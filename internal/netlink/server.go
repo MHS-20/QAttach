@@ -87,7 +87,7 @@ func (s *Server) Serve() error {
 		}
 
 		payload := buf[syscall.NLMSG_HDRLEN:hdr.Len]
-		s.dispatch(payload)
+		s.dispatch(hdr.Type, payload)
 	}
 }
 
@@ -102,18 +102,12 @@ func (s *Server) Stop() {
 	}
 }
 
-func (s *Server) dispatch(data []byte) {
-	if len(data) < 4 {
-		return
-	}
+func (s *Server) dispatch(msgType uint16, data []byte) {
 	if s.handler == nil {
 		return
 	}
 
-	msgType := binary.LittleEndian.Uint32(data[0:4])
-	payload := data[4:]
-
-	switch msgType {
+	switch uint32(msgType) {
 	case protocol.MsgLockReq:
 		var req protocol.LockRequest
 		if decodeLE(payload, &req) {
