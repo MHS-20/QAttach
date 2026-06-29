@@ -1,0 +1,107 @@
+#!/bin/bash
+# destroy-infra.sh — tear down all QAttach infrastructure.
+#
+# Reads state from $QATTACH_STATE and destroys everything created
+# by create-infra.sh.  Use --force to skip confirmation.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/state.sh"
+
+FORCE="${1:-}"
+
+log "=== QAttach Infrastructure Teardown ==="
+
+# ---- read state ----
+
+VOL_ID=$(state_get volume_id)
+SG_ID=$(state_get sg_id)
+KEY_NAME=$(state_get key_name)
+CLUSTER=$(state_get cluster_name)
+
+ETCD_IDS=$(state_get etcd_instance_ids | jq -r '.[]' 2>/dev/null || echo "")
+COMPUTE_IDS=$(state_get compute_instance_ids | jq -r '.[]' 2>/dev/null || echo "")
+
+ALL_IDS="$ETCD_IDS $COMPUTE_IDS"
+
+log "Volume:        $VOL_ID"
+log "Security Grp:  $SG_ID"
+log "Key pair:      $KEY_NAME"
+log "etcd nodes:    $(echo $ETCD_IDS | wc -w)"
+log "Compute nodes: $(echo $COMPUTE_IDS | wc -w)"
+
+if [[ "$FORCE" != "--force" ]]; then
+    echo ""
+    read -p "Destroy all resources? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        die "aborted"
+    fi
+fi
+
+# ---- Step 1: Terminate all instances ----
+
+if [[ -n "$ALL_IDS" ]]; then
+    log "Terminating instances..."
+    for id in $ALL_IDS; do
+        [[ -z "$id" || "$id" == "null" ]] && continue
+        aws ec2 terminate-instances --instance-ids "$id" --no-cli-pager 2>/dev/null || true
+    done
+
+    log "Waiting for termination..."
+    for id in $ALL_IDS; do
+        [[ -z "$id" || "$id" == "null" ]] && continue
+        aws ec2 wait instance-terminated --instance-ids "$id" 2>/dev/null || true
+    done
+fi
+
+# ---- Step 2: Delete NLB ----
+
+NLB_ARN=$(aws elbv2 describe-load-balancers \
+    --names "${CLUSTER}-etcd" \
+    --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
+
+if [[ -n "$NLB_ARN" && "$NLB_ARN" != "None" ]]; then
+    log "Deleting NLB..."
+    aws elbv2 delete-load-balancer --load-balancer-arn "$NLB_ARN"
+
+    # Delete target groups
+    for tg in $(aws elbv2 describe-target-groups \
+        --names "${CLUSTER}-etcd-tg" \
+        --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo ""); do
+        [[ "$tg" == "None" ]] && continue
+        sleep 2
+        aws elbv2 delete-target-group --target-group-arn "$tg" 2>/dev/null || true
+    done
+fi
+
+# ---- Step 3: Delete EBS volume ----
+
+if [[ -n "$VOL_ID" && "$VOL_ID" != "null" ]]; then
+    log "Waiting for volume to detach..."
+    sleep 10
+    aws ec2 delete-volume --volume-id "$VOL_ID" 2>/dev/null || true
+    log "Volume $VOL_ID deleted"
+fi
+
+# ---- Step 4: Delete security group ----
+
+if [[ -n "$SG_ID" && "$SG_ID" != "null" ]]; then
+    sleep 5
+    aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
+    log "Security group $SG_ID deleted"
+fi
+
+# ---- Step 5: Delete key pair ----
+
+if [[ -n "$KEY_NAME" && "$KEY_NAME" != "null" ]]; then
+    aws ec2 delete-key-pair --key-name "$KEY_NAME" 2>/dev/null || true
+    log "Key pair $KEY_NAME deleted"
+fi
+
+# ---- Clean up state ----
+
+rm -f "$QATTACH_STATE"
+
+log ""
+log "=== Teardown complete ==="
