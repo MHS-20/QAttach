@@ -1,0 +1,120 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+
+	"github.com/polarity/qattach/internal/config"
+	"github.com/polarity/qattach/internal/etcd"
+	"github.com/polarity/qattach/internal/fencing"
+	"github.com/polarity/qattach/internal/identity"
+	"github.com/polarity/qattach/internal/lock"
+	"github.com/polarity/qattach/internal/netlink"
+	"github.com/polarity/qattach/internal/signal"
+)
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	cfg := parseFlags()
+
+	ctx, cancel := signal.Context()
+	defer cancel()
+
+	// Discover identity.
+	id, err := identity.Discover()
+	if err != nil {
+		log.Printf("identity discovery warning: %v", err)
+	}
+	log.Printf("node identity: id=%s ip=%s az=%s", id.InstanceID, id.PrivateIP, id.AZ)
+
+	if cfg.NodeID == "" {
+		cfg.NodeID = id.InstanceID
+	}
+
+	// Connect to etcd.
+	log.Printf("connecting to etcd: %s", strings.Join(cfg.EtcdEndpoints, ","))
+	ec, err := etcd.New(ctx, cfg)
+	if err != nil {
+		log.Fatalf("etcd connect: %v", err)
+	}
+	defer ec.Close()
+
+	// Register node membership.
+	if err := ec.RegisterNode(ctx, cfg.NodeID, id.InstanceID, id.PrivateIP, id.AZ); err != nil {
+		log.Fatalf("register node: %v", err)
+	}
+	log.Printf("registered node %s in etcd", cfg.NodeID)
+
+	// Create lock manager.
+	lm := lock.NewManager(ec, cfg.NodeID)
+
+	// Create netlink server.
+	nlSrv, err := netlink.ListenRaw()
+	if err != nil {
+		log.Fatalf("netlink server: %v", err)
+	}
+	nlSrv.SetHandler(lm)
+	lm.SetNetlink(nlSrv)
+
+	// Create fencer.
+	f, err := fencing.NewFencer(ec, cfg.NodeID, cfg.VolumeID)
+	if err != nil {
+		log.Fatalf("fencer init: %v", err)
+	}
+	f.SetNetlink(nlSrv)
+
+	// Start fencer watch loop.
+	go f.Run(ctx)
+
+	// Start netlink receive loop.
+	go func() {
+		if err := nlSrv.Serve(); err != nil {
+			log.Printf("netlink serve: %v", err)
+		}
+	}()
+
+	log.Printf("cluster-agent ready — listening for lock_etcd requests")
+
+	// Wait for shutdown signal.
+	_ = signal.Wait(ctx, func() {
+		log.Printf("clean shutdown: deregistering node %s", cfg.NodeID)
+		if err := ec.DeregisterNode(context.Background(), cfg.NodeID); err != nil {
+			log.Printf("deregister error: %v", err)
+		}
+		nlSrv.Stop()
+	})
+
+	log.Printf("cluster-agent stopped")
+}
+
+func parseFlags() *config.Config {
+	cfg := config.Default()
+
+	flag.StringVar(&cfg.NodeID, "node-id", "", "unique node identifier (default: instance ID from IMDS)")
+
+	etcdEndpoints := flag.String("etcd-endpoints", "http://localhost:2379",
+		"comma-separated etcd endpoints")
+
+	flag.StringVar(&cfg.EtcdCertFile, "etcd-cert", "", "etcd client certificate file")
+	flag.StringVar(&cfg.EtcdKeyFile, "etcd-key", "", "etcd client key file")
+	flag.StringVar(&cfg.EtcdCAFile, "etcd-ca", "", "etcd CA certificate file")
+
+	flag.StringVar(&cfg.ClusterName, "cluster-name", "mycluster", "GFS2 cluster name")
+	flag.StringVar(&cfg.VolumeID, "volume-id", "", "EBS volume ID for fencing")
+	flag.StringVar(&cfg.AZ, "az", "us-east-1a", "availability zone")
+
+	flag.Parse()
+
+	cfg.EtcdEndpoints = strings.Split(*etcdEndpoints, ",")
+
+	if cfg.VolumeID == "" {
+		fmt.Fprintf(os.Stderr, "warning: --volume-id not set, fencing will be incomplete\n")
+	}
+
+	return cfg
+}
