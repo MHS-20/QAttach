@@ -2,60 +2,91 @@
 
 etcd-backed distributed lock manager (DLM) replacement for GFS2 on EBS Multi-Attach.
 
-## Status
-
-Greenfield — no commits, no source code. Single source of truth for design is `docs/general_plan.md` (843 lines, covers every decision). Read it first before writing any code.
-
-## Architecture (tl;dr)
+## Architecture
 
 ```
 lock_etcd (kernel module, lm_lockops impl) ←Netlink→ cluster-agent (Go daemon) ←gRPC→ etcd (3-node Raft)
 ```
 
-- **`lock_etcd`** — kernel module implementing GFS2's `lm_lockops`. Communicates with `cluster-agent` exclusively via a custom Netlink family. Replaces `lock_dlm`.
-- **`cluster-agent`** — Go userspace daemon (one per compute node). Owns all etcd interactions, fencing logic (EC2 `StopInstances`/`DetachVolume`), and Netlink server.
-- **etcd** — fixed 3-node cluster behind internal NLB. Single source of truth for membership, glocks, and fencing coordination.
-- **GFS2** — unchanged on-disk format. Journals managed entirely on-disk by GFS2 itself (not in etcd).
-- **EBS io2 Multi-Attach** — one volume per AZ, block device shared by all compute nodes in that AZ.
+- **`lock_etcd`** — kernel module (C) implementing GFS2's `lm_lockops`. Replaces `lock_dlm`.
+- **`cluster-agent`** — Go userspace daemon (one per compute node). Owns etcd, fencing, Netlink server.
+- **etcd** — fixed 3-node Raft cluster behind internal NLB. Source of truth for membership, glocks, fencing.
+- **GFS2** — unchanged on-disk format. Journals on-disk only (not in etcd).
+- **EBS io2 Multi-Attach** — one volume per AZ shared by all compute nodes.
 
-## Key constraints (from design doc)
+## Key constraints
 
-- Fencing is EC2 API-based (`StopInstances`, `DetachVolume`) — no STONITH/IPMI.
+- Fencing: EC2 API (`StopInstances`/`DetachVolume`), **not** STONITH/IPMI. Never grant `ec2:TerminateInstances`.
 - Session lease TTL=15s, keepalive every 5s. Idle nodes are never fenced.
-- Fencing token = etcd revision of the lock key, issued on grant, validated on every request.
-- No node-to-node monitoring — etcd Watch on `/cluster/members/` and session lease expiry are the sole liveness signals.
-- One session lease per node (unconditional keepalive). Per-lock keys are attached to the session lease (auto-deleted on crash).
-- etcd key schema: `/cluster/members/{node_id}`, `/cluster/fencing/{node_id}`, `/cluster/epoch`, `/locks/glock/{type}/{number}`.
+- Fencing token = etcd revision of the lock key, validated on every request.
+- No node-to-node monitoring — etcd Watch + session expiry are the sole liveness signals.
 - Glock mode mapping: EX→EX, SH→PR, DF→CW, UN→delete key.
-- The kernel module template is `fs/gfs2/lock_dlm.c` — read it before implementing.
+- etcd keys: `/cluster/members/{id}`, `/cluster/fencing/{id}`, `/cluster/epoch`, `/locks/glock/{type}/{number}`.
 
-## Environment
+## Build & test
 
-From `docs/awscli_info.txt`:
+```bash
+go build ./...          # build cluster-agent
+go test ./...           # 20 unit tests (no infra needed)
+go vet ./...            # static analysis
+```
+
+## Full deployment workflow
+
+Run these in order from the repo root:
+
+```bash
+# 1. Provision AWS infrastructure (VPC, EC2, EBS, NLB)
+QATTACH_KEY_NAME=muhamad-keypair scripts/infra/create-infra.sh
+
+# 2. Install etcd cluster with mTLS
+scripts/infra/setup-etcd.sh
+
+# 3. Install agent + kernel module + GFS2 on compute nodes
+scripts/infra/setup-compute.sh
+
+# 4. Run end-to-end tests
+scripts/infra/run-full-test.sh
+
+# 5. Tear down everything
+scripts/infra/destroy-infra.sh --force
+```
+
+Infra state is saved to `infra-state.json` so scripts can resume after interruption.
+
+## Environment (from `docs/awscli_info.txt`)
 
 ```
-region: us-east-1
-az: us-east-1a
+region: eu-west-1     (was us-east-1 in docs, actual: eu-west-1)
+az: eu-west-1b
 key_pair_name: muhamad-keypair
 pem_path: ~/.ssh/id_ed25519
 cluster_name: mycluster
 aws_profile: default
 ```
 
-## AWS provisioning notes
+Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QATTACH_CLUSTER`, etc.
 
-- `docs/setup_aws_cli.md` explains IAM user vs instance role, credential layers, and what the agent can discover vs what the user must provide.
-- Three separate credential sets: terminal (IAM user access key), compute nodes (IAM instance role), SSH (EC2 key pair).
-- All four compute nodes + EBS volume must be in the same AZ (Multi-Attach is AZ-scoped).
-- IAM policy for `cluster-agent` instance role is in `docs/general_plan.md` — requires `ec2:StopInstances`, `ec2:DetachVolume`, `ec2:Describe*`, `autoscaling:CompleteLifecycleAction`.
-- Lock down `StopInstances`/`DetachVolume` with `aws:ResourceTag/ClusterName` condition.
-- Do not grant `ec2:TerminateInstances` — stopping is sufficient for fencing.
+## File map
 
-## What exists so far
-
-| Path | Content |
+| Path | Purpose |
 |------|---------|
-| `docs/general_plan.md` | Full architecture, design decisions, etcd key schema, IAM policy, phased implementation plan, testing matrix |
-| `docs/awscli_info.txt` | AWS environment variables |
-| `docs/setup_aws_cli.md` | AWS CLI setup, credential layers, SSH key pair, provisioning workflow |
-| `.gitignore` | `*.csv` only |
+| `cmd/cluster-agent/` | CLI entrypoint |
+| `internal/etcd/` | etcd client (mTLS, sessions, CAS, Watch) |
+| `internal/netlink/` | Raw AF_NETLINK server (kernel↔userspace) |
+| `internal/lock/` | Glock request handler (acquire, release, watch-and-retry) |
+| `internal/fencing/` | Member Watch, CAS race, EC2 fencing |
+| `internal/identity/` | IMDSv2 instance ID/IP/AZ discovery |
+| `internal/lifecycle/` | ASG terminating lifecycle hook |
+| `internal/config/` | Configuration defaults |
+| `internal/signal/` | SIGTERM/SIGINT handling |
+| `kernel/` | `lock_etcd` kernel module (C, lm_lockops impl) |
+| `pkg/protocol/` | Shared types (glock modes, Netlink messages, etcd keys) |
+| `scripts/infra/` | AWS infra provisioning, etcd setup, compute setup, e2e tests |
+| `scripts/` | GFS2 format, mount, journal management, module loader |
+| `scripts/test/` | Standalone test suite, partition sim, fencing test, glock monitor |
+| `docs/` | Design plan, AWS setup, env info |
+
+## Design doc
+
+`docs/general_plan.md` — 843 lines, covers every architectural decision, IAM policy, etcd key schema, phased plan, test matrix, and all reference URLs.
