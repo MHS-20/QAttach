@@ -92,7 +92,7 @@ echo "Stock kernel version: $KERNEL_VERSION"
 
 run_user "cd /tmp && dnf download --source kernel6.18"
 run_user "cd /tmp && rpm -ivh kernel6.18*.src.rpm"
-run "dnf builddep -y ~/rpmbuild/SPECS/kernel6.18.spec"
+run "dnf builddep -y /home/ec2-user/rpmbuild/SPECS/kernel6.18.spec"
 run_user "cd ~/rpmbuild/SPECS && rpmbuild -bp --target=\$(uname -m) kernel6.18.spec"
 
 echo ""
@@ -128,24 +128,22 @@ echo "========================================"
 echo " Integrating lock_etcd into kernel tree..."
 echo "========================================"
 
-# Copy our kernel source files to the build instance
+# Copy lock_etcd sources and patch script to the build instance
 scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o BatchMode=yes \
   kernel/lock_etcd_main.c kernel/lock_etcd_netlink.c kernel/lock_etcd_glock.c \
   kernel/lock_etcd_mount.c kernel/lock_etcd_lock.c kernel/lock_etcd_internal.h \
-  pkg/protocol/letcd_netlink.h \
+  pkg/protocol/letcd_netlink.h scripts/kernel/patch-kernel.py \
   "${SSH_USER}@${PUBLIC_IP}:/home/${SSH_USER}/"
 
-# Move sources into the kernel tree and add Kconfig/Makefile entries
 run_user "
 SRC=\$(echo ~/rpmbuild/BUILD/kernel-*/linux-*/)
 GFS2=\${SRC}fs/gfs2
 
-# Copy source files
+# Copy lock_etcd source files into kernel tree
 cp ~/lock_etcd_main.c ~/lock_etcd_netlink.c ~/lock_etcd_glock.c \
    ~/lock_etcd_mount.c ~/lock_etcd_lock.c \
    ~/lock_etcd_internal.h ~/letcd_netlink.h \"\$GFS2/\"
-
-echo 'Copied lock_etcd sources to '\$GFS2''
+echo 'Copied lock_etcd sources'
 
 # Add Kconfig entry
 cat >> \"\$GFS2/Kconfig\" << 'KEOF'
@@ -154,9 +152,7 @@ config GFS2_FS_LOCKING_ETCD
 	bool \"GFS2 etcd-backed locking (lock_etcd)\"
 	depends on GFS2_FS
 	help
-	  Enable the lock_etcd locking protocol for GFS2. Uses etcd
-	  via the cluster-agent userspace daemon for distributed locking
-	  and fencing, replacing the DLM-based lock_dlm protocol.
+	  Enable the lock_etcd locking protocol for GFS2.
 KEOF
 
 # Add Makefile entries
@@ -164,13 +160,15 @@ cat >> \"\$GFS2/Makefile\" << 'MEOF'
 gfs2-\$(CONFIG_GFS2_FS_LOCKING_ETCD) += lock_etcd_main.o lock_etcd_netlink.o lock_etcd_glock.o lock_etcd_mount.o lock_etcd_lock.o
 MEOF
 
-echo 'Added Kconfig and Makefile entries'
-
 # Enable the config
 cd \"\$SRC\"
 ./scripts/config --enable CONFIG_GFS2_FS_LOCKING_ETCD
 make olddefconfig
 echo 'Enabled CONFIG_GFS2_FS_LOCKING_ETCD'
+
+# Patch main.c and ops_fstype.c for lock_etcd registration
+python3 ~/patch-kernel.py \"\$SRC\"
+
 grep CONFIG_GFS2_FS_LOCKING .config
 "
 

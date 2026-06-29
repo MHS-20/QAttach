@@ -1,20 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/*
- * lock_etcd_mount.c — lm_mount, lm_unmount, lm_first_done,
- * lm_recovery_result.
- */
-
 #define pr_fmt(fmt) "lock_etcd: " fmt
-
 #include <linux/delay.h>
 #include <linux/string.h>
-
 #include "lock_etcd_internal.h"
 
 struct letcd_mount_context letcd_mount_ctx;
 EXPORT_SYMBOL(letcd_mount_ctx);
 
-static int letcd_mount(struct gfs2_sbd *sdp, const char *table)
+int letcd_mount(struct gfs2_sbd *sdp, const char *table)
 {
 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
 	struct letcd_mount_req req;
@@ -54,7 +47,6 @@ static int letcd_mount(struct gfs2_sbd *sdp, const char *table)
 		pr_err("mount timed out\n");
 		return -ETIMEDOUT;
 	}
-
 	if (letcd_mount_ctx.mount_error) {
 		pr_err("mount denied: %d\n", letcd_mount_ctx.mount_error);
 		return letcd_mount_ctx.mount_error;
@@ -72,21 +64,25 @@ static int letcd_mount(struct gfs2_sbd *sdp, const char *table)
 	return 0;
 }
 
-static void letcd_first_done(struct gfs2_sbd *sdp)
+void letcd_first_done(struct gfs2_sbd *sdp)
 {
 	pr_info("first mounter recovery done\n");
 }
 
-static void letcd_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
-				   unsigned int result)
+void letcd_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
+			    unsigned int result)
 {
 	pr_info("recovery result: jid=%u result=%u\n", jid, result);
 }
 
-static void letcd_unmount(struct gfs2_sbd *sdp, bool clean)
+void letcd_unmount(struct gfs2_sbd *sdp)
 {
 	char dummy[4] = {0};
-
-	pr_info("unmount (clean=%d)\n", clean);
+	pr_info("unmount\n");
 	letcd_nl_send_msg(LETCD_MSG_UNMOUNT, dummy, sizeof(dummy));
+}
+
+void letcd_withdraw(struct gfs2_sbd *sdp)
+{
+	pr_info("withdraw\n");
 }
