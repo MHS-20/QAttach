@@ -102,7 +102,7 @@ func (s *Server) Stop() {
 	}
 }
 
-func (s *Server) dispatch(msgType uint16, data []byte) {
+func (s *Server) dispatch(msgType uint16, payload []byte) {
 	if s.handler == nil {
 		return
 	}
