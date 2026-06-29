@@ -151,6 +151,11 @@ func (f *Fencer) executeFencing(ctx context.Context, instanceID, failedNodeID st
 		f.signalRecoveryOk(jid)
 	}
 
+	// Step 5: Mark fencing complete so other nodes can observe it.
+	if err := f.etcdCli.MarkFencingComplete(ctx, failedNodeID, "done"); err != nil {
+		log.Printf("mark fencing complete error for %s: %v", failedNodeID, err)
+	}
+
 	log.Printf("fencing complete for node %s (instance %s)", failedNodeID, instanceID)
 }
 

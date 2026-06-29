@@ -172,6 +172,20 @@ func (c *Client) WatchPrefix(ctx context.Context, prefix string) clientv3.WatchC
 	return c.cli.Watch(ctx, prefix, clientv3.WithPrefix())
 }
 
+// MarkFencingComplete writes the fencing result so other surviving nodes can
+// observe that fencing completed.
+func (c *Client) MarkFencingComplete(ctx context.Context, failedNodeID, result string) error {
+	key := protocol.PrefixFencing + failedNodeID
+	_, err := c.cli.Put(ctx, key, result)
+	return err
+}
+
+// WatchFencingKey watches the fencing key for a specific failed node.
+func (c *Client) WatchFencingKey(ctx context.Context, failedNodeID string) clientv3.WatchChan {
+	key := protocol.PrefixFencing + failedNodeID
+	return c.cli.Watch(ctx, key)
+}
+
 // Close shuts down the etcd session and client.
 func (c *Client) Close() error {
 	if c.sess != nil {
