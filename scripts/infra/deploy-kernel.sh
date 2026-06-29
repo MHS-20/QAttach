@@ -38,11 +38,11 @@ rm -f /tmp/$KERNEL_FILE
 
 # Install gfs2-utils (if included in archive)
 for bin in mkfs.gfs2 mount.gfs2 fsck.gfs2 gfs2_jadd gfs2_grow gfs2_edit; do
-    if [[ -f /usr/local/sbin/\$bin ]]; then
-        sudo cp /usr/local/sbin/\$bin /usr/sbin/
+    if [[ -f /usr/sbin/\$bin ]]; then
         sudo chmod 755 /usr/sbin/\$bin
     fi
 done
+which mkfs.gfs2 2>/dev/null || echo '(mkfs.gfs2 not in archive — will be built by setup-compute.sh)'
 
 # Verify extracted files
 ls -la /boot/vmlinuz-*custom* 2>/dev/null || echo 'WARN: no custom vmlinuz'

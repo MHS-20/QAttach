@@ -186,18 +186,23 @@ echo " Building gfs2-utils (userspace tools)..."
 echo "========================================"
 
 run_user "
-# Clone and build gfs2-utils (not in AL2023 repos)
+# Build gfs2-utils from source (pagure.io, per SetUpAL2023.md)
 cd /tmp
-git clone --depth 1 --branch v3.5.1 https://github.com/ClusterLabs/gfs2-utils 2>&1 | tail -1
+sudo dnf install -y \
+  autoconf automake libtool \
+  ncurses-devel gettext \
+  zlib-devel bzip2-devel \
+  libblkid-devel libuuid-devel \
+  corosynclib-devel libqb-devel \
+  systemd-devel libxml2-devel \
+  readline-devel 2>&1 | tail -2
+git clone https://pagure.io/gfs2-utils.git 2>&1 | tail -1
 cd gfs2-utils
-# Install build deps
-sudo dnf install -y autoconf automake libtool libuuid-devel ncurses-devel 2>&1 | tail -2
 ./autogen.sh 2>&1 | tail -1
-./configure --prefix=/usr/local 2>&1 | tail -2
+./configure --prefix=/usr --sbindir=/usr/sbin --sysconfdir=/etc 2>&1 | tail -2
 make -j\$(nproc) 2>&1 | tail -2
 sudo make install 2>&1 | tail -2
-echo 'gfs2-utils built'
-ls /usr/local/sbin/mkfs.gfs2 /usr/local/sbin/mount.gfs2
+ls /usr/sbin/mkfs.gfs2 && echo 'gfs2-utils built'
 "
 
 echo ""
@@ -233,13 +238,12 @@ run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && sudo tar -czf /tmp/${ARCHIVE}
   /boot/vmlinuz-${KERNEL_RELEASE}-custom \
   /boot/initramfs-${KERNEL_RELEASE}-custom.img \
   /lib/modules/${KERNEL_RELEASE}/ \
-  /usr/local/sbin/mkfs.gfs2 \
-  /usr/local/sbin/mount.gfs2 \
-  /usr/local/sbin/fsck.gfs2 \
-  /usr/local/sbin/gfs2_jadd \
-  /usr/local/sbin/gfs2_grow \
-  /usr/local/sbin/gfs2_edit \
-  /usr/local/sbin/gfs2_lockcapture"
+  /usr/sbin/mkfs.gfs2 \
+  /usr/sbin/mount.gfs2 \
+  /usr/sbin/fsck.gfs2 \
+  /usr/sbin/gfs2_jadd \
+  /usr/sbin/gfs2_grow \
+  /usr/sbin/gfs2_edit"
 run "chown ${SSH_USER}:${SSH_USER} /tmp/${ARCHIVE}"
 
 echo ""

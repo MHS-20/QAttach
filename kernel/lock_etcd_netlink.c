@@ -77,8 +77,8 @@ static void letcd_nl_recv(struct sk_buff *skb)
 	void *payload = nlmsg_data(nlh);
 	size_t plen = nlmsg_len(nlh);
 
-	/* Store agent PID on first REGISTER message */
-	if (!agent_pid && plen >= 4 && *(u32 *)payload == LETCD_MSG_REGISTER) {
+	/* Store agent PID on REGISTER message (update on restart) */
+	if (plen >= 4 && *(u32 *)payload == LETCD_MSG_REGISTER) {
 		agent_pid = NETLINK_CB(skb).portid;
 		pr_info("agent registered pid=%u\n", agent_pid);
 		return;

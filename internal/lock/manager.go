@@ -176,8 +176,10 @@ func (m *Manager) sendWait(requestID uint64) {
 // sendMountResponse sends the mount response with assigned journal ID.
 func (m *Manager) sendMountResponse(requestID uint64, jid int32) {
 	if m.nlSrv == nil {
+		log.Printf("mount response NOT SENT: netlink server is nil")
 		return
 	}
+	log.Printf("sending mount response: jid=%d via netlink", jid)
 	if err := m.nlSrv.SendMountResponse(protocol.MountResponse{
 		RequestID: requestID,
 		JID:       jid,
