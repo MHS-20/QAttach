@@ -1,0 +1,7 @@
+Environment:
+  region: ue-west-1
+  az: ue-west-1b
+  key_pair_name: muhamad-keypair
+  pem_path: ~/.ssh/id_ed25519
+  cluster_name: mycluster
+  aws_profile: default
