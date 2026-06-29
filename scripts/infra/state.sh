@@ -18,7 +18,7 @@ QATTACH_STATE="${QATTACH_STATE:-$PROJECT_ROOT/infra-state.json}"
 # Defaults from docs/awscli_info.txt (overridable via env)
 REGION="${AWS_DEFAULT_REGION:-eu-west-1}"
 AZ="${QATTACH_AZ:-eu-west-1b}"
-CLUSTER_NAME="${QATTACH_CLUSTER:-mycluster}"
+CLUSTER_NAME="${QATTACH_CLUSTER:-ebs-ma}"
 KEY_NAME="${QATTACH_KEY_NAME:-}"
 PEM_PATH="${QATTACH_PEM_PATH:-~/.ssh/id_ed25519}"
 ETCD_NODES="${QATTACH_ETCD_NODES:-3}"
@@ -114,10 +114,16 @@ wait_for_instance() {
     aws ec2 wait instance-running --instance-ids "$id"
 }
 
-get_instance_ip() {
+get_instance_private_ip() {
     local id="$1"
     aws ec2 describe-instances --instance-ids "$id" \
         --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text
+}
+
+get_instance_public_ip() {
+    local id="$1"
+    aws ec2 describe-instances --instance-ids "$id" \
+        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
 }
 
 # init state on source

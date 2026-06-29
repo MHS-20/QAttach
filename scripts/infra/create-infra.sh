@@ -117,7 +117,7 @@ for i in $(seq 1 $ETCD_NODES); do
         --security-group-ids "$SG_ID" \
         --subnet-id "$SUBNET_ID" \
         --associate-public-ip-address \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
+        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":10,"VolumeType":"gp3"}}]' \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
         --query 'Instances[0].InstanceId' --output text)
 
@@ -128,7 +128,7 @@ done
 log "Waiting for etcd nodes..."
 for id in "${ETCD_IDS[@]}"; do
     wait_for_instance "$id"
-    ip=$(get_instance_ip "$id")
+    ip=$(get_instance_private_ip "$id")
     ETCD_IPS+=("$ip")
     log "  $id → $ip"
 done
@@ -196,7 +196,7 @@ for i in $(seq 1 $COMPUTE_NODES); do
         --security-group-ids "$COMPUTE_SG_ID" \
         --subnet-id "$SUBNET_ID" \
         --associate-public-ip-address \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
+        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":10,"VolumeType":"gp3"}}]' \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
         --query 'Instances[0].InstanceId' --output text)
 
@@ -207,7 +207,7 @@ done
 log "Waiting for compute nodes..."
 for id in "${COMPUTE_IDS[@]}"; do
     wait_for_instance "$id"
-    ip=$(get_instance_ip "$id")
+    ip=$(get_instance_private_ip "$id")
     COMPUTE_IPS+=("$ip")
     log "  $id → $ip"
 done

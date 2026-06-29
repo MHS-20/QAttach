@@ -55,20 +55,24 @@ func main() {
 	// Create lock manager.
 	lm := lock.NewManager(ec, cfg.NodeID)
 
-	// Create netlink server.
+	// Create netlink server (non-fatal — kernel module optional).
 	nlSrv, err := netlink.ListenRaw()
 	if err != nil {
-		log.Fatalf("netlink server: %v", err)
+		log.Printf("netlink server unavailable (kernel module not loaded?): %v", err)
+		lm.SetNetlink(nil)
+	} else {
+		nlSrv.SetHandler(lm)
+		lm.SetNetlink(nlSrv)
 	}
-	nlSrv.SetHandler(lm)
-	lm.SetNetlink(nlSrv)
 
 	// Create fencer.
 	f, err := fencing.NewFencer(ec, cfg.NodeID, cfg.VolumeID)
 	if err != nil {
 		log.Fatalf("fencer init: %v", err)
 	}
-	f.SetNetlink(nlSrv)
+	if nlSrv != nil {
+		f.SetNetlink(nlSrv)
+	}
 
 	// Start fencer watch loop.
 	go f.Run(ctx)
@@ -88,12 +92,14 @@ func main() {
 		}
 	}
 
-	// Start netlink receive loop.
-	go func() {
-		if err := nlSrv.Serve(); err != nil {
-			log.Printf("netlink serve: %v", err)
-		}
-	}()
+	// Start netlink receive loop (if available).
+	if nlSrv != nil {
+		go func() {
+			if err := nlSrv.Serve(); err != nil {
+				log.Printf("netlink serve: %v", err)
+			}
+		}()
+	}
 
 	log.Printf("cluster-agent ready — listening for lock_etcd requests")
 
@@ -103,7 +109,9 @@ func main() {
 		if err := ec.DeregisterNode(context.Background(), cfg.NodeID); err != nil {
 			log.Printf("deregister error: %v", err)
 		}
-		nlSrv.Stop()
+		if nlSrv != nil {
+			nlSrv.Stop()
+		}
 	})
 
 	log.Printf("cluster-agent stopped")

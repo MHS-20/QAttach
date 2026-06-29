@@ -19,9 +19,7 @@
 
 #ifdef __KERNEL__
 #include "incore.h"
-#include "lm_interface.h"
-#else
-#include "gfs2_compat.h"
+#include "glock.h"
 #endif
 
 #include "letcd_netlink.h"
