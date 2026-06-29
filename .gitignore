@@ -1,2 +1,6 @@
 *.csv
 bin/
+certs/
+bin/cluster-agent
+infra-state.json
+test-results/

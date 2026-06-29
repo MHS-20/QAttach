@@ -8,6 +8,8 @@
 struct sock *letcd_nl_sk;
 EXPORT_SYMBOL(letcd_nl_sk);
 
+static u32 agent_pid;
+
 /* ---- dispatch helpers ---- */
 
 static void dispatch_mount_resp(struct letcd_mount_resp *resp)
@@ -76,7 +78,7 @@ static void letcd_nl_recv(struct sk_buff *skb)
 	size_t plen = nlmsg_len(nlh);
 
 	/* Store agent PID on first REGISTER message */
-	if (nlh->nlmsg_type == LETCD_MSG_REGISTER && !agent_pid) {
+	if (!agent_pid && plen >= 4 && *(u32 *)payload == LETCD_MSG_REGISTER) {
 		agent_pid = NETLINK_CB(skb).portid;
 		pr_info("agent registered pid=%u\n", agent_pid);
 		return;
@@ -112,10 +114,6 @@ static void letcd_nl_recv(struct sk_buff *skb)
 		break;
 	}
 }
-
-/* ---- agent PID tracking ---- */
-
-static u32 agent_pid;
 
 /* ---- create / destroy ---- */
 
