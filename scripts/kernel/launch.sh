@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+cd "$(dirname "$0")/../.."
+
 AMI_ID="ami-05cbf8a8aa4e4b755"
 INSTANCE_TYPE="m8i.4xlarge"
 REGION="eu-west-1"
@@ -21,7 +23,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --key-name "$KEY_NAME" \
   --subnet-id subnet-6570782d \
   --security-group-ids sg-c56ee982 \
-  --iam-instance-profile "Name=${IAM_PROFILE}" \
+  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=kernel-builder}]" \
   --query 'Instances[0].InstanceId' \
   --output text)
@@ -88,10 +90,10 @@ KERNEL_VERSION=$(ssh -i "$SSH_KEY_PATH" \
   "${SSH_USER}@${PUBLIC_IP}" "uname -r")
 echo "Stock kernel version: $KERNEL_VERSION"
 
-run_user "cd /tmp && dnf download --source kernel-${KERNEL_VERSION}"
-run_user "cd /tmp && rpm -ivh kernel-*.src.rpm"
-run "dnf builddep -y ~/rpmbuild/SPECS/kernel.spec"
-run_user "cd ~/rpmbuild/SPECS && rpmbuild -bp --target=\$(uname -m) kernel.spec"
+run_user "cd /tmp && dnf download --source kernel6.18"
+run_user "cd /tmp && rpm -ivh kernel6.18*.src.rpm"
+run "dnf builddep -y ~/rpmbuild/SPECS/kernel6.18.spec"
+run_user "cd ~/rpmbuild/SPECS && rpmbuild -bp --target=\$(uname -m) kernel6.18.spec"
 
 echo ""
 echo "========================================"
@@ -214,14 +216,14 @@ run "chown ${SSH_USER}:${SSH_USER} /tmp/${ARCHIVE}"
 
 echo ""
 echo "========================================"
-echo " Uploading to S3..."
+echo " Downloading and uploading to S3..."
 echo "========================================"
 
-ssh -i "$SSH_KEY_PATH" \
-  -o StrictHostKeyChecking=no \
-  -o BatchMode=yes \
-  "${SSH_USER}@${PUBLIC_IP}" \
-  "aws s3 cp /tmp/${ARCHIVE} ${S3_BUCKET}/"
+scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o BatchMode=yes \
+  "${SSH_USER}@${PUBLIC_IP}:/tmp/${ARCHIVE}" /tmp/
+
+aws s3 cp "/tmp/${ARCHIVE}" "${S3_BUCKET}/"
+rm -f "/tmp/${ARCHIVE}"
 
 echo ""
 echo "Upload complete: ${S3_BUCKET}/${ARCHIVE}"
