@@ -45,7 +45,7 @@ if [[ -n "$ALL_IDS" ]]; then
     log "Terminating instances..."
     for id in $ALL_IDS; do
         [[ -z "$id" || "$id" == "null" ]] && continue
-        aws ec2 terminate-instances --instance-ids "$id" --no-cli-pager 2>/dev/null || true
+        aws ec2 terminate-instances --instance-ids "$id" 2>/dev/null || true
     done
 
     log "Waiting for termination..."
@@ -55,7 +55,7 @@ if [[ -n "$ALL_IDS" ]]; then
     done
 fi
 
-# ---- Step 2: Delete NLB ----
+# ---- Step 2: Delete NLB (if it exists) ----
 
 NLB_ARN=$(aws elbv2 describe-load-balancers \
     --names "${CLUSTER}-etcd" \
@@ -63,9 +63,7 @@ NLB_ARN=$(aws elbv2 describe-load-balancers \
 
 if [[ -n "$NLB_ARN" && "$NLB_ARN" != "None" ]]; then
     log "Deleting NLB..."
-    aws elbv2 delete-load-balancer --load-balancer-arn "$NLB_ARN"
-
-    # Delete target groups
+    aws elbv2 delete-load-balancer --load-balancer-arn "$NLB_ARN" 2>/dev/null || true
     for tg in $(aws elbv2 describe-target-groups \
         --names "${CLUSTER}-etcd-tg" \
         --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo ""); do

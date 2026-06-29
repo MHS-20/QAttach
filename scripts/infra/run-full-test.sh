@@ -20,7 +20,7 @@ RESULTS="$PROJECT_ROOT/test-results"
 
 mapfile -t COMPUTE_IPS < <(state_get compute_ips | jq -r '.[]')
 COMPUTE_COUNT=${#COMPUTE_IPS[@]}
-NLB_DNS=$(state_get etcd_nlb_dns)
+ETCD0_IP=$(state_get etcd_ips | jq -r '.[0]')
 CLUSTER=$(state_get cluster_name)
 
 if [[ "$COMPUTE_COUNT" -lt 2 ]]; then
@@ -60,7 +60,7 @@ log "=== Test 2: etcd membership ==="
 CERT_DIR="$PROJECT_ROOT/certs"
 MEMBER_COUNT=$(ssh $SSH_OPTS "ec2-user@$IP0" \
     "ETCDCTL_API=3 etcdctl \
-      --endpoints=https://${NLB_DNS}:2379 \
+      --endpoints=https://${ETCD0_IP}:2379 \
       --cacert=/etc/cluster-agent/ca.crt \
       --cert=/etc/cluster-agent/client.crt \
       --key=/etc/cluster-agent/client.key \

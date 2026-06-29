@@ -1,0 +1,31 @@
+{
+  "cluster_name": "mycluster",
+  "region": "eu-west-1",
+  "az": "eu-west-1b",
+  "key_name": "muhamad-keypair",
+  "vpc_id": "vpc-be569ac7",
+  "sg_id": "sg-0fe389232948be1ef",
+  "subnet_id": "subnet-861862dc",
+  "ami_id": "ami-02d74237498939967",
+  "volume_id": "vol-038163e7e9b232f0c",
+  "etcd_ips": [
+    "172.31.33.3",
+    "172.31.34.68",
+    "172.31.44.46"
+  ],
+  "etcd_instance_ids": [
+    "i-00e2a0c7b7703e999",
+    "i-0c55ca126595338c6",
+    "i-0a6a0ce39b6ef03e8"
+  ],
+  "etcd_nlb_dns": "https://172.31.33.3:2379,https://172.31.34.68:2379,https://172.31.44.46:2379",
+  "compute_ips": [
+    "172.31.32.210",
+    "172.31.46.157"
+  ],
+  "compute_instance_ids": [
+    "i-07df18df2325c0458",
+    "i-08f89c63f1a07be4a"
+  ],
+  "created_at": "2026-06-29T12:39:08+02:00"
+}

@@ -214,10 +214,14 @@ VERIFY
 
 log ""
 log "=== etcd cluster ready ==="
-log "Endpoints:"
+ENDPOINTS=""
 for ip in "${ETCD_IP_ARRAY[@]}"; do
     echo "  https://${ip}:2379"
+    [[ -n "$ENDPOINTS" ]] && ENDPOINTS+=","
+    ENDPOINTS+="https://${ip}:2379"
 done
+# Update state with comma-separated endpoints
+state_put etcd_nlb_dns "\"$ENDPOINTS\""
 log ""
 log "Client certs for cluster-agent:"
 log "  CA:   $CERT_DIR/ca.crt"

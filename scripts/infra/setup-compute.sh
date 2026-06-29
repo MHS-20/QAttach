@@ -26,9 +26,9 @@ if [[ "$COMPUTE_COUNT" -eq 0 ]]; then
     die "No compute IPs in state file."
 fi
 
-NLB_DNS=$(state_get etcd_nlb_dns)
-if [[ -z "$NLB_DNS" || "$NLB_DNS" == "null" ]]; then
-    die "NLB DNS not found. Run setup-etcd.sh first."
+ETCD_ENDPOINTS=$(state_get etcd_nlb_dns)
+if [[ -z "$ETCD_ENDPOINTS" || "$ETCD_ENDPOINTS" == "null" ]]; then
+    die "etcd endpoints not found. Run setup-etcd.sh first."
 fi
 
 VOL_ID=$(state_get volume_id)
@@ -36,7 +36,7 @@ CLUSTER=$(state_get cluster_name)
 CERT_DIR="$PROJECT_ROOT/certs"
 
 log "=== Compute node setup ($COMPUTE_COUNT nodes) ==="
-log "etcd NLB:    $NLB_DNS"
+log "etcd:        $ETCD_ENDPOINTS"
 log "Volume:      $VOL_ID"
 log "Cluster:     $CLUSTER"
 log ""
@@ -149,7 +149,7 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/cluster-agent \\
   --node-id=NODE_ID_PLACEHOLDER \\
-  --etcd-endpoints=https://ETCD_NLB_PLACEHOLDER:2379 \\
+  --etcd-endpoints=ETCD_ENDPOINTS_PLACEHOLDER \\
   --etcd-cert=/etc/cluster-agent/client.crt \\
   --etcd-key=/etc/cluster-agent/client.key \\
   --etcd-ca=/etc/cluster-agent/ca.crt \\
@@ -165,7 +165,7 @@ WantedBy=multi-user.target
 EOF
 
 sudo sed -i "s/NODE_ID_PLACEHOLDER/\$(hostname)/" /etc/systemd/system/cluster-agent.service
-sudo sed -i "s|ETCD_NLB_PLACEHOLDER|${NLB_DNS}|" /etc/systemd/system/cluster-agent.service
+sudo sed -i "s|ETCD_ENDPOINTS_PLACEHOLDER|${ETCD_ENDPOINTS}|" /etc/systemd/system/cluster-agent.service
 sudo sed -i "s/VOL_ID_PLACEHOLDER/${VOL_ID}/" /etc/systemd/system/cluster-agent.service
 sudo sed -i "s/CLUSTER_PLACEHOLDER/${CLUSTER}/" /etc/systemd/system/cluster-agent.service
 sudo sed -i "s/AZ_PLACEHOLDER/${AZ}/" /etc/systemd/system/cluster-agent.service

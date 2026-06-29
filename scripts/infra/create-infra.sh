@@ -112,7 +112,7 @@ for i in $(seq 1 $ETCD_NODES); do
 
     INST_ID=$(aws ec2 run-instances \
         --image-id "$AMI_ID" \
-        --instance-type t3.medium \
+        --instance-type "$ETCD_INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
         --security-group-ids "$SG_ID" \
         --subnet-id "$SUBNET_ID" \
@@ -136,52 +136,20 @@ done
 state_save_array etcd_instance_ids "${ETCD_IDS[@]}"
 state_save_array etcd_ips "${ETCD_IPS[@]}"
 
-# ---- Step 5: etcd NLB ----
+# ---- Step 5: etcd endpoint (direct IPs, no NLB) ----
 
 log ""
-log "=== Creating etcd NLB ==="
+log "=== Building etcd endpoint list ==="
 
-NLB_ARN=$(aws elbv2 create-load-balancer \
-    --name "${CLUSTER_NAME}-etcd" \
-    --scheme internal \
-    --type network \
-    --subnets "$SUBNET_ID" \
-    --tags "Key=ClusterName,Value=$CLUSTER_NAME" \
-    --query 'LoadBalancers[0].LoadBalancerArn' --output text)
-
-log "NLB ARN: $NLB_ARN"
-
-# Target group
-TG_ARN=$(aws elbv2 create-target-group \
-    --name "${CLUSTER_NAME}-etcd-tg" \
-    --protocol TCP --port 2379 \
-    --vpc-id "$VPC_ID" \
-    --target-type instance \
-    --health-check-protocol HTTP --health-check-path /health \
-    --query 'TargetGroups[0].TargetGroupArn' --output text)
-
-# Wait for NLB provisioning
-sleep 5
-
-# Register etcd targets
-TARGETS=""
-for id in "${ETCD_IDS[@]}"; do
-    TARGETS+="Id=$id "
+# Concatenate IPs as comma-separated https://host:2379 endpoints
+ETCD_ENDPOINTS=""
+for ip in "${ETCD_IPS[@]}"; do
+    [[ -n "$ETCD_ENDPOINTS" ]] && ETCD_ENDPOINTS+=","
+    ETCD_ENDPOINTS+="https://${ip}:2379"
 done
-aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets $TARGETS
 
-# Listener
-aws elbv2 create-listener \
-    --load-balancer-arn "$NLB_ARN" \
-    --protocol TCP --port 2379 \
-    --default-actions Type=forward,TargetGroupArn="$TG_ARN"
-
-NLB_DNS=$(aws elbv2 describe-load-balancers \
-    --load-balancer-arns "$NLB_ARN" \
-    --query 'LoadBalancers[0].DNSName' --output text)
-
-log "NLB DNS: $NLB_DNS"
-state_put etcd_nlb_dns "\"$NLB_DNS\""
+log "Endpoints: $ETCD_ENDPOINTS"
+state_put etcd_nlb_dns "\"$ETCD_ENDPOINTS\""
 
 # ---- Step 6: EBS Multi-Attach volume ----
 
