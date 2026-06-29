@@ -7,11 +7,13 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/polarity/qattach/internal/config"
 	"github.com/polarity/qattach/internal/etcd"
 	"github.com/polarity/qattach/internal/fencing"
 	"github.com/polarity/qattach/internal/identity"
+	"github.com/polarity/qattach/internal/lifecycle"
 	"github.com/polarity/qattach/internal/lock"
 	"github.com/polarity/qattach/internal/netlink"
 	"github.com/polarity/qattach/internal/signal"
@@ -71,6 +73,21 @@ func main() {
 	// Start fencer watch loop.
 	go f.Run(ctx)
 
+	// Start ASG lifecycle hook poll if configured.
+	if cfg.ASGName != "" {
+		lh, err := lifecycle.NewHookHandler(id.InstanceID)
+		if err != nil {
+			log.Printf("lifecycle hook init error: %v", err)
+		} else {
+			go lh.PollTerminating(ctx, cfg.ASGName, 5*time.Second, func(hookCtx context.Context) error {
+				log.Printf("ASG terminating: deregistering node %s", cfg.NodeID)
+				_ = ec.DeregisterNode(hookCtx, cfg.NodeID)
+				nlSrv.Stop()
+				return nil
+			})
+		}
+	}
+
 	// Start netlink receive loop.
 	go func() {
 		if err := nlSrv.Serve(); err != nil {
@@ -104,6 +121,7 @@ func parseFlags() *config.Config {
 	flag.StringVar(&cfg.EtcdKeyFile, "etcd-key", "", "etcd client key file")
 	flag.StringVar(&cfg.EtcdCAFile, "etcd-ca", "", "etcd CA certificate file")
 
+	flag.StringVar(&cfg.ASGName, "asg-name", "", "Auto Scaling Group name for lifecycle hook handling")
 	flag.StringVar(&cfg.ClusterName, "cluster-name", "mycluster", "GFS2 cluster name")
 	flag.StringVar(&cfg.VolumeID, "volume-id", "", "EBS volume ID for fencing")
 	flag.StringVar(&cfg.AZ, "az", "us-east-1a", "availability zone")

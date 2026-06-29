@@ -15,6 +15,7 @@ type Config struct {
 	EtcdKeyFile   string
 	EtcdCAFile    string
 
+	ASGName     string
 	ClusterName string
 	VolumeID    string
 	AZ          string
