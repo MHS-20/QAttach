@@ -16,8 +16,9 @@ const (
 	MsgLockRel    = 6 // kernel → agent: release glock
 	MsgRecoveryOk = 7 // agent → kernel: node fenced, journal replay safe
 	MsgUnmount    = 8 // kernel → agent: filesystem unmounting
-	MsgMountReq   = 9 // kernel → agent: mount request (needs jid)
+	MsgMountReq   = 9  // kernel → agent: mount request (needs jid)
 	MsgMountResp  = 10 // agent → kernel: mount response with jid
+	MsgRegister   = 11 // agent → kernel: register PID for unicast replies
 )
 
 // LockRequest sent from kernel to agent requesting a glock.

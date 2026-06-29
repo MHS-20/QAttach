@@ -75,6 +75,13 @@ static void letcd_nl_recv(struct sk_buff *skb)
 	void *payload = nlmsg_data(nlh);
 	size_t plen = nlmsg_len(nlh);
 
+	/* Store agent PID on first REGISTER message */
+	if (nlh->nlmsg_type == LETCD_MSG_REGISTER && !agent_pid) {
+		agent_pid = NETLINK_CB(skb).portid;
+		pr_info("agent registered pid=%u\n", agent_pid);
+		return;
+	}
+
 	if (plen < 4)
 		return;
 
@@ -106,12 +113,17 @@ static void letcd_nl_recv(struct sk_buff *skb)
 	}
 }
 
+/* ---- agent PID tracking ---- */
+
+static u32 agent_pid;
+
 /* ---- create / destroy ---- */
 
 int letcd_netlink_init(void)
 {
 	struct netlink_kernel_cfg cfg = { .input = letcd_nl_recv };
 
+	agent_pid = 0;
 	letcd_nl_sk = netlink_kernel_create(&init_net, LETCD_NETLINK_FAMILY,
 					    &cfg);
 	if (!letcd_nl_sk) {
@@ -138,6 +150,10 @@ int letcd_nl_send_msg(int msg_type, const void *payload, size_t payload_len)
 
 	if (!letcd_nl_sk)
 		return -ENODEV;
+	if (!agent_pid) {
+		pr_debug("no agent pid registered yet\n");
+		return -ENODEV;
+	}
 
 	skb = nlmsg_new(NLMSG_HDRLEN + payload_len, GFP_ATOMIC);
 	if (!skb)
@@ -149,6 +165,6 @@ int letcd_nl_send_msg(int msg_type, const void *payload, size_t payload_len)
 		return -EMSGSIZE;
 	}
 	memcpy(nlmsg_data(nlh), payload, payload_len);
-	return nlmsg_unicast(letcd_nl_sk, skb, 0);
+	return nlmsg_unicast(letcd_nl_sk, skb, agent_pid);
 }
 EXPORT_SYMBOL(letcd_nl_send_msg);

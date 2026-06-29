@@ -21,6 +21,7 @@
 #define LETCD_MSG_UNMOUNT     8   /* kernel → agent: filesystem unmounting */
 #define LETCD_MSG_MOUNT_REQ   9   /* kernel → agent: mount request */
 #define LETCD_MSG_MOUNT_RESP  10  /* agent → kernel: mount response with jid */
+#define LETCD_MSG_REGISTER    11  /* agent → kernel: register PID for unicast */
 
 /* Lock modes — must match GFS2 LM_ST_* exactly */
 #define LETCD_LM_ST_UNLOCKED  0

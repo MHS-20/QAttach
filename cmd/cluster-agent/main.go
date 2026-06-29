@@ -92,8 +92,13 @@ func main() {
 		}
 	}
 
-	// Start netlink receive loop (if available).
+	// Start netlink receive loop and register with kernel (if available).
 	if nlSrv != nil {
+		if err := nlSrv.SendRegister(); err != nil {
+			log.Printf("netlink register error: %v", err)
+		} else {
+			log.Printf("netlink: registered with kernel module")
+		}
 		go func() {
 			if err := nlSrv.Serve(); err != nil {
 				log.Printf("netlink serve: %v", err)
