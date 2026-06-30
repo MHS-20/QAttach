@@ -160,7 +160,6 @@ ExecStart=/usr/local/bin/cluster-agent \\
   --volume-id=VOL_ID_PLACEHOLDER \\
   --cluster-name=CLUSTER_PLACEHOLDER \\
   --az=AZ_PLACEHOLDER
-ExecStop=/bin/umount /mnt/shared 2>/dev/null || true
 Restart=on-failure
 RestartSec=5
 
