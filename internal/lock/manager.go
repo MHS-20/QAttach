@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/polarity/qattach/internal/etcd"
@@ -13,9 +12,8 @@ import (
 )
 
 type heldLock struct {
-	cancel       context.CancelFunc
-	mode         string
-	waiterNodeID string
+	cancel context.CancelFunc
+	mode   string
 }
 
 type Manager struct {
@@ -46,51 +44,6 @@ func lockMapKey(lockType uint32, lockNumber uint64) string {
 		strconv.FormatUint(lockNumber, 10)
 }
 
-// ---- compatibility ----
-
-func etcdModeToNum(etcdMode string) uint32 {
-	switch etcdMode {
-	case protocol.EtcdModeEX:
-		return protocol.LockModeExclusive
-	case protocol.EtcdModeCW:
-		return protocol.LockModeDeferred
-	case protocol.EtcdModePR:
-		return protocol.LockModeShared
-	default:
-		return protocol.LockModeUnlocked
-	}
-}
-
-func compatibleBastMode(holderEtcdMode string, requesterMode uint32) (uint32, bool) {
-	h := etcdModeToNum(holderEtcdMode)
-	r := requesterMode
-	if h == protocol.LockModeShared && r == protocol.LockModeShared {
-		return 0, false
-	}
-	switch h {
-	case protocol.LockModeExclusive:
-		if r == protocol.LockModeShared {
-			return protocol.LockModeShared, true
-		}
-		return 0, false
-	case protocol.LockModeDeferred:
-		if r == protocol.LockModeShared {
-			return protocol.LockModeShared, true
-		}
-		if r == protocol.LockModeExclusive {
-			return protocol.LockModeUnlocked, true
-		}
-		return 0, false
-	case protocol.LockModeShared:
-		if r == protocol.LockModeExclusive || r == protocol.LockModeDeferred {
-			return protocol.LockModeUnlocked, true
-		}
-		return 0, false
-	default:
-		return 0, false
-	}
-}
-
 // ---- lock request handling ----
 
 func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
@@ -106,13 +59,6 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
-		if has, _ := m.etcdCli.CheckHandoff(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID); has {
-			log.Printf("handoff priority: type=%d num=%d",
-				req.GlockType, req.GlockNumber)
-			m.etcdCli.DeleteHandoff(ctx, req.GlockType, req.GlockNumber)
-		}
-
 		granted, rev, holderMode, holderNodeID, err :=
 			m.etcdCli.AcquireLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
@@ -125,12 +71,14 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 
 		if granted {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
-			m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
+			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
 		} else if holderNodeID == m.nodeID {
+			// Self-contention: we hold this lock, GFS2 wants a
+			// different mode.  Release and reacquire once.
 			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
 				req.GlockType, req.GlockNumber, holderMode, mode)
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
-			g2, r2, hm2, hn2, e2 := m.etcdCli.AcquireLock(ctx,
+			g2, r2, _, _, e2 := m.etcdCli.AcquireLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
 			if e2 != nil {
 				log.Printf("self-contention reacquire error: %v", e2)
@@ -139,38 +87,32 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			}
 			if g2 {
 				m.sendGrant(req.RequestID, req.RequestedMode, r2)
-				m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
-			} else if hn2 == m.nodeID {
-				// Still self-contention; retry via waiter path.
-				m.sendWait(req.RequestID)
-				go m.watchAndRetry(ctx, req)
+				m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
 			} else {
-				// Other holders still exist; request BAST to them.
-				target, ok := compatibleBastMode(hm2, req.RequestedMode)
-				if ok {
-					log.Printf("self→contended (other holders): holder=%s→bast=%d",
-						hm2, target)
-					m.etcdCli.RequestBast(ctx,
-						req.GlockType, req.GlockNumber, target, m.nodeID)
-				}
+				// Still contended (other holders present).
 				m.sendWait(req.RequestID)
 				go m.watchAndRetry(ctx, req)
 			}
 		} else {
-			target, ok := compatibleBastMode(holderMode, req.RequestedMode)
-			if ok {
-				log.Printf("lock contended: holder=%s requester=%d → bast target=%d",
-					holderMode, req.RequestedMode, target)
-				m.etcdCli.RequestBast(ctx,
-					req.GlockType, req.GlockNumber, target, m.nodeID)
-			} else {
-				log.Printf("lock contended (no downgrade path): holder=%s requester=%d",
-					holderMode, req.RequestedMode)
-			}
+			// Contended by another node.  Wait for natural release.
+			log.Printf("lock contended by %s (mode=%s), waiting",
+				holderNodeID, holderMode)
 			m.sendWait(req.RequestID)
 			go m.watchAndRetry(ctx, req)
 		}
 	}()
+}
+
+func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	mapKey := lockMapKey(lockType, lockNumber)
+	m.mu.Lock()
+	if prev, ok := m.heldLocks[mapKey]; ok {
+		prev.cancel()
+	}
+	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode}
+	m.mu.Unlock()
+	_ = ctx
 }
 
 func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumber uint64) {
@@ -185,74 +127,9 @@ func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumb
 		return
 	}
 	hl.cancel()
-
-	waiter := hl.waiterNodeID
-	if waiter != "" && waiter != m.nodeID {
-		if err := m.etcdCli.HandoffRelease(ctx,
-			lockType, lockNumber, waiter); err != nil {
-			log.Printf("handoff release error: %v", err)
-		} else {
-			log.Printf("handoff: type=%d num=%d → %s",
-				lockType, lockNumber, waiter)
-		}
-	}
-	// Single-key model: one release path handles all modes.
 	m.etcdCli.ReleaseLock(ctx, lockType, lockNumber, m.nodeID)
-	m.etcdCli.DeleteBastRequest(ctx, lockType, lockNumber)
 	log.Printf("released lock type=%d num=%d mode=%s",
 		lockType, lockNumber, hl.mode)
-}
-
-func (m *Manager) startBastWatch(parentCtx context.Context,
-	lockType uint32, lockNumber uint64, mode string) {
-
-	ctx, cancel := context.WithCancel(parentCtx)
-	mapKey := lockMapKey(lockType, lockNumber)
-
-	m.mu.Lock()
-	if prev, ok := m.heldLocks[mapKey]; ok {
-		prev.cancel()
-	}
-	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode}
-	m.mu.Unlock()
-
-	go func() {
-		defer cancel()
-		ch := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
-		for resp := range ch {
-			if resp.Err() != nil {
-				return
-			}
-			for _, ev := range resp.Events {
-				if ev.Type != 0 {
-					continue
-				}
-				val := string(ev.Kv.Value)
-				parts := strings.SplitN(val, ",", 2)
-				targetMode, err := strconv.ParseUint(parts[0], 10, 32)
-				if err != nil {
-					continue
-				}
-				waiterID := ""
-				if len(parts) > 1 {
-					waiterID = parts[1]
-				}
-				log.Printf("bast request: type=%d num=%d target=%d waiter=%s",
-					lockType, lockNumber, targetMode, waiterID)
-
-				if waiterID != "" {
-					m.mu.Lock()
-					if hl, ok := m.heldLocks[mapKey]; ok {
-						hl.waiterNodeID = waiterID
-					}
-					m.mu.Unlock()
-				}
-
-				m.sendBast(lockType, lockNumber, uint32(targetMode))
-				break
-			}
-		}
-	}()
 }
 
 func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
@@ -288,15 +165,8 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 	watchCh := m.etcdCli.WatchLockKey(ctx, req.GlockType, req.GlockNumber)
 	for resp := range watchCh {
 		for _, ev := range resp.Events {
-			if ev.Type == 1 {
+			if ev.Type == 1 { // DELETE
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
-				if has, _ := m.etcdCli.CheckHandoff(ctx,
-					req.GlockType, req.GlockNumber, m.nodeID); has {
-					log.Printf("handoff priority (retry): type=%d num=%d",
-						req.GlockType, req.GlockNumber)
-					m.etcdCli.DeleteHandoff(ctx,
-						req.GlockType, req.GlockNumber)
-				}
 				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
 				if err != nil {
@@ -306,7 +176,7 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 				}
 				if granted {
 					m.sendGrant(req.RequestID, req.RequestedMode, rev)
-					m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
+					m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
 				}
 				return
 			}
@@ -346,20 +216,6 @@ func (m *Manager) sendWait(requestID uint64) {
 		RequestID: requestID,
 	}); err != nil {
 		log.Printf("send wait error: %v", err)
-	}
-}
-
-func (m *Manager) sendBast(lockType uint32, lockNumber uint64, targetMode uint32) {
-	if m.nlSrv == nil {
-		return
-	}
-	if err := m.nlSrv.SendBast(protocol.BastNotification{
-		GlockNumber: lockNumber, GlockType: lockType, TargetMode: targetMode,
-	}); err != nil {
-		log.Printf("send bast error: %v", err)
-	} else {
-		log.Printf("sent bast: type=%d num=%d target=%d",
-			lockType, lockNumber, targetMode)
 	}
 }
 
