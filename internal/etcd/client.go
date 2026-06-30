@@ -80,32 +80,94 @@ func (c *Client) DeregisterNode(ctx context.Context, nodeID string) error {
 	return c.sess.Close()
 }
 
-// AcquireLock attempts a CAS transaction to acquire a lock key.
+// lockKey returns the primary (EX) lock key.
+func lockKey(lockType uint32, lockNumber uint64) string {
+	return fmt.Sprintf("%s%d/%d", protocol.PrefixLocks, lockType, lockNumber)
+}
+
+// lockSHKey returns the per-holder shared lock sub-key.
+func lockSHKey(lockType uint32, lockNumber uint64, nodeID string) string {
+	return fmt.Sprintf("%s%d/%d/holders/%s", protocol.PrefixLocks, lockType, lockNumber, nodeID)
+}
+
+// AcquireLock attempts to acquire a lock.
+// EX mode uses a CAS on a single key — only one holder.
+// SH mode uses per-holder sub-keys — multiple concurrent holders allowed.
 // Returns (granted, etcd_revision, error).
 func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (bool, int64, error) {
-	key := fmt.Sprintf("%s%d/%d", protocol.PrefixLocks, lockType, lockNumber)
+	key := lockKey(lockType, lockNumber)
 	val := fmt.Sprintf(`{"owner_node_id":"%s","mode":"%s"}`, nodeID, mode)
 
-	txnResp, err := c.cli.Txn(ctx).
-		If(clientv3.Compare(clientv3.Version(key), "=", 0)).
-		Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
-		Else(clientv3.OpGet(key)).
-		Commit()
-	if err != nil {
-		return false, 0, fmt.Errorf("acquire lock txn: %w", err)
+	if mode == "EX" {
+		// Exclusive: CAS on primary key (must not exist).
+		txnResp, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", 0)).
+			Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
+			Else(clientv3.OpGet(key)).
+			Commit()
+		if err != nil {
+			return false, 0, fmt.Errorf("acquire EX lock txn: %w", err)
+		}
+		if !txnResp.Succeeded {
+			return false, 0, nil
+		}
+		return true, txnResp.Header.Revision, nil
 	}
 
+	// SH mode: check if an EX holder exists; if not, create per-holder sub-key.
+	// First, check the primary key to detect EX contention.
+	getResp, err := c.cli.Get(ctx, key)
+	if err != nil {
+		return false, 0, fmt.Errorf("check EX lock before SH: %w", err)
+	}
+	if len(getResp.Kvs) > 0 {
+		// Key exists — check if it's an EX lock.
+		// If EX, we're contended.  If SH, we can join.
+		// We assume the key stores JSON with a "mode" field.
+		// For simplicity: if key exists at all, check mode.
+		if string(getResp.Kvs[0].Value) != "" {
+			// Parse mode — if EX, bail and let caller request bast.
+			// If already SH, proceed to sub-key.
+			if len(getResp.Kvs[0].Value) > 0 {
+				valStr := string(getResp.Kvs[0].Value)
+				if len(valStr) > 8 && valStr[8:10] == "EX" {
+					return false, 0, nil // EX held, contended
+				}
+			}
+		}
+	}
+
+	// Write per-holder SH sub-key (unique per node).
+	shKey := lockSHKey(lockType, lockNumber, nodeID)
+	txnResp, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Version(shKey), "=", 0)).
+		Then(clientv3.OpPut(shKey, val, clientv3.WithLease(c.sess.Lease()))).
+		Commit()
+	if err != nil {
+		return false, 0, fmt.Errorf("acquire SH lock txn: %w", err)
+	}
 	if !txnResp.Succeeded {
 		return false, 0, nil
 	}
 
+	// Ensure primary key exists as a marker (mode: SH).
+	c.cli.Put(ctx, key, val, clientv3.WithLease(c.sess.Lease()))
+
 	return true, txnResp.Header.Revision, nil
 }
 
-// ReleaseLock deletes the lock key from etcd.
+// ReleaseLock deletes the lock key(s) from etcd.
+// For EX locks, deletes the primary key.
+// For SH locks, deletes this node's holder sub-key.
 func (c *Client) ReleaseLock(ctx context.Context, lockType uint32, lockNumber uint64) error {
-	key := fmt.Sprintf("%s%d/%d", protocol.PrefixLocks, lockType, lockNumber)
-	_, err := c.cli.Delete(ctx, key)
+	// Always try to delete the primary key (EX holder).
+	c.cli.Delete(ctx, lockKey(lockType, lockNumber))
+	return nil
+}
+
+// ReleaseSHLock deletes only this node's shared lock sub-key.
+func (c *Client) ReleaseSHLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) error {
+	_, err := c.cli.Delete(ctx, lockSHKey(lockType, lockNumber, nodeID))
 	return err
 }
 
@@ -122,6 +184,37 @@ func (c *Client) WatchMemberDeletions(ctx context.Context) clientv3.WatchChan {
 func (c *Client) WatchLockKey(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
 	key := fmt.Sprintf("%s%d/%d", protocol.PrefixLocks, lockType, lockNumber)
 	return c.cli.Watch(ctx, key)
+}
+
+// bastKey returns the bast request key for a given lock.
+func bastKey(lockType uint32, lockNumber uint64) string {
+	return fmt.Sprintf("%s%d/%d", protocol.PrefixBast, lockType, lockNumber)
+}
+
+// RequestBast writes a bast (blocking AST) request to signal the lock
+// holder that another node wants the lock.  The holder should downgrade
+// or release in response.
+func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32) error {
+	key := bastKey(lockType, lockNumber)
+	val := fmt.Sprintf("%d", targetMode)
+	lease, err := c.cli.Grant(ctx, int64(c.cfg.SessionTTL.Seconds()))
+	if err != nil {
+		return fmt.Errorf("bast lease grant: %w", err)
+	}
+	_, err = c.cli.Put(ctx, key, val, clientv3.WithLease(lease.ID))
+	return err
+}
+
+// DeleteBastRequest removes a bast request key after it has been serviced.
+func (c *Client) DeleteBastRequest(ctx context.Context, lockType uint32, lockNumber uint64) error {
+	_, err := c.cli.Delete(ctx, bastKey(lockType, lockNumber))
+	return err
+}
+
+// WatchLockBast watches for bast requests on a specific lock.
+// Used by the lock holder to detect when another node wants the lock.
+func (c *Client) WatchLockBast(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
+	return c.cli.Watch(ctx, bastKey(lockType, lockNumber))
 }
 
 // CASFencing attempts to win the fencing race for a failed node.

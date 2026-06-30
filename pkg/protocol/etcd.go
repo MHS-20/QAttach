@@ -6,6 +6,8 @@ const (
 	PrefixFencing = "cluster/fencing/"   // /cluster/fencing/{node_id}
 	KeyEpoch      = "cluster/epoch"      // /cluster/epoch
 	PrefixLocks   = "locks/glock/"       // /locks/glock/{type}/{number}
+	PrefixLockSH  = "locks/glock/"       // /locks/glock/{type}/{number}/holders/{nodeID}
+	PrefixBast    = "locks/bast/"        // /locks/bast/{type}/{number}  — BAST request signal
 )
 
 // MemberInfo stored in /cluster/members/{node_id}.
