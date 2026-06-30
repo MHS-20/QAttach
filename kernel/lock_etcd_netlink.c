@@ -51,7 +51,8 @@ static void dispatch_lock_wait(struct letcd_lock_wait *wait)
 	struct gfs2_glock *gl = letcd_pending_remove(wait->request_id);
 	if (!gl)
 		return;
-	letcd_pending_insert(wait->request_id, gl);
+	letcd_pending_insert(wait->request_id, gl,
+			     gl->gl_name.ln_type, gl->gl_name.ln_number);
 }
 
 static void dispatch_bast(struct letcd_bast *bast)

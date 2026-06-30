@@ -15,22 +15,23 @@
 #include "letcd_netlink.h"
 
 #define LETCD_PENDING_BITS  8
+
+/* Ordered lock queue entry — prevents deadlock by serialising
+ * lock acquisition per node into a consistent global order.
+ * Entries are sorted by (glock_type << 56 | glock_number).
+ */
+struct letcd_ordered_entry {
+	struct list_head  list;
+	u64               order_key;
+	struct completion done;
+	bool              completed;
+};
+
 struct letcd_pending_entry {
 	u64 request_id;
 	struct gfs2_glock *gl;
 	struct hlist_node node;
 	struct letcd_ordered_entry ordered;
-};
-
-/* Ordered lock queue entry — prevents deadlock by serialising
- * lock acquisition per node into a consistent global order.
- * Entries are sorted by (glock_type << 32 | glock_number).
- */
-struct letcd_ordered_entry {
-	struct list_head  list;
-	u64               order_key;   /* (type<<32) | number */
-	struct completion done;
-	bool              completed;
 };
 
 extern spinlock_t letcd_pending_lock;
