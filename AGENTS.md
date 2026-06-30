@@ -90,3 +90,28 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 ## Design doc
 
 `docs/general_plan.md` — 843 lines, covers every architectural decision, IAM policy, etcd key schema, phased plan, test matrix, and all reference URLs.
+
+## Current status
+
+### Working
+
+- Single-key lock model (one key per lock, JSON holder array)
+- Cross-node reads (node1 reads files written by node0)
+- BAST delivery end-to-end
+- Atomic handoff (holder→waiter reservation via `/next` key)
+- Self-contention handling with other holders
+- Journal ID CAS assignment
+- Go↔C struct padding
+- Agent PID re-registration on restart
+
+### Not yet working
+
+- Node1 writes hang: GFS2 metadata locks EX→SH demotion not guaranteed
+
+See `docs/etcd-schema.md` for the single-key holder-array key layout and `docs/bast-mechanism.md` for the atomic handoff design.
+
+### Test workflow quirks
+
+- **The cluster-agent systemd unit must NOT have `ExecStop=umount`** — it bricks agent restarts. If GFS2 is mounted and the unit has an ExecStop umount, systemd will try to unmount on restart, hang because the filesystem is busy, and the agent will never come back.
+- **Agent restart requires a reboot if GFS2 is mounted** when ExecStop includes umount. Removing ExecStop fixes this — the agent can restart cleanly while GFS2 stays mounted.
+- **Nodes with hung GFS2 need force-terminate, not graceful shutdown** — graceful shutdown tries to unmount, which hangs. Use `aws ec2 stop-instances --force` or `aws ec2 terminate-instances`.

@@ -9,7 +9,8 @@ or release the lock.  In QAttach, BAST is coordinated through etcd.
 ## The Contention Problem
 
 When node B wants a lock held by node A in an incompatible mode, the etcd CAS
-fails because the key already exists.  Node B's agent must:
+or Txn fails because the holder array already has an incompatible entry.  Node B's
+agent must:
 
 1. Signal node A that someone is waiting (BAST request)
 2. Tell its local kernel to wait (LOCK_WAIT)
@@ -22,9 +23,9 @@ Without step 1, node A never knows to release, and node B waits forever.
 ```
         Node A (holder)                    etcd                    Node B (waiter)
         ───────────────                    ────                    ───────────────
-  1.    holds lock (EX)                   key=EX                  
+  1.    holds lock (EX)                   holder array=[{A,EX}]
   2.                                                              lock request (SH)
-  3.                                                              CAS fails (EX held)
+  3.                                                              Txn fails (EX present in array)
   4.                                                              write bast key (target=SH)
   5.                                                              send LOCK_WAIT to kernel
   6.                                                              watch lock key
@@ -33,10 +34,9 @@ Without step 1, node A never knows to release, and node B waits forever.
   9.    sends BAST to kernel
  10.    GFS2: glock_cb(SH)
  11.    GFS2: letcd_lock(SH)
- 12.    agent: release EX                key deleted
- 13.    agent: acquire SH                key=SH (sub-key)
- 14.                                                              watch fires (DELETE)
- 15.                                                              retry CAS → SH succeeds
+ 12.    agent: release EX                Txn: remove A from array, add A with PR
+ 13.                                                              watch fires (array changed)
+ 14.                                                              Txn: append B with PR → succeeds
 ```
 
 ## BAST Request Keys
@@ -47,7 +47,7 @@ Value: target mode (integer: 0=UNLOCK, 1=EX, 2=DF, 3=SH)
 The waiter writes this key.  The holder watches it.  The holder deletes it after
 processing (typically in `releaseHeldLock` when the lock is actually released).
 
-The dealer uses a short lease (15s) so stale bast requests auto-expire.
+The waiter uses a short lease (15s) so stale bast requests auto-expire.
 
 ## The Livelock Problem
 
@@ -56,15 +56,15 @@ The flow above has a critical race condition:
 ```
 Time  Holder (SH)                     etcd                  Waiter (wants EX)
 ────  ──────────────────────          ────                  ─────────────────
-  1   holds SH                                              CAS fails → SH held
+  1   holds SH (array=[{A,PR}])                             Txn fails → SH held
   2                                                          writes bast(UNLOCK)
   3   bast fires → sendBast(UNLOCK)
   4   GFS2: letcd_lock(UNLOCK)
-  5   agent: delete SH key ────────  key deleted ────────  watch fires
+  5   agent: delete from array ────  key deleted ────────  watch fires
   6   GFS2: glock work runs:
       "I still need EX"
   7   letcd_lock(EX)
-  8   agent: CAS → succeeds ────────  key=EX created       
+  8   agent: CAS → succeeds ────────  array=[{A,EX}]
   9                                                          CAS → fails again
  10                                                          contention loop
 ```
@@ -100,31 +100,34 @@ but the holder may reacquire EX if it still needs it.
 For EX+EX: no BAST is sent because EX cannot coexist with EX.  The waiter
 must wait for the holder to release naturally (I/O completion, unmount, etc.).
 
-## Proposed Solution: Atomic Handoff
+## Implemented Solution: Atomic Handoff
 
 To eliminate the race window, the holder's release must atomically reserve
-the lock for the waiter:
+the lock for the waiter.  The handoff token is at `/locks/glock/{type}/{number}/next`
+with the waiter's nodeID.
 
 ```
-Holder releases (BAST-triggered):
-  etcd Txn:
-    IF (lock key exists AND I am the holder)
-    THEN: Delete(lock key), Put(/locks/glock/{type}/{number}/next, waiterID, lease=5s)
+Holder releases (BAST-triggered) in a single etcd Txn:
+  IF (lock key Version matches AND I am in the holder array)
+  THEN:
+    1. Remove my entry from the holder array
+    2. If array is now empty, Delete the lock key
+    3. Put /locks/glock/{type}/{number}/next = waiterID (lease=5s)
 
 Waiter watches:
-  if /next appears with my ID → I have priority, CAS succeeds
-  if lock key deleted without /next → normal CAS race
+  if /next appears with my ID → I have priority, Txn succeeds
+  if lock key deleted/modified without /next → normal retry
 ```
 
-The handoff token (`/next`) acts as a reservation.  The 5s lease prevents
-permanent reservation if the waiter crashes.  The transaction is atomic:
-either the holder holds the lock OR the handoff token exists — never both,
-never neither.
+The holder's release transaction deletes the lock key (if all holders removed)
+and writes the handoff token atomically.  The 5s lease prevents permanent
+reservation if the waiter crashes.  The transaction is atomic: either the
+holder holds the lock OR the handoff token exists — never both, never neither.
 
 This guarantees the waiter wins the race because:
-1. Holder atomically deletes key + writes handoff
+1. Holder atomically removes self from array + writes handoff
 2. Holder's glock work runs, tries to CAS → fails (handoff exists)
-3. Waiter's watch fires on /next → CAS → succeeds
+3. Waiter's watch fires on /next → Txn → succeeds
 4. Waiter deletes /next
 
 The holder can only reacquire after the handoff expires (if waiter crashes)
