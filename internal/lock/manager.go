@@ -141,10 +141,13 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
 		} else if holderNodeID == m.nodeID {
 			// Self-contention: we hold this lock and want a different mode.
-			// Release and reacquire in-place instead of contending.
+			// Release everything (EX key + any SH sub-key) and reacquire.
 			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
 				req.GlockType, req.GlockNumber, holderMode, mode)
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
+			// Also clean SH sub-key in case we previously held SH.
+			m.etcdCli.ReleaseSHLock(ctx,
+				req.GlockType, req.GlockNumber, m.nodeID)
 			// Retry once after releasing.
 			g2, r2, _, _, e2 := m.etcdCli.AcquireLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
