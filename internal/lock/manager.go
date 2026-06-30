@@ -11,10 +11,10 @@ import (
 	"github.com/polarity/qattach/pkg/protocol"
 )
 
-// heldLock tracks a lock held by this node so we can clean up BAST watches.
+// heldLock tracks a lock held by this node.
 type heldLock struct {
 	cancel context.CancelFunc
-	mode   string // EX or PR (=SH in etcd terms)
+	mode   string // etcd mode: EX, PR, CW
 }
 
 // Manager handles glock requests from the kernel module via etcd.
@@ -23,11 +23,11 @@ type Manager struct {
 	nlSrv   *netlink.Server
 	nodeID  string
 
-	mu           sync.Mutex
-	mountReqs    map[uint64]chan int32
-	mountJID     int32
-	nextJID      int32
-	heldLocks    map[string]*heldLock // key: "type/number"
+	mu        sync.Mutex
+	mountReqs map[uint64]chan int32
+	mountJID  int32
+	nextJID   int32
+	heldLocks map[string]*heldLock // key: "type/number"
 }
 
 // NewManager creates a lock manager.
@@ -42,16 +42,79 @@ func NewManager(ec *etcd.Client, nodeID string) *Manager {
 	}
 }
 
-// SetNetlink sets the netlink server reference (used after server init).
+// SetNetlink sets the netlink server reference.
 func (m *Manager) SetNetlink(srv *netlink.Server) {
 	m.nlSrv = srv
 }
 
-// lockKey builds the map key for tracking held locks.
 func lockMapKey(lockType uint32, lockNumber uint64) string {
 	return strconv.FormatUint(uint64(lockType), 10) + "/" +
 		strconv.FormatUint(lockNumber, 10)
 }
+
+// ---- lock compatibility ----
+
+// etcdModeToNum maps etcd mode strings back to GFS2 LM_ST_* values.
+func etcdModeToNum(etcdMode string) uint32 {
+	switch etcdMode {
+	case protocol.EtcdModeEX:
+		return protocol.LockModeExclusive
+	case protocol.EtcdModeCW:
+		return protocol.LockModeDeferred
+	case protocol.EtcdModePR:
+		return protocol.LockModeShared
+	default:
+		return protocol.LockModeUnlocked
+	}
+}
+
+// compatibleBastMode returns the target mode for a BAST demotion, or 0
+// if no compatible downgrade exists (holder should not be disturbed).
+//
+// Based on GFS2 lock compatibility matrix:
+//
+//	Holder↓ Requester→  EX      DF      SH
+//	EX                  ✗       ✗       →SH
+//	DF                  ✗       ✓       →SH
+//	SH                  ✗       ✗       ✓
+func compatibleBastMode(holderEtcdMode string, requesterMode uint32) uint32 {
+	h := etcdModeToNum(holderEtcdMode)
+	r := requesterMode
+
+	// Already compatible — no BAST needed (shouldn't reach here).
+	if h == r {
+		return 0
+	}
+	// SH + SH is compatible.
+	if h == protocol.LockModeShared && r == protocol.LockModeShared {
+		return 0
+	}
+
+	switch h {
+	case protocol.LockModeExclusive:
+		if r == protocol.LockModeShared {
+			return protocol.LockModeShared // EX → SH
+		}
+		return 0 // EX can't downgrade for EX or DF requester
+
+	case protocol.LockModeDeferred:
+		if r == protocol.LockModeShared {
+			return protocol.LockModeShared // DF → SH
+		}
+		return 0 // DF can't downgrade for EX requester
+
+	case protocol.LockModeShared:
+		if r == protocol.LockModeExclusive || r == protocol.LockModeDeferred {
+			return protocol.LockModeUnlocked // SH must release for EX/DF
+		}
+		return 0
+
+	default:
+		return 0
+	}
+}
+
+// ---- lock request handling ----
 
 // HandleLockRequest processes a lock request from the kernel module.
 func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
@@ -63,12 +126,11 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 
 		mode := protocol.LockModeToEtcd(req.RequestedMode)
 		if mode == "" {
-			// UNLOCKED → release the lock.
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 			return
 		}
 
-		granted, rev, err := m.etcdCli.AcquireLock(ctx,
+		granted, rev, holderMode, err := m.etcdCli.AcquireLock(ctx,
 			req.GlockType, req.GlockNumber, m.nodeID, mode)
 		if err != nil {
 			log.Printf("lock acquire error type=%d num=%d: %v",
@@ -81,11 +143,18 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
 		} else {
-			// Contended — signal the holder via bast, then wait.
-			targetMode := compatibleBastMode(req.RequestedMode)
-			if err := m.etcdCli.RequestBast(ctx,
-				req.GlockType, req.GlockNumber, targetMode); err != nil {
-				log.Printf("bast request error: %v", err)
+			// Only request bast if a compatible downgrade exists.
+			target := compatibleBastMode(holderMode, req.RequestedMode)
+			if target != 0 {
+				log.Printf("lock contended: holder=%s requester=%d → bast target=%d",
+					holderMode, req.RequestedMode, target)
+				if err := m.etcdCli.RequestBast(ctx,
+					req.GlockType, req.GlockNumber, target); err != nil {
+					log.Printf("bast request error: %v", err)
+				}
+			} else {
+				log.Printf("lock contended (no downgrade path): holder=%s requester=%d",
+					holderMode, req.RequestedMode)
 			}
 			m.sendWait(req.RequestID)
 			go m.watchAndRetry(ctx, req)
@@ -93,8 +162,6 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 	}()
 }
 
-// releaseHeldLock cleans up a held lock, cancels its bast watch,
-// and removes it from etcd.
 func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumber uint64) {
 	mapKey := lockMapKey(lockType, lockNumber)
 	m.mu.Lock()
@@ -117,9 +184,6 @@ func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumb
 	}
 }
 
-// startBastWatch spawns a goroutine that watches for BAST requests on
-// a lock we hold.  When a BAST request arrives, we send a BAST to the
-// kernel so GFS2 can demote the lock.
 func (m *Manager) startBastWatch(parentCtx context.Context,
 	lockType uint32, lockNumber uint64, mode string) {
 
@@ -127,7 +191,6 @@ func (m *Manager) startBastWatch(parentCtx context.Context,
 	mapKey := lockMapKey(lockType, lockNumber)
 
 	m.mu.Lock()
-	// Cancel previous watch if re-acquiring the same lock.
 	if prev, ok := m.heldLocks[mapKey]; ok {
 		prev.cancel()
 	}
@@ -139,10 +202,10 @@ func (m *Manager) startBastWatch(parentCtx context.Context,
 		ch := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
 		for resp := range ch {
 			if resp.Err() != nil {
-				return // context cancelled or error
+				return
 			}
 			for _, ev := range resp.Events {
-				if ev.Type != 0 { // PUT
+				if ev.Type != 0 { // not PUT
 					continue
 				}
 				targetMode, err := strconv.ParseUint(
@@ -153,25 +216,12 @@ func (m *Manager) startBastWatch(parentCtx context.Context,
 				log.Printf("bast request: type=%d num=%d target=%d",
 					lockType, lockNumber, targetMode)
 				m.sendBast(lockType, lockNumber, uint32(targetMode))
-				// Clean up the bast key (the requester will retry).
-				m.etcdCli.DeleteBastRequest(ctx,
-					lockType, lockNumber)
-				return // one BAST is enough; GFS2 will demote
+				// Keep watch alive — GFS2 may reacquire and need another BAST.
+				// The bast request key is cleaned up in releaseHeldLock.
+				break // one BAST per event batch; continue watching
 			}
 		}
 	}()
-}
-
-// compatibleBastMode returns a target mode that is compatible with
-// the requested mode.  For SH requests, ask the EX holder to
-// downgrade to SH.  For EX requests, ask any holder to release.
-func compatibleBastMode(requestedMode uint32) uint32 {
-	switch requestedMode {
-	case protocol.LockModeShared:
-		return protocol.LockModeShared
-	default:
-		return protocol.LockModeShared // conservative: request SH
-	}
 }
 
 // HandleLockRelease processes a lock release from the kernel module.
@@ -183,7 +233,6 @@ func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
 // HandleUnmount cleans up when the filesystem unmounts.
 func (m *Manager) HandleUnmount() {
 	log.Printf("filesystem unmounting — releasing all resources")
-	// etcd session will be closed and delete all lock keys automatically.
 }
 
 // HandleMountRequest handles the initial mount request from kernel module.
@@ -195,7 +244,7 @@ func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 		m.mu.Unlock()
 
 		clusterName := cstring(req.ClusterName[:])
-		_ = clusterName // used for membership context
+		_ = clusterName
 
 		m.mountJID = jid
 
@@ -212,9 +261,8 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 	for resp := range watchCh {
 		for _, ev := range resp.Events {
 			if ev.Type == 1 { // DELETE
-				// Lock released — retry acquisition.
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
-				granted, rev, err := m.etcdCli.AcquireLock(ctx,
+				granted, rev, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
 				if err != nil {
 					log.Printf("retry lock acquire error: %v", err)
@@ -299,7 +347,6 @@ func (m *Manager) sendMountResponse(requestID uint64, jid int32) {
 	}
 }
 
-// cstring extracts a null-terminated string from a fixed-size byte array.
 func cstring(b []byte) string {
 	for i, v := range b {
 		if v == 0 {

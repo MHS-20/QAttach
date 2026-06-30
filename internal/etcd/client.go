@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -90,70 +91,83 @@ func lockSHKey(lockType uint32, lockNumber uint64, nodeID string) string {
 	return fmt.Sprintf("%s%d/%d/holders/%s", protocol.PrefixLocks, lockType, lockNumber, nodeID)
 }
 
+// lockInfo is the JSON value stored in a lock key.
+type lockInfo struct {
+	OwnerNodeID string `json:"owner_node_id"`
+	Mode        string `json:"mode"` // EX, PR (etcd name for SH)
+}
+
+// parseLockMode extracts the etcd mode string from a lock key value.
+// Returns "" if parsing fails.
+func parseLockMode(raw []byte) string {
+	var li lockInfo
+	if err := json.Unmarshal(raw, &li); err != nil {
+		return ""
+	}
+	return li.Mode
+}
+
 // AcquireLock attempts to acquire a lock.
 // EX mode uses a CAS on a single key — only one holder.
 // SH mode uses per-holder sub-keys — multiple concurrent holders allowed.
-// Returns (granted, etcd_revision, error).
-func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (bool, int64, error) {
+// Returns (granted, etcd_revision, holder_etcd_mode, error).
+// On failure (granted=false), holderMode is the etcd mode of the current
+// holder (empty string if no holder or parse error).
+func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (bool, int64, string, error) {
 	key := lockKey(lockType, lockNumber)
 	val := fmt.Sprintf(`{"owner_node_id":"%s","mode":"%s"}`, nodeID, mode)
 
 	if mode == "EX" {
-		// Exclusive: CAS on primary key (must not exist).
 		txnResp, err := c.cli.Txn(ctx).
 			If(clientv3.Compare(clientv3.Version(key), "=", 0)).
 			Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
 			Else(clientv3.OpGet(key)).
 			Commit()
 		if err != nil {
-			return false, 0, fmt.Errorf("acquire EX lock txn: %w", err)
+			return false, 0, "", fmt.Errorf("acquire EX lock txn: %w", err)
 		}
 		if !txnResp.Succeeded {
-			return false, 0, nil
-		}
-		return true, txnResp.Header.Revision, nil
-	}
-
-	// SH mode: check if an EX holder exists; if not, create per-holder sub-key.
-	// First, check the primary key to detect EX contention.
-	getResp, err := c.cli.Get(ctx, key)
-	if err != nil {
-		return false, 0, fmt.Errorf("check EX lock before SH: %w", err)
-	}
-	if len(getResp.Kvs) > 0 {
-		// Key exists — check if it's an EX lock.
-		// If EX, we're contended.  If SH, we can join.
-		// We assume the key stores JSON with a "mode" field.
-		// For simplicity: if key exists at all, check mode.
-		if string(getResp.Kvs[0].Value) != "" {
-			// Parse mode — if EX, bail and let caller request bast.
-			// If already SH, proceed to sub-key.
-			if len(getResp.Kvs[0].Value) > 0 {
-				valStr := string(getResp.Kvs[0].Value)
-				if len(valStr) > 8 && valStr[8:10] == "EX" {
-					return false, 0, nil // EX held, contended
+			hm := ""
+			if len(txnResp.Responses) > 0 {
+				for _, ev := range txnResp.Responses[0].GetResponseRange().Kvs {
+					hm = parseLockMode(ev.Value)
+					break
 				}
 			}
+			return false, 0, hm, nil
+		}
+		return true, txnResp.Header.Revision, "", nil
+	}
+
+	// SH mode: check if an EX holder exists.
+	getResp, err := c.cli.Get(ctx, key)
+	if err != nil {
+		return false, 0, "", fmt.Errorf("check EX lock before SH: %w", err)
+	}
+	hm := ""
+	if len(getResp.Kvs) > 0 {
+		hm = parseLockMode(getResp.Kvs[0].Value)
+		if hm == "EX" {
+			return false, 0, hm, nil // EX held, contended
 		}
 	}
 
-	// Write per-holder SH sub-key (unique per node).
+	// Write per-holder SH sub-key.
 	shKey := lockSHKey(lockType, lockNumber, nodeID)
 	txnResp, err := c.cli.Txn(ctx).
 		If(clientv3.Compare(clientv3.Version(shKey), "=", 0)).
 		Then(clientv3.OpPut(shKey, val, clientv3.WithLease(c.sess.Lease()))).
 		Commit()
 	if err != nil {
-		return false, 0, fmt.Errorf("acquire SH lock txn: %w", err)
+		return false, 0, "", fmt.Errorf("acquire SH lock txn: %w", err)
 	}
 	if !txnResp.Succeeded {
-		return false, 0, nil
+		return false, 0, "", nil
 	}
 
-	// Ensure primary key exists as a marker (mode: SH).
 	c.cli.Put(ctx, key, val, clientv3.WithLease(c.sess.Lease()))
 
-	return true, txnResp.Header.Revision, nil
+	return true, txnResp.Header.Revision, "", nil
 }
 
 // ReleaseLock deletes the lock key(s) from etcd.
