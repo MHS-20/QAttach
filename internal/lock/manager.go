@@ -68,8 +68,9 @@ func etcdModeToNum(etcdMode string) uint32 {
 	}
 }
 
-// compatibleBastMode returns the target mode for a BAST demotion, or 0
-// if no compatible downgrade exists.
+// compatibleBastMode returns the target mode and whether a BAST should be sent.
+// Returns (target, true) if the holder can downgrade to a mode compatible
+// with the requester, or (0, false) if no compatible downgrade exists.
 //
 // Based on GFS2 lock compatibility matrix:
 //
@@ -77,42 +78,38 @@ func etcdModeToNum(etcdMode string) uint32 {
 //	EX                  ✗       ✗       →SH
 //	DF                  ✗       ✓       →SH
 //	SH                  ✗       ✗       ✓
-//
-// EX→SH is always valid per the mode matrix; the holder's GFS2 decides
-// whether to comply.  The bast watch stays alive to retry if the holder
-// reacquires EX.
-func compatibleBastMode(holderEtcdMode string, requesterMode uint32) uint32 {
+func compatibleBastMode(holderEtcdMode string, requesterMode uint32) (uint32, bool) {
 	h := etcdModeToNum(holderEtcdMode)
 	r := requesterMode
 
 	if h == protocol.LockModeShared && r == protocol.LockModeShared {
-		return 0 // already compatible
+		return 0, false // already compatible
 	}
 
 	switch h {
 	case protocol.LockModeExclusive:
 		if r == protocol.LockModeShared {
-			return protocol.LockModeShared // EX → SH
+			return protocol.LockModeShared, true // EX → SH
 		}
-		return 0 // EX can't demote for EX or DF requester
+		return 0, false
 
 	case protocol.LockModeDeferred:
 		if r == protocol.LockModeShared {
-			return protocol.LockModeShared // DF → SH
+			return protocol.LockModeShared, true // DF → SH
 		}
 		if r == protocol.LockModeExclusive {
-			return protocol.LockModeUnlocked // DF must release for EX
+			return protocol.LockModeUnlocked, true // DF must release
 		}
-		return 0
+		return 0, false
 
 	case protocol.LockModeShared:
 		if r == protocol.LockModeExclusive || r == protocol.LockModeDeferred {
-			return protocol.LockModeUnlocked // SH must release for EX/DF
+			return protocol.LockModeUnlocked, true // SH must release
 		}
-		return 0
+		return 0, false
 
 	default:
-		return 0
+		return 0, false
 	}
 }
 
@@ -145,9 +142,8 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
 		} else {
-			// Only request bast if a compatible downgrade exists.
-			target := compatibleBastMode(holderMode, req.RequestedMode)
-			if target != 0 {
+			target, ok := compatibleBastMode(holderMode, req.RequestedMode)
+			if ok {
 				log.Printf("lock contended: holder=%s requester=%d → bast target=%d",
 					holderMode, req.RequestedMode, target)
 				if err := m.etcdCli.RequestBast(ctx,
