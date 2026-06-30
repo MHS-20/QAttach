@@ -8,6 +8,8 @@ const (
 	PrefixLocks   = "locks/glock/"       // /locks/glock/{type}/{number}
 	PrefixLockSH  = "locks/glock/"       // /locks/glock/{type}/{number}/holders/{nodeID}
 	PrefixBast    = "locks/bast/"        // /locks/bast/{type}/{number}  — BAST request signal
+	PrefixJournal = "cluster/journals/"  // /cluster/journals/{jid} — journal slot assignment
+	MaxJournals   = 16                   // max journals to try during mount
 )
 
 // MemberInfo stored in /cluster/members/{node_id}.

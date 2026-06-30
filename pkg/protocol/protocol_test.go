@@ -301,16 +301,16 @@ func TestGlockTypeValues(t *testing.T) {
 	for name, val := range expected {
 		switch name {
 		case "nondisk":
-			if val != 0 {
-				t.Errorf("LM_TYPE_NONDISK must be 0, got %d", val)
+			if val != 1 {
+				t.Errorf("LM_TYPE_NONDISK must be 1, got %d", val)
 			}
 		case "inode":
-			if val != 1 {
-				t.Errorf("LM_TYPE_INODE must be 1, got %d", val)
+			if val != 2 {
+				t.Errorf("LM_TYPE_INODE must be 2, got %d", val)
 			}
 		case "journal":
-			if val != 8 {
-				t.Errorf("LM_TYPE_JOURNAL must be 8, got %d", val)
+			if val != 9 {
+				t.Errorf("LM_TYPE_JOURNAL must be 9, got %d", val)
 			}
 		}
 	}

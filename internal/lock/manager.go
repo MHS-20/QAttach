@@ -69,7 +69,7 @@ func etcdModeToNum(etcdMode string) uint32 {
 }
 
 // compatibleBastMode returns the target mode for a BAST demotion, or 0
-// if no compatible downgrade exists (holder should not be disturbed).
+// if no compatible downgrade exists.
 //
 // Based on GFS2 lock compatibility matrix:
 //
@@ -77,17 +77,16 @@ func etcdModeToNum(etcdMode string) uint32 {
 //	EX                  ✗       ✗       →SH
 //	DF                  ✗       ✓       →SH
 //	SH                  ✗       ✗       ✓
+//
+// EX→SH is always valid per the mode matrix; the holder's GFS2 decides
+// whether to comply.  The bast watch stays alive to retry if the holder
+// reacquires EX.
 func compatibleBastMode(holderEtcdMode string, requesterMode uint32) uint32 {
 	h := etcdModeToNum(holderEtcdMode)
 	r := requesterMode
 
-	// Already compatible — no BAST needed (shouldn't reach here).
-	if h == r {
-		return 0
-	}
-	// SH + SH is compatible.
 	if h == protocol.LockModeShared && r == protocol.LockModeShared {
-		return 0
+		return 0 // already compatible
 	}
 
 	switch h {
@@ -95,13 +94,16 @@ func compatibleBastMode(holderEtcdMode string, requesterMode uint32) uint32 {
 		if r == protocol.LockModeShared {
 			return protocol.LockModeShared // EX → SH
 		}
-		return 0 // EX can't downgrade for EX or DF requester
+		return 0 // EX can't demote for EX or DF requester
 
 	case protocol.LockModeDeferred:
 		if r == protocol.LockModeShared {
 			return protocol.LockModeShared // DF → SH
 		}
-		return 0 // DF can't downgrade for EX requester
+		if r == protocol.LockModeExclusive {
+			return protocol.LockModeUnlocked // DF must release for EX
+		}
+		return 0
 
 	case protocol.LockModeShared:
 		if r == protocol.LockModeExclusive || r == protocol.LockModeDeferred {
@@ -236,18 +238,24 @@ func (m *Manager) HandleUnmount() {
 }
 
 // HandleMountRequest handles the initial mount request from kernel module.
+// Journal ID is assigned via etcd CAS to avoid collisions across nodes.
 func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 	go func() {
-		m.mu.Lock()
-		jid := m.nextJID
-		m.nextJID++
-		m.mu.Unlock()
+		ctx := context.Background()
 
-		clusterName := cstring(req.ClusterName[:])
-		_ = clusterName
+		jid, err := m.etcdCli.AssignJournal(ctx,
+			m.nodeID, protocol.MaxJournals)
+		if err != nil {
+			log.Printf("journal assignment error: %v", err)
+			jid = -1 // error sentinel
+		}
+		if jid < 0 {
+			log.Printf("mount request: no free journal slots")
+			m.sendMountResponse(req.RequestID, -1) // error
+			return
+		}
 
 		m.mountJID = jid
-
 		log.Printf("mount request: cluster=%s, assigned jid=%d",
 			cstring(req.FilesystemName[:]), jid)
 

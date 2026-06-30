@@ -72,6 +72,26 @@ func (c *Client) RegisterNode(ctx context.Context, nodeID, instanceID, ip, az st
 	return err
 }
 
+// AssignJournal atomically claims a journal slot via CAS.
+// Tries slots 0..max-1 and returns the first one that succeeds.
+// Returns (jid, error).  jid is -1 if all slots are taken.
+func (c *Client) AssignJournal(ctx context.Context, nodeID string, max int) (int32, error) {
+	for jid := int32(0); jid < int32(max); jid++ {
+		key := fmt.Sprintf("%s%d", protocol.PrefixJournal, jid)
+		txnResp, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", 0)).
+			Then(clientv3.OpPut(key, nodeID, clientv3.WithLease(c.sess.Lease()))).
+			Commit()
+		if err != nil {
+			return -1, fmt.Errorf("journal %d CAS: %w", jid, err)
+		}
+		if txnResp.Succeeded {
+			return jid, nil
+		}
+	}
+	return -1, nil
+}
+
 // DeregisterNode removes the member key and revokes the session lease.
 func (c *Client) DeregisterNode(ctx context.Context, nodeID string) error {
 	key := protocol.PrefixMembers + nodeID

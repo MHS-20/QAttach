@@ -1,16 +1,22 @@
 package protocol
 
 // Glock types — must match GFS2 lm_lockname types exactly.
+// GFS2's LM_TYPE_* enum:
+//   LM_TYPE_RESERVED = 0, LM_TYPE_NONDISK = 1, LM_TYPE_INODE = 2,
+//   LM_TYPE_RGRP = 3, LM_TYPE_META = 4, LM_TYPE_IOPEN = 5,
+//   LM_TYPE_FLOCK = 6, LM_TYPE_PLOCK = 7, LM_TYPE_QUOTA = 8,
+//   LM_TYPE_JOURNAL = 9
 const (
-	LockTypeNondisk = 0
-	LockTypeInode   = 1
-	LockTypeRgrp    = 2
-	LockTypeMeta    = 3
-	LockTypeIopen   = 4
-	LockTypeFlock   = 5
-	LockTypePlock   = 6
-	LockTypeQuota   = 7
-	LockTypeJournal = 8
+	LockTypeReserved = 0
+	LockTypeNondisk  = 1 // superblock uses this (num=0)
+	LockTypeInode    = 2
+	LockTypeRgrp     = 3
+	LockTypeMeta     = 4
+	LockTypeIopen    = 5
+	LockTypeFlock    = 6
+	LockTypePlock    = 7
+	LockTypeQuota    = 8
+	LockTypeJournal  = 9
 )
 
 // Lock modes — must match GFS2 LM_ST_* constants exactly.

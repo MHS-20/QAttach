@@ -1,4 +1,5 @@
 *.csv
+*.out
 bin/
 certs/
 bin/cluster-agent
