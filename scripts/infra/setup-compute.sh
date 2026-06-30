@@ -19,7 +19,11 @@ source "$SCRIPT_DIR/state.sh"
 PEM="${PEM_PATH/#\~/$HOME}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
 
-mapfile -t COMPUTE_IPS < <(state_get compute_ips | jq -r '.[]')
+mapfile -t COMPUTE_IPS < <(state_get compute_public_ips | jq -r '.[]')
+if [[ -z "${COMPUTE_IPS[*]}" || "${COMPUTE_IPS[0]}" == "null" ]]; then
+    # fallback: no public IPs in state, use private
+    mapfile -t COMPUTE_IPS < <(state_get compute_ips | jq -r '.[]')
+fi
 COMPUTE_COUNT=${#COMPUTE_IPS[@]}
 
 if [[ "$COMPUTE_COUNT" -eq 0 ]]; then

@@ -105,6 +105,7 @@ log "=== Creating etcd nodes ($ETCD_NODES nodes) ==="
 
 ETCD_IDS=()
 ETCD_IPS=()
+ETCD_PUB_IPS=()
 
 for i in $(seq 1 $ETCD_NODES); do
     NAME="${CLUSTER_NAME}-etcd-${i}"
@@ -129,12 +130,15 @@ log "Waiting for etcd nodes..."
 for id in "${ETCD_IDS[@]}"; do
     wait_for_instance "$id"
     ip=$(get_instance_private_ip "$id")
+    pub=$(get_instance_public_ip "$id")
     ETCD_IPS+=("$ip")
-    log "  $id → $ip"
+    ETCD_PUB_IPS+=("$pub")
+    log "  $id → $pub / $ip"
 done
 
 state_save_array etcd_instance_ids "${ETCD_IDS[@]}"
 state_save_array etcd_ips "${ETCD_IPS[@]}"
+state_save_array etcd_public_ips "${ETCD_PUB_IPS[@]}"
 
 # ---- Step 5: etcd endpoint (direct IPs, no NLB) ----
 
@@ -175,6 +179,7 @@ log "=== Creating compute nodes ($COMPUTE_NODES nodes) ==="
 
 COMPUTE_IDS=()
 COMPUTE_IPS=()
+COMPUTE_PUB_IPS=()
 
 COMPUTE_SG_ID=$(aws ec2 describe-security-groups \
     --filters "Name=group-name,Values=$SG_NAME" \
@@ -208,12 +213,15 @@ log "Waiting for compute nodes..."
 for id in "${COMPUTE_IDS[@]}"; do
     wait_for_instance "$id"
     ip=$(get_instance_private_ip "$id")
+    pub=$(get_instance_public_ip "$id")
     COMPUTE_IPS+=("$ip")
-    log "  $id → $ip"
+    COMPUTE_PUB_IPS+=("$pub")
+    log "  $id → $pub / $ip"
 done
 
 state_save_array compute_instance_ids "${COMPUTE_IDS[@]}"
 state_save_array compute_ips "${COMPUTE_IPS[@]}"
+state_save_array compute_public_ips "${COMPUTE_PUB_IPS[@]}"
 
 # ---- Step 8: Attach EBS to compute nodes ----
 

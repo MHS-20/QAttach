@@ -44,6 +44,9 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 	go func() {
 		ctx := context.Background()
 
+		log.Printf("lock request: id=%d type=%d num=%d mode=%d",
+			req.RequestID, req.GlockType, req.GlockNumber, req.RequestedMode)
+
 		mode := protocol.LockModeToEtcd(req.RequestedMode)
 		if mode == "" {
 			// UNLOCKED → release the lock

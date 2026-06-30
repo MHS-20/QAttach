@@ -26,7 +26,7 @@ ALL_IDS="$ETCD_IDS $COMPUTE_IDS"
 
 log "Volume:        $VOL_ID"
 log "Security Grp:  $SG_ID"
-log "Key pair:      $KEY_NAME"
+log "Key pair:      $KEY_NAME (preserved)"
 log "etcd nodes:    $(echo $ETCD_IDS | wc -w)"
 log "Compute nodes: $(echo $COMPUTE_IDS | wc -w)"
 
@@ -90,12 +90,7 @@ if [[ -n "$SG_ID" && "$SG_ID" != "null" ]]; then
     log "Security group $SG_ID deleted"
 fi
 
-# ---- Step 5: Delete key pair ----
-
-if [[ -n "$KEY_NAME" && "$KEY_NAME" != "null" ]]; then
-    aws ec2 delete-key-pair --key-name "$KEY_NAME" 2>/dev/null || true
-    log "Key pair $KEY_NAME deleted"
-fi
+# ---- Key pair is NOT deleted (shared across deployments) ----
 
 # ---- Clean up state ----
 

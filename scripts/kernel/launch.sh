@@ -210,14 +210,14 @@ echo "========================================"
 echo " Installing modules and packaging..."
 echo "========================================"
 
-run "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && make modules_install"
-run "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && make install"
+run "cd /home/${SSH_USER}/rpmbuild/BUILD/kernel-*/linux-*/ && make modules_install"
+run "cd /home/${SSH_USER}/rpmbuild/BUILD/kernel-*/linux-*/ && make install"
 
 KERNEL_RELEASE=$(ssh -i "$SSH_KEY_PATH" \
   -o StrictHostKeyChecking=no \
   -o BatchMode=yes \
   "${SSH_USER}@${PUBLIC_IP}" \
-  "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && make kernelrelease")
+  "cd /home/${SSH_USER}/rpmbuild/BUILD/kernel-*/linux-*/ && make kernelrelease")
 
 echo "Kernel release: $KERNEL_RELEASE"
 
@@ -234,12 +234,11 @@ echo "========================================"
 
 ARCHIVE="kernel-${KERNEL_RELEASE}-custom.tar.gz"
 
-run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && sudo tar -czf /tmp/${ARCHIVE} \
+run_user "sudo tar -czf /tmp/${ARCHIVE} \
   /boot/vmlinuz-${KERNEL_RELEASE}-custom \
   /boot/initramfs-${KERNEL_RELEASE}-custom.img \
   /lib/modules/${KERNEL_RELEASE}/ \
   /usr/sbin/mkfs.gfs2 \
-  /usr/sbin/mount.gfs2 \
   /usr/sbin/fsck.gfs2 \
   /usr/sbin/gfs2_jadd \
   /usr/sbin/gfs2_grow \

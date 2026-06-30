@@ -30,16 +30,22 @@ type LockRequest struct {
 }
 
 // LockGrant sent from agent to kernel on successful acquisition.
+// PadGrant ensures 24-byte size matching C struct letcd_lock_grant
+// (C inserts 4 bytes padding after granted_mode to align etcd_revision to 8).
 type LockGrant struct {
 	RequestID    uint64
 	GrantedMode  uint32
+	PadGrant     [4]byte
 	EtcdRevision int64 // fencing token — store in glock private data
 }
 
 // LockDeny sent from agent to kernel when lock cannot be granted.
+// PadDeny ensures 16-byte size matching C struct letcd_lock_deny
+// (C adds 4 bytes trailing padding to align struct to 8).
 type LockDeny struct {
 	RequestID uint64
 	Reason    uint32
+	PadDeny   [4]byte
 }
 
 // LockWait sent from agent to kernel when lock is contended.
@@ -73,9 +79,12 @@ type MountRequest struct {
 }
 
 // MountResponse sent from agent to kernel with assigned journal ID.
+// PadMnt ensures 16-byte size matching C struct letcd_mount_resp
+// (Go binary.Write omits trailing padding; C adds 4 bytes to align to 8).
 type MountResponse struct {
 	RequestID uint64
 	JID       int32 // negative on error
+	PadMnt    [4]byte
 }
 
 // Deny reasons.

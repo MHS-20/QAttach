@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -205,7 +206,12 @@ func (s *Server) sendMsg(msgType uint32, v interface{}) error {
 		Pid:    0, // kernel
 	}
 
-	return syscall.Sendto(s.fd, buf, 0, sa)
+	err := syscall.Sendto(s.fd, buf, 0, sa)
+	if err != nil {
+		log.Printf("netlink send error (type=%d plen=%d buflen=%d): %v",
+			msgType, len(payload), len(buf), err)
+	}
+	return err
 }
 
 func decodeLE(data []byte, v interface{}) bool {
