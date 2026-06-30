@@ -130,7 +130,7 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
 				req.GlockType, req.GlockNumber, holderMode, mode)
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
-			g2, r2, _, _, e2 := m.etcdCli.AcquireLock(ctx,
+			g2, r2, hm2, hn2, e2 := m.etcdCli.AcquireLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
 			if e2 != nil {
 				log.Printf("self-contention reacquire error: %v", e2)
@@ -140,7 +140,19 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			if g2 {
 				m.sendGrant(req.RequestID, req.RequestedMode, r2)
 				m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
+			} else if hn2 == m.nodeID {
+				// Still self-contention; retry via waiter path.
+				m.sendWait(req.RequestID)
+				go m.watchAndRetry(ctx, req)
 			} else {
+				// Other holders still exist; request BAST to them.
+				target, ok := compatibleBastMode(hm2, req.RequestedMode)
+				if ok {
+					log.Printf("self→contended (other holders): holder=%s→bast=%d",
+						hm2, target)
+					m.etcdCli.RequestBast(ctx,
+						req.GlockType, req.GlockNumber, target, m.nodeID)
+				}
 				m.sendWait(req.RequestID)
 				go m.watchAndRetry(ctx, req)
 			}
