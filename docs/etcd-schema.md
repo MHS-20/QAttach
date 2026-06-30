@@ -40,7 +40,7 @@ locks/
     Writers:  Agent when acquiring EX (CAS on Version=0)
     Readers:  All agents (WatchLockKey for retry)
 
-  glock/{type}/{number}/holders/{node_id}
+  glock/{type}/{number} → [{"node":"A","mode":"EX"}]  (holder array, single key)
     Purpose:  Per-holder shared lock sub-key (SH/PR mode)
     Value:    {"owner_node_id":"...","mode":"PR"}
     Lease:    Session lease
@@ -73,7 +73,7 @@ locks/
 
 ### SH (Shared) — etcd mode "PR"
 
-- Keys: `/locks/glock/{type}/{number}/holders/{node_id}`
+- Keys: `/locks/glock/{type}/{number} → [{"node":"A","mode":"EX"}]  (holder array, single key)
 - One sub-key per holder, each attached to its session lease
 - Multiple nodes can hold SH simultaneously
 - The primary key (`/locks/glock/{type}/{number}`) also exists as a marker

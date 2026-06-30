@@ -6,7 +6,6 @@ const (
 	PrefixFencing = "cluster/fencing/"   // /cluster/fencing/{node_id}
 	KeyEpoch      = "cluster/epoch"      // /cluster/epoch
 	PrefixLocks   = "locks/glock/"       // /locks/glock/{type}/{number}
-	PrefixLockSH  = "locks/glock/"       // /locks/glock/{type}/{number}/holders/{nodeID}
 	PrefixBast    = "locks/bast/"        // /locks/bast/{type}/{number}  — BAST request signal
 	PrefixJournal = "cluster/journals/"  // /cluster/journals/{jid} — journal slot assignment
 	PrefixHandoff = "locks/glock/"       // /locks/glock/{type}/{number}/next — handoff reservation
