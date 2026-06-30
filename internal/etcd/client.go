@@ -226,16 +226,56 @@ func bastKey(lockType uint32, lockNumber uint64) string {
 }
 
 // RequestBast writes a bast (blocking AST) request to signal the lock
-// holder that another node wants the lock.  The holder should downgrade
-// or release in response.
-func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32) error {
+// holder that another node wants the lock.  The value encodes both the
+// target mode and the waiter's node ID so the holder can hand off.
+func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32, waiterID string) error {
 	key := bastKey(lockType, lockNumber)
-	val := fmt.Sprintf("%d", targetMode)
+	val := fmt.Sprintf("%d,%s", targetMode, waiterID)
 	lease, err := c.cli.Grant(ctx, int64(c.cfg.SessionTTL.Seconds()))
 	if err != nil {
 		return fmt.Errorf("bast lease grant: %w", err)
 	}
 	_, err = c.cli.Put(ctx, key, val, clientv3.WithLease(lease.ID))
+	return err
+}
+
+// handoffKey returns the handoff reservation key for a lock.
+func handoffKey(lockType uint32, lockNumber uint64) string {
+	return fmt.Sprintf("%s%d/%d/next", protocol.PrefixHandoff, lockType, lockNumber)
+}
+
+// HandoffRelease atomically deletes the lock key and writes a handoff
+// reservation for the waiter.  This guarantees the waiter wins the race
+// against the holder's GFS2 glock work function reacquiring.
+func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber uint64, waiterID string) error {
+	lk := lockKey(lockType, lockNumber)
+	hk := handoffKey(lockType, lockNumber)
+	lease, err := c.cli.Grant(ctx, int64(protocol.HandoffTTL))
+	if err != nil {
+		return fmt.Errorf("handoff lease: %w", err)
+	}
+	_, err = c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Version(lk), ">", 0)).
+		Then(clientv3.OpDelete(lk), clientv3.OpPut(hk, waiterID, clientv3.WithLease(lease.ID))).
+		Commit()
+	return err
+}
+
+// CheckHandoff returns true if a handoff reservation exists for this node.
+func (c *Client) CheckHandoff(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
+	resp, err := c.cli.Get(ctx, handoffKey(lockType, lockNumber))
+	if err != nil {
+		return false, err
+	}
+	if len(resp.Kvs) == 0 {
+		return false, nil
+	}
+	return string(resp.Kvs[0].Value) == nodeID, nil
+}
+
+// DeleteHandoff removes the handoff reservation key.
+func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {
+	_, err := c.cli.Delete(ctx, handoffKey(lockType, lockNumber))
 	return err
 }
 
