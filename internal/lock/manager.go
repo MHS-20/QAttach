@@ -126,8 +126,9 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			// Fall through to normal acquire; the key should be free.
 		}
 
-		granted, rev, holderMode, err := m.etcdCli.AcquireLock(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID, mode)
+		granted, rev, holderMode, holderNodeID, err :=
+			m.etcdCli.AcquireLock(ctx,
+				req.GlockType, req.GlockNumber, m.nodeID, mode)
 		if err != nil {
 			log.Printf("lock acquire error type=%d num=%d: %v",
 				req.GlockType, req.GlockNumber, err)
@@ -138,6 +139,27 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		if granted {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
+		} else if holderNodeID == m.nodeID {
+			// Self-contention: we hold this lock and want a different mode.
+			// Release and reacquire in-place instead of contending.
+			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
+				req.GlockType, req.GlockNumber, holderMode, mode)
+			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
+			// Retry once after releasing.
+			g2, r2, _, _, e2 := m.etcdCli.AcquireLock(ctx,
+				req.GlockType, req.GlockNumber, m.nodeID, mode)
+			if e2 != nil {
+				log.Printf("self-contention reacquire error: %v", e2)
+				m.sendDeny(req.RequestID, protocol.DenyReasonError)
+				return
+			}
+			if g2 {
+				m.sendGrant(req.RequestID, req.RequestedMode, r2)
+				m.startBastWatch(ctx, req.GlockType, req.GlockNumber, mode)
+			} else {
+				m.sendWait(req.RequestID)
+				go m.watchAndRetry(ctx, req)
+			}
 		} else {
 			target, ok := compatibleBastMode(holderMode, req.RequestedMode)
 			if ok {
@@ -173,14 +195,17 @@ func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumb
 
 	waiter := hl.waiterNodeID
 	if waiter != "" && waiter != m.nodeID {
-		// Atomic handoff: delete our key and reserve for the waiter.
+		// Atomic handoff: delete primary key and reserve for waiter.
+		// Also clean up SH sub-key if we held in SH mode.
 		if err := m.etcdCli.HandoffRelease(ctx,
 			lockType, lockNumber, waiter); err != nil {
 			log.Printf("handoff release error: %v", err)
-			m.etcdCli.ReleaseLock(ctx, lockType, lockNumber)
 		} else {
 			log.Printf("handoff: type=%d num=%d → %s",
 				lockType, lockNumber, waiter)
+		}
+		if hl.mode != "EX" {
+			m.etcdCli.ReleaseSHLock(ctx, lockType, lockNumber, m.nodeID)
 		}
 	} else {
 		if hl.mode == "EX" {
@@ -296,7 +321,7 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 						req.GlockType, req.GlockNumber)
 				}
 
-				granted, rev, _, err := m.etcdCli.AcquireLock(ctx,
+				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
 				if err != nil {
 					log.Printf("retry lock acquire error: %v", err)

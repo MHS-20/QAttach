@@ -127,13 +127,22 @@ func parseLockMode(raw []byte) string {
 	return li.Mode
 }
 
+// parseLockOwner extracts the owner_node_id from a lock key value.
+func parseLockOwner(raw []byte) string {
+	var li lockInfo
+	if err := json.Unmarshal(raw, &li); err != nil {
+		return ""
+	}
+	return li.OwnerNodeID
+}
+
 // AcquireLock attempts to acquire a lock.
 // EX mode uses a CAS on a single key — only one holder.
 // SH mode uses per-holder sub-keys — multiple concurrent holders allowed.
-// Returns (granted, etcd_revision, holder_etcd_mode, error).
-// On failure (granted=false), holderMode is the etcd mode of the current
-// holder (empty string if no holder or parse error).
-func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (bool, int64, string, error) {
+// Returns (granted, etcd_revision, holder_etcd_mode, holder_node_id, error).
+// On failure (granted=false), holderMode and holderNodeID describe the
+// current holder (empty if no holder or parse error).
+func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (bool, int64, string, string, error) {
 	key := lockKey(lockType, lockNumber)
 	val := fmt.Sprintf(`{"owner_node_id":"%s","mode":"%s"}`, nodeID, mode)
 
@@ -144,31 +153,35 @@ func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber ui
 			Else(clientv3.OpGet(key)).
 			Commit()
 		if err != nil {
-			return false, 0, "", fmt.Errorf("acquire EX lock txn: %w", err)
+			return false, 0, "", "", fmt.Errorf("acquire EX lock txn: %w", err)
 		}
 		if !txnResp.Succeeded {
 			hm := ""
+			hn := ""
 			if len(txnResp.Responses) > 0 {
 				for _, ev := range txnResp.Responses[0].GetResponseRange().Kvs {
 					hm = parseLockMode(ev.Value)
+					hn = parseLockOwner(ev.Value)
 					break
 				}
 			}
-			return false, 0, hm, nil
+			return false, 0, hm, hn, nil
 		}
-		return true, txnResp.Header.Revision, "", nil
+		return true, txnResp.Header.Revision, "", "", nil
 	}
 
 	// SH mode: check if an EX holder exists.
 	getResp, err := c.cli.Get(ctx, key)
 	if err != nil {
-		return false, 0, "", fmt.Errorf("check EX lock before SH: %w", err)
+		return false, 0, "", "", fmt.Errorf("check EX lock before SH: %w", err)
 	}
 	hm := ""
+	hn := ""
 	if len(getResp.Kvs) > 0 {
 		hm = parseLockMode(getResp.Kvs[0].Value)
+		hn = parseLockOwner(getResp.Kvs[0].Value)
 		if hm == "EX" {
-			return false, 0, hm, nil // EX held, contended
+			return false, 0, hm, hn, nil // EX held, contended
 		}
 	}
 
@@ -179,15 +192,15 @@ func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber ui
 		Then(clientv3.OpPut(shKey, val, clientv3.WithLease(c.sess.Lease()))).
 		Commit()
 	if err != nil {
-		return false, 0, "", fmt.Errorf("acquire SH lock txn: %w", err)
+		return false, 0, "", "", fmt.Errorf("acquire SH lock txn: %w", err)
 	}
 	if !txnResp.Succeeded {
-		return false, 0, "", nil
+		return false, 0, "", "", nil
 	}
 
 	c.cli.Put(ctx, key, val, clientv3.WithLease(c.sess.Lease()))
 
-	return true, txnResp.Header.Revision, "", nil
+	return true, txnResp.Header.Revision, "", "", nil
 }
 
 // ReleaseLock deletes the lock key(s) from etcd.
