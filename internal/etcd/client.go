@@ -306,6 +306,16 @@ func (c *Client) CheckHandoff(ctx context.Context, lockType uint32, lockNumber u
 	return string(resp.Kvs[0].Value) == nodeID, nil
 }
 
+// HasWaiter returns true if a bast key exists for this lock,
+// meaning another node is waiting and this holder should yield.
+func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint64) bool {
+	resp, err := c.cli.Get(ctx, bastKey(lockType, lockNumber))
+	if err != nil || len(resp.Kvs) == 0 {
+		return false
+	}
+	return true
+}
+
 func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {
 	_, err := c.cli.Delete(ctx, handoffKey(lockType, lockNumber))
 	return err

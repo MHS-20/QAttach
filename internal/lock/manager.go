@@ -121,6 +121,17 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
 		} else if holderNodeID == m.nodeID {
+			// Self-contention: check if another node is waiting
+			// via a bast key.  If so, yield so the waiter can
+			// acquire the lock on the next watch cycle.
+			if m.etcdCli.HasWaiter(ctx,
+				req.GlockType, req.GlockNumber) {
+				log.Printf("self-contention yielding to waiter: type=%d num=%d",
+					req.GlockType, req.GlockNumber)
+				m.sendWait(req.RequestID)
+				go m.watchAndRetry(ctx, req)
+				return
+			}
 			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
 				req.GlockType, req.GlockNumber, holderMode, mode)
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
@@ -139,18 +150,12 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 				go m.watchAndRetry(ctx, req)
 			}
 		} else {
-			// Cross-node deadlock prevention: if we're contending
-			// on a type-2 or type-3 lock, release ALL held
-			// type-2/3 locks to break the AB/BA cycle.  The other
-			// node can then complete, and we retry after.
-			if (req.GlockType == 2 || req.GlockType == 3) &&
-				holderNodeID != "" && holderNodeID != m.nodeID {
-				log.Printf("deadlock risk: releasing all type-2/3 locks to break cycle")
-				m.releaseHeldLocksByType(ctx, 2)
-				m.releaseHeldLocksByType(ctx, 3)
-			}
-			log.Printf("lock contended by %s (mode=%s), waiting",
-				holderNodeID, holderMode)
+			// Contended by another node.  Write a handoff token
+			// so the holder yields on its next self-contention.
+			m.etcdCli.RequestBast(ctx,
+				req.GlockType, req.GlockNumber, 0, m.nodeID)
+			log.Printf("lock contended by %s, waiting",
+				holderNodeID)
 			m.sendWait(req.RequestID)
 			go m.watchAndRetry(ctx, req)
 		}
