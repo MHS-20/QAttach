@@ -118,7 +118,7 @@ for i in $(seq 1 $ETCD_NODES); do
         --security-group-ids "$SG_ID" \
         --subnet-id "$SUBNET_ID" \
         --associate-public-ip-address \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":10,"VolumeType":"gp3"}}]' \
+        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
         --query 'Instances[0].InstanceId' --output text)
 
@@ -201,7 +201,7 @@ for i in $(seq 1 $COMPUTE_NODES); do
         --security-group-ids "$COMPUTE_SG_ID" \
         --subnet-id "$SUBNET_ID" \
         --associate-public-ip-address \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":10,"VolumeType":"gp3"}}]' \
+        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
         --query 'Instances[0].InstanceId' --output text)
 
