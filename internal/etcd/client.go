@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -306,14 +307,18 @@ func (c *Client) CheckHandoff(ctx context.Context, lockType uint32, lockNumber u
 	return string(resp.Kvs[0].Value) == nodeID, nil
 }
 
-// HasWaiter returns true if a bast key exists for this lock,
-// meaning another node is waiting and this holder should yield.
-func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint64) bool {
+// HasWaiter returns true and the waiter's nodeID if a bast key exists.
+func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint64) (bool, string) {
 	resp, err := c.cli.Get(ctx, bastKey(lockType, lockNumber))
 	if err != nil || len(resp.Kvs) == 0 {
-		return false
+		return false, ""
 	}
-	return true
+	val := string(resp.Kvs[0].Value)
+	parts := strings.SplitN(val, ",", 2)
+	if len(parts) == 2 && parts[1] != "" {
+		return true, parts[1]
+	}
+	return false, ""
 }
 
 func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {

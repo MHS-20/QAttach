@@ -1,105 +1,171 @@
-# Multi-node Deadlock Analysis & Solutions
+# Multi-node Lock Contention: Analysis & Solution History
 
-## The Problem
+## The Actual Problem
 
-When two GFS2 nodes create files in the same directory simultaneously,
-they deadlock.  Both need the same two locks acquired step by step:
-
-```
-Node 0: open("/mnt/shared/.x", O_CREAT)
-  → needs dir inode EX (type=2, num=33384) — call it Lock A
-  → needs rgrp EX      (type=3, num=32861) — call it Lock B
-
-Node 1: open("/mnt/shared/.y", O_CREAT)
-  → needs the SAME dir inode EX  (Lock A)
-  → needs a rgrp EX              (Lock B, same or different RG)
-```
-
-The AB/BA deadlock:
+When two GFS2 nodes do concurrent I/O (e.g. creating files in the same
+directory), they contend on the same inode glock.  The deadlock is NOT
+the classic two-lock AB/BA pattern — it's a **single-lock holder-reacquire
+race**:
 
 ```
-Time  Node 0                          Node 1
-────  ────────────────────────────    ────────────────────────────
-  1   requests Lock A → granted       requests Lock B → granted
-  2   requests Lock B → contended     requests Lock A → contended
-  3   🔒 holds A, waits for B          🔒 holds B, waits for A
+Time  Node 0 (holder)                           Node 1 (waiter)
+────  ──────────────────────────────────────    ──────────────────────────
+  1   holds inode lock 33384 in SH mode
+  2                                               wants EX on 33384
+  3                                               CAS fails → LOCK_WAIT
+  4                                               writes bast key (signal)
+  5                                               watchAndRetry starts
+  6   GFS2 glock cycle: releases 33384 (SH)
+  7   GFS2: "I still need this" → self-contention
+  8   self-contention: release → CAS → reacquire EX
+  9                                               watch sees DELETE
+ 10                                               tries CAS → key exists
+ 11                                               🔁 contention loop
 ```
 
-Node 0 holds A and needs B.  Node 1 holds B and needs A.  Neither
-can release its held lock while waiting for the other lock — both
-are required simultaneously to complete `open()`.
+The holder releases every ~30s via GFS2's periodic glock work function,
+then _immediately reacquires_ via self-contention in the same goroutine.
+The waiter's watchAndRetry — which must travel etcd→kernel→goroutine —
+can never win this race because the holder's reacquire happens in
+microseconds with no network delay.
+
+This is fundamentally different from the AB/BA deadlock (two nodes holding
+complementary locks).  Both nodes are contending on the _same_ lock, not
+two different locks.
 
 ## Why DLM Avoids This
 
-DLM daemons on every node communicate via TCP and share the global
-lock dependency graph.  When Node 0 requests A and Node 1 requests B,
-both daemons see the full picture and withhold one of the grants.
-Our agent only sees etcd keys (granted locks), not pending requests.
+DLM daemons on every node communicate via TCP and share the global lock
+dependency graph.  When Node 0 holds a lock and Node 1 wants it, the DLM
+arbitrates: it either tells the holder to demote (BAST) _and_ guarantees
+the waiter gets priority.  Our agent only sees etcd keys (granted locks),
+not pending requests, so it can't prioritise waiters naturally.
 
-## Attempted Solutions
+## Approach Timeline
 
 ### 1. BAST + Handoff + Compatibility Matrix
 
-Node B requests lock, CAS fails, writes a bast key, holder watches
-it, sends BAST to kernel.  Holder demotes, atomic handoff reserves
-lock for waiter.
+Node B's CAS fails → writes a bast key.  Holder watches it, sends BAST to
+kernel.  Holder demotes, atomic handoff reserves lock for waiter.
 
-**Result: livelock.**  EX holder receives BAST(SH), releases, but
-GFS2's glock work function immediately reacquires EX because it
-still needs it before the waiter can CAS.  Ping-pong forever.
+**Result: livelock.**  EX holder receives BAST(SH), releases, but GFS2's
+glock work function immediately reacquires EX because it still needs it.
+Ping-pong forever between EX→release→EX on both nodes.
 
 ### 2. No BAST, Just Wait
 
-Node B does LOCK_WAIT and watches for the lock key to be deleted.
-Holder releases naturally when GFS2 completes its I/O.
+No bast, no handoff.  Node B does LOCK_WAIT and watches for the lock key
+to be deleted.  Holder releases naturally when GFS2 completes I/O.
 
-**Result: deadlock.**  Same AB/BA pattern — natural release never
-happens because both nodes hold one lock while waiting for the other.
+**Result: deadlock.**  Initially thought to be AB/BA (both nodes hold
+complementary locks), but later analysis shows it's the single-lock race —
+the holder reacquires before the waiter can.
 
 ### 3. Kernel-level Ordered Queue
 
-Kernel module serialises lock requests within a node via a sorted
-wait queue (`letcd_ordered_drain`).  Each node acquires A before B
-because `orderKey(A) < orderKey(B)`.
+Kernel module (`letcd_ordered_drain`) serialises lock requests within a
+node: lower `orderKey` locks must complete before higher ones.
 
-**Result: deadlock persists.**  The queue only orders within a node.
-Node 0 acquires A first, Node 1 acquires B first (its queue was
-empty).  Cross-node, the AB/BA cycle remains.
+**Result: deadlock persists.**  The queue only orders within a node, not
+between nodes.  Cross-node, the holder-reacquire race still exists.
 
-## Current Solution: Agent-side Global Order
+### 4. Agent-side Global Order (DENY on Out-of-Order)
 
-The agent now enforces the same global sort order across all nodes
-by tracking the sort keys of every held lock:
+Agent tracks held lock order keys.  If a node tries to acquire a lock
+while holding a higher-key lock, send LOCK_DENY with reason STALE.
+
+**Result: kernel panic.**  `gfs2_glock_complete(gl, -ESTALE)` treats STALE
+as a fatal filesystem error (it was designed for fencing-token validation
+failures).  GFS2 withdraws the filesystem.
+
+### 5. Agent-side Global Order (WAIT on Out-of-Order)
+
+Same ordering check, but send LOCK_WAIT instead of DENY.
+
+**Result: no effect.**  LOCK_WAIT doesn't break the holder-reacquire race —
+the waiter stays in LOCK_WAIT while the holder continues its release→
+reacquire cycle.  Never progresses.
+
+### 6. Agent-side Type-2/3 Order (WAIT)
+
+Only enforce ordering between type=2 (inode) and type=3 (rgrp) locks,
+which were believed to form the AB/BA pair.  Send LOCK_WAIT + BAST.
+
+**Result: no effect.**  The "AB/BA" model was incorrect — the contention
+is on a single lock (type=2, not type=2 vs type=3).  The ordering check
+never fired because neither node held both types simultaneously.
+
+### 7. Release All Type-2/3 on Contention
+
+When CAS fails on a type-2 or type-3 lock and another node holds it,
+release ALL held type-2/3 locks to break the cycle.
+
+**Result: no effect.**  Same diagnosis — the contention is on a single
+lock, not across types.  The release logic didn't trigger because the
+"other type" wasn't held.
+
+### 8. BAST Signal + HasWaiter Check in Self-contention
+
+When CAS fails due to contention, write a bast key with the waiter's
+nodeID.  In the self-contention handler, check `HasWaiter()` before
+reacquiring.  If a waiter exists, yield (send LOCK_WAIT, watchAndRetry).
+
+This approach evolved through several sub-iterations:
+
+**8a: Check HasWaiter before release.**  TOCTOU race — both nodes check
+before anyone writes the bast key.  Neither yields.
+
+**8b: Check HasWaiter after release.**  Holder releases, then checks.
+Closes the TOCTOU window.  Holder yields when bast found.
+
+**Result: both nodes yielded.**  Node 1's bast key made Node 0 yield, but
+Node 1's own self-contention (on retry) also saw the bast key and yielded.
+Both ended up in watchAndRetry, neither acquired.  (Fixed by deleting the
+bast key on yield — see #9.)
+
+**8c: WatchAndRetry only handled DELETE events.**  After yielding, the
+holder array was MODIFIED (one entry removed) but not DELETED.  The waiter's
+watch didn't fire.  (Fixed by also handling PUT events in watchAndRetry.)
+
+### 9. Atomic Handoff on Self-contention Yield (Current)
+
+When `HasWaiter` returns true with a valid waiter nodeID, instead of
+just sending LOCK_WAIT, atomically delete the lock key AND write a `/next`
+handoff reservation via `HandoffRelease`:
 
 ```
-lockOrderKey = (type << 56) | number
+Holder yields:
+  Txn: IF lock_key.version > 0
+       THEN Delete(lock_key), Put(/next, waiterID, lease=5s)
+  → DeleteBastRequest
+  → LOCK_WAIT
+  → watchAndRetry
+
+Waiter:
+  watchAndRetry fires (DELETE from HandoffRelease)
+  → CheckHandoff → YES (my ID)
+  → DeleteHandoff
+  → CAS → key empty → succeeds
 ```
 
-Before granting any lock, the agent checks whether the requesting
-node already holds any lock with a HIGHER sort key.  If so, the
-request is denied (`LOCK_DENY` with reason `STALE`) — GFS2 must
-release the higher-key lock first.
+The single etcd transaction guarantees the waiter wins — there's no race
+window between the holder deleting the key and the waiter CASing.  The 5s
+lease on `/next` prevents permanent reservation if the waiter crashes.
 
-**Why this breaks the cycle:**
+**Status: committed, untested on clean infra.**  The last deploy had a build
+error (missing `strings` import in `client.go`) that was fixed but not
+deployed to a working cluster.
 
-```
-Node 0: holds Lock A (key=0x20000000000082D8)
-  → requests Lock B (key=0x30000000000080F1)
-  → holdsHigherLock(0x3000...) = false  (A < B)
-  → granted ✓
+## Summary
 
-Node 1: holds Lock B (key=0x30000000000080F1)
-  → requests Lock A (key=0x20000000000082D8)
-  → holdsHigherLock(0x2000...) = true   (B > A — held!)
-  → DENIED ✗
-  → GFS2 must release B first, then retry A
-  → B becomes available → Node 0 gets it → completes both → releases
-  → Node 1 gets A → gets B → completes
-```
-
-No cycle — the agent stops Node 1 from acquiring in the wrong order.
-
-**Caveat:** This relies on GFS2 retrying the lock after receiving
-`LOCK_DENY` with reason `STALE`.  The kernel's `dispatch_lock_deny`
-calls `gfs2_glock_complete(gl, -ESTALE)`, which tells GFS2 the
-lock state is stale and it should retry after releasing higher locks.
+| # | Approach | Failure Mode |
+|---|----------|-------------|
+| 1 | BAST + handoff | Livelock |
+| 2 | No BAST, wait | Holder-reacquire race |
+| 3 | Kernel ordered queue | Per-node only |
+| 4 | Global order + DENY | Kernel panic (ESTALE) |
+| 5 | Global order + WAIT | No effect |
+| 6 | Type-2/3 order + WAIT | Wrong diagnosis |
+| 7 | Release all type-2/3 | Wrong diagnosis |
+| 8 | HasWaiter + yield | TOCTOU + self-yield + watch events |
+| 9 | Atomic handoff on yield | Untested |

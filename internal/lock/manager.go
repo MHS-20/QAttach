@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/polarity/qattach/internal/etcd"
@@ -55,27 +54,6 @@ func lockMapKey(lockType uint32, lockNumber uint64) string {
 
 // ---- lock ordering ----
 
-// violatesTypeOrder returns true if acquiring lockType would violate
-// the global ordering rule.  Only type=2 (inode) and type=3 (rgrp)
-// are ordered — they form the AB/BA deadlock pair when creating files.
-// All other lock types (superblock, iopen, journal, etc.) are exempt.
-func (m *Manager) violatesTypeOrder(orderKey uint64, lockType uint32) bool {
-	if lockType != 2 && lockType != 3 {
-		return false
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, hl := range m.heldLocks {
-		heldType := uint32(hl.orderKey >> 56)
-		// Requesting type=2 while holding type=3, or vice versa.
-		if (lockType == 2 && heldType == 3) ||
-			(lockType == 3 && heldType == 2) {
-			return true
-		}
-	}
-	return false
-}
-
 // ---- lock request handling ----
 
 func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
@@ -92,20 +70,6 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		}
 
 		orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
-
-		if m.violatesTypeOrder(orderKey, req.GlockType) {
-			otherType := uint32(2)
-			if req.GlockType == 2 {
-				otherType = 3
-			}
-			log.Printf("lock out-of-order: type=%d num=%d — basting held type=%d locks to release",
-				req.GlockType, req.GlockNumber, otherType)
-			// Send BAST to our own kernel to release the higher-key locks.
-			m.sendOutOfOrderBast(otherType)
-			m.sendWait(req.RequestID)
-			go m.watchAndRetry(ctx, req)
-			return
-		}
 
 		granted, rev, holderMode, holderNodeID, err :=
 			m.etcdCli.AcquireLock(ctx,
@@ -126,10 +90,19 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 			// Re-check after release: another node may have
 			// written a bast key while we were releasing.
-			if m.etcdCli.HasWaiter(ctx,
-				req.GlockType, req.GlockNumber) {
-				log.Printf("self-contention yielding to waiter: type=%d num=%d",
+			hasWaiter, waiterID := m.etcdCli.HasWaiter(ctx,
+				req.GlockType, req.GlockNumber)
+			if hasWaiter && waiterID != "" && waiterID != m.nodeID {
+				log.Printf("self-contention yielding to waiter: type=%d num=%d waiter=%s",
+					req.GlockType, req.GlockNumber, waiterID)
+				// Atomic handoff: delete our lock entry and
+				// reserve for the waiter so they win the race.
+				m.etcdCli.DeleteBastRequest(ctx,
 					req.GlockType, req.GlockNumber)
+				if err := m.etcdCli.HandoffRelease(ctx,
+					req.GlockType, req.GlockNumber, waiterID); err != nil {
+					log.Printf("handoff release error: %v", err)
+				}
 				m.sendWait(req.RequestID)
 				go m.watchAndRetry(ctx, req)
 				return
@@ -171,37 +144,6 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string,
 	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode, orderKey: orderKey}
 	m.mu.Unlock()
 	_ = ctx
-}
-
-func (m *Manager) holdsLockType(lockType uint32) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, hl := range m.heldLocks {
-		if uint32(hl.orderKey>>56) == lockType {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *Manager) releaseHeldLocksByType(ctx context.Context, lockType uint32) {
-	m.mu.Lock()
-	var toRelease []struct{ t uint32; n uint64 }
-	for mapKey, hl := range m.heldLocks {
-		if uint32(hl.orderKey>>56) == lockType {
-			parts := strings.SplitN(mapKey, "/", 2)
-			if len(parts) == 2 {
-				t, _ := strconv.ParseUint(parts[0], 10, 32)
-				n, _ := strconv.ParseUint(parts[1], 10, 64)
-				toRelease = append(toRelease, struct{ t uint32; n uint64 }{uint32(t), n})
-			}
-		}
-	}
-	m.mu.Unlock()
-
-	for _, l := range toRelease {
-		m.releaseHeldLock(ctx, l.t, l.n)
-	}
 }
 
 func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumber uint64) {
@@ -261,15 +203,6 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
 				orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 
-				if m.violatesTypeOrder(orderKey, req.GlockType) {
-					otherType := uint32(2)
-					if req.GlockType == 2 {
-						otherType = 3
-					}
-					m.sendOutOfOrderBast(otherType)
-					continue
-				}
-
 				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
 				if err != nil {
@@ -288,39 +221,6 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 }
 
 // ---- netlink helpers ----
-
-// sendOutOfOrderBast sends BAST(UNLOCK) to the kernel for every
-// held lock of the given type, telling GFS2 to release those locks
-// so they can be reacquired in the correct global order.
-func (m *Manager) sendOutOfOrderBast(lockType uint32) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for mapKey, hl := range m.heldLocks {
-		heldType := uint32(hl.orderKey >> 56)
-		if heldType == lockType {
-			parts := strings.SplitN(mapKey, "/", 2)
-			if len(parts) == 2 {
-				t, _ := strconv.ParseUint(parts[0], 10, 32)
-				n, _ := strconv.ParseUint(parts[1], 10, 64)
-				m.sendBast(uint32(t), n, protocol.LockModeUnlocked)
-			}
-		}
-	}
-}
-
-func (m *Manager) sendBast(lockType uint32, lockNumber uint64, targetMode uint32) {
-	if m.nlSrv == nil {
-		return
-	}
-	if err := m.nlSrv.SendBast(protocol.BastNotification{
-		GlockNumber: lockNumber, GlockType: lockType, TargetMode: targetMode,
-	}); err != nil {
-		log.Printf("send bast error: %v", err)
-	} else {
-		log.Printf("sent bast: type=%d num=%d target=%d",
-			lockType, lockNumber, targetMode)
-	}
-}
 
 func (m *Manager) sendGrant(requestID uint64, mode uint32, revision int64) {
 	if m.nlSrv == nil {
