@@ -11,9 +11,17 @@ import (
 	"github.com/polarity/qattach/pkg/protocol"
 )
 
+// lockOrderKey produces the global sort key used to serialise lock
+// acquisition across all nodes.  Matches the kernel's letcd_order_key.
+// Lower keys must be acquired before higher keys on every node.
+func lockOrderKey(lockType uint32, lockNumber uint64) uint64 {
+	return (uint64(lockType) << 56) | (lockNumber & 0x00FFFFFFFFFFFFFF)
+}
+
 type heldLock struct {
-	cancel context.CancelFunc
-	mode   string
+	cancel   context.CancelFunc
+	mode     string
+	orderKey uint64
 }
 
 type Manager struct {
@@ -44,6 +52,23 @@ func lockMapKey(lockType uint32, lockNumber uint64) string {
 		strconv.FormatUint(lockNumber, 10)
 }
 
+// ---- lock ordering ----
+
+// holdsHigherLock returns true if this node already holds a lock whose
+// sort key is strictly greater than the requested key.  That means the
+// node is trying to acquire locks out of the global order and must
+// release the higher-key lock first.
+func (m *Manager) holdsHigherLock(reqOrderKey uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, hl := range m.heldLocks {
+		if hl.orderKey > reqOrderKey {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- lock request handling ----
 
 func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
@@ -59,6 +84,23 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
+		orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
+
+		// Global ordering: a node must acquire locks in ascending
+		// sorted order.  If it already holds a higher-key lock,
+		// deny this request so GFS2 releases the higher locks first.
+		//
+		// This prevents the AB/BA deadlock: if Node 0 holds A
+		// (lower key) and Node 1 holds B (higher key), Node 1
+		// cannot get A because B has a higher key — Node 1 must
+		// release B first.  Node 0 can then get both.
+		if m.holdsHigherLock(orderKey) {
+			log.Printf("lock out-of-order: type=%d num=%d (order=%x) — must release higher locks first",
+				req.GlockType, req.GlockNumber, orderKey)
+			m.sendDeny(req.RequestID, protocol.DenyReasonStale)
+			return
+		}
+
 		granted, rev, holderMode, holderNodeID, err :=
 			m.etcdCli.AcquireLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
@@ -71,10 +113,8 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 
 		if granted {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
-			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+			m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
 		} else if holderNodeID == m.nodeID {
-			// Self-contention: we hold this lock, GFS2 wants a
-			// different mode.  Release and reacquire once.
 			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
 				req.GlockType, req.GlockNumber, holderMode, mode)
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
@@ -87,14 +127,12 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			}
 			if g2 {
 				m.sendGrant(req.RequestID, req.RequestedMode, r2)
-				m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+				m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
 			} else {
-				// Still contended (other holders present).
 				m.sendWait(req.RequestID)
 				go m.watchAndRetry(ctx, req)
 			}
 		} else {
-			// Contended by another node.  Wait for natural release.
 			log.Printf("lock contended by %s (mode=%s), waiting",
 				holderNodeID, holderMode)
 			m.sendWait(req.RequestID)
@@ -103,14 +141,14 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 	}()
 }
 
-func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string) {
+func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string, orderKey uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	mapKey := lockMapKey(lockType, lockNumber)
 	m.mu.Lock()
 	if prev, ok := m.heldLocks[mapKey]; ok {
 		prev.cancel()
 	}
-	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode}
+	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode, orderKey: orderKey}
 	m.mu.Unlock()
 	_ = ctx
 }
@@ -167,6 +205,15 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 		for _, ev := range resp.Events {
 			if ev.Type == 1 { // DELETE
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
+				orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
+
+				if m.holdsHigherLock(orderKey) {
+					log.Printf("retry out-of-order: type=%d num=%d — waiting for higher locks to release",
+						req.GlockType, req.GlockNumber)
+					// Higher locks still held; keep watching.
+					continue
+				}
+
 				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
 				if err != nil {
@@ -176,7 +223,7 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 				}
 				if granted {
 					m.sendGrant(req.RequestID, req.RequestedMode, rev)
-					m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+					m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
 				}
 				return
 			}
