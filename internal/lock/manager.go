@@ -139,6 +139,22 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 				go m.watchAndRetry(ctx, req)
 			}
 		} else {
+			// Cross-node AB/BA deadlock prevention:
+			// If we hold a type-2 or type-3 lock and are requesting
+			// the opposite type held by another node, release our
+			// held lock to break the cycle.  We'll retry both after.
+			if (req.GlockType == 2 || req.GlockType == 3) &&
+				holderNodeID != "" && holderNodeID != m.nodeID {
+				otherType := uint32(2)
+				if req.GlockType == 2 {
+					otherType = 3
+				}
+				if m.holdsLockType(otherType) {
+					log.Printf("deadlock risk: releasing our type=%d locks to break cycle",
+						otherType)
+					m.releaseHeldLocksByType(ctx, otherType)
+				}
+			}
 			log.Printf("lock contended by %s (mode=%s), waiting",
 				holderNodeID, holderMode)
 			m.sendWait(req.RequestID)
@@ -157,6 +173,37 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string,
 	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode, orderKey: orderKey}
 	m.mu.Unlock()
 	_ = ctx
+}
+
+func (m *Manager) holdsLockType(lockType uint32) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, hl := range m.heldLocks {
+		if uint32(hl.orderKey>>56) == lockType {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) releaseHeldLocksByType(ctx context.Context, lockType uint32) {
+	m.mu.Lock()
+	var toRelease []struct{ t uint32; n uint64 }
+	for mapKey, hl := range m.heldLocks {
+		if uint32(hl.orderKey>>56) == lockType {
+			parts := strings.SplitN(mapKey, "/", 2)
+			if len(parts) == 2 {
+				t, _ := strconv.ParseUint(parts[0], 10, 32)
+				n, _ := strconv.ParseUint(parts[1], 10, 64)
+				toRelease = append(toRelease, struct{ t uint32; n uint64 }{uint32(t), n})
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for _, l := range toRelease {
+		m.releaseHeldLock(ctx, l.t, l.n)
+	}
 }
 
 func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumber uint64) {
