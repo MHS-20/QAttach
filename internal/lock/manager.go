@@ -54,15 +54,21 @@ func lockMapKey(lockType uint32, lockNumber uint64) string {
 
 // ---- lock ordering ----
 
-// holdsHigherLock returns true if this node already holds a lock whose
-// sort key is strictly greater than the requested key.  That means the
-// node is trying to acquire locks out of the global order and must
-// release the higher-key lock first.
-func (m *Manager) holdsHigherLock(reqOrderKey uint64) bool {
+// violatesTypeOrder returns true if acquiring lockType would violate
+// the global ordering rule.  Only type=2 (inode) and type=3 (rgrp)
+// are ordered — they form the AB/BA deadlock pair when creating files.
+// All other lock types (superblock, iopen, journal, etc.) are exempt.
+func (m *Manager) violatesTypeOrder(orderKey uint64, lockType uint32) bool {
+	if lockType != 2 && lockType != 3 {
+		return false
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, hl := range m.heldLocks {
-		if hl.orderKey > reqOrderKey {
+		heldType := uint32(hl.orderKey >> 56)
+		// Requesting type=2 while holding type=3, or vice versa.
+		if (lockType == 2 && heldType == 3) ||
+			(lockType == 3 && heldType == 2) {
 			return true
 		}
 	}
@@ -86,17 +92,10 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 
 		orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 
-		// Global ordering: a node must acquire locks in ascending
-		// sorted order.  If it already holds a higher-key lock,
-		// deny this request so GFS2 releases the higher locks first.
-		//
-		// This prevents the AB/BA deadlock: if Node 0 holds A
-		// (lower key) and Node 1 holds B (higher key), Node 1
-		// cannot get A because B has a higher key — Node 1 must
-		// release B first.  Node 0 can then get both.
-		if m.holdsHigherLock(orderKey) {
-			log.Printf("lock out-of-order: type=%d num=%d (order=%x) — waiting for higher locks to release",
-				req.GlockType, req.GlockNumber, orderKey)
+		if m.violatesTypeOrder(orderKey, req.GlockType) {
+			log.Printf("lock out-of-order: type=%d num=%d — waiting for type=%d locks",
+				req.GlockType, req.GlockNumber,
+				req.GlockType^1) // 2↔3
 			m.sendWait(req.RequestID)
 			go m.watchAndRetry(ctx, req)
 			return
@@ -208,10 +207,7 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
 				orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 
-				if m.holdsHigherLock(orderKey) {
-					log.Printf("retry out-of-order: type=%d num=%d — waiting for higher locks to release",
-						req.GlockType, req.GlockNumber)
-					// Higher locks still held; keep watching.
+				if m.violatesTypeOrder(orderKey, req.GlockType) {
 					continue
 				}
 
