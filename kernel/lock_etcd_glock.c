@@ -202,3 +202,80 @@ void letcd_revision_clear(struct gfs2_glock *gl)
 	spin_unlock_bh(&rev_lock);
 }
 EXPORT_SYMBOL(letcd_revision_clear);
+
+/* ---- yield infrastructure ---- */
+
+#define LETCD_YIELD_BITS 8
+struct yield_entry {
+	u32 glock_type;
+	u64 glock_number;
+	struct hlist_node node;
+};
+static DEFINE_HASHTABLE(yield_table, LETCD_YIELD_BITS);
+static DEFINE_SPINLOCK(yield_lock);
+
+static u32 yield_hash(u32 type, u64 number)
+{
+	return jhash_2words(type, (u32)(number & 0xFFFFFFFF), 0);
+}
+
+void letcd_yield_set(u32 glock_type, u64 glock_number)
+{
+	struct yield_entry *e = kmalloc(sizeof(*e), GFP_ATOMIC);
+	if (!e)
+		return;
+	e->glock_type = glock_type;
+	e->glock_number = glock_number;
+	spin_lock_bh(&yield_lock);
+	hash_add(yield_table, &e->node, yield_hash(glock_type, glock_number));
+	spin_unlock_bh(&yield_lock);
+}
+
+bool letcd_yield_test(u32 glock_type, u64 glock_number)
+{
+	struct yield_entry *e;
+	u32 key = yield_hash(glock_type, glock_number);
+	spin_lock_bh(&yield_lock);
+	hash_for_each_possible(yield_table, e, node, key) {
+		if (e->glock_type == glock_type &&
+		    e->glock_number == glock_number) {
+			spin_unlock_bh(&yield_lock);
+			return true;
+		}
+	}
+	spin_unlock_bh(&yield_lock);
+	return false;
+}
+
+void letcd_yield_clear(u32 glock_type, u64 glock_number)
+{
+	struct yield_entry *e;
+	u32 key = yield_hash(glock_type, glock_number);
+	spin_lock_bh(&yield_lock);
+	hash_for_each_possible(yield_table, e, node, key) {
+		if (e->glock_type == glock_type &&
+		    e->glock_number == glock_number) {
+			hash_del(&e->node);
+			kfree(e);
+			break;
+		}
+	}
+	spin_unlock_bh(&yield_lock);
+}
+
+void letcd_yield_cleanup(void)
+{
+	struct yield_entry *e;
+	struct hlist_node *tmp;
+	int bkt;
+	spin_lock_bh(&yield_lock);
+	hash_for_each_safe(yield_table, bkt, tmp, e, node) {
+		hash_del(&e->node);
+		kfree(e);
+	}
+	spin_unlock_bh(&yield_lock);
+}
+EXPORT_SYMBOL(letcd_yield_set);
+EXPORT_SYMBOL(letcd_yield_test);
+EXPORT_SYMBOL(letcd_yield_clear);
+EXPORT_SYMBOL(letcd_yield_cleanup);

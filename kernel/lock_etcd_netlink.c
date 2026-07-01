@@ -113,6 +113,18 @@ static void letcd_nl_recv(struct sk_buff *skb)
 		if (plen >= 4 + sizeof(struct letcd_mount_resp))
 			dispatch_mount_resp(payload + 4);
 		break;
+	case LETCD_MSG_LOCK_YIELD:
+		if (plen >= 4 + sizeof(struct letcd_lock_yield)) {
+			struct letcd_lock_yield *y = (void *)(payload + 4);
+			letcd_yield_set(y->glock_type, y->glock_number);
+		}
+		break;
+	case LETCD_MSG_YIELD_CLEAR:
+		if (plen >= 4 + sizeof(struct letcd_lock_yield)) {
+			struct letcd_lock_yield *y = (void *)(payload + 4);
+			letcd_yield_clear(y->glock_type, y->glock_number);
+		}
+		break;
 	}
 }
 

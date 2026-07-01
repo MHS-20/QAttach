@@ -61,6 +61,12 @@ void letcd_ordered_enqueue(struct letcd_ordered_entry *e,
 void letcd_ordered_drain(struct letcd_ordered_entry *e);
 void letcd_ordered_complete(struct letcd_ordered_entry *e);
 
+/* Yield infrastructure — prevents holder-reacquire race. */
+void letcd_yield_set(u32 glock_type, u64 glock_number);
+bool letcd_yield_test(u32 glock_type, u64 glock_number);
+void letcd_yield_clear(u32 glock_type, u64 glock_number);
+void letcd_yield_cleanup(void);
+
 struct letcd_mount_context {
 	struct completion mount_done;
 	int mount_jid;

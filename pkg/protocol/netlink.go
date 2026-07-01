@@ -19,6 +19,8 @@ const (
 	MsgMountReq   = 9  // kernel → agent: mount request (needs jid)
 	MsgMountResp  = 10 // agent → kernel: mount response with jid
 	MsgRegister   = 11 // agent → kernel: register PID for unicast replies
+	MsgLockYield  = 12 // agent → kernel: yield lock to waiter
+	MsgYieldClear = 13 // agent → kernel: clear yield flag
 )
 
 // LockRequest sent from kernel to agent requesting a glock.
@@ -85,6 +87,14 @@ type MountResponse struct {
 	RequestID uint64
 	JID       int32 // negative on error
 	PadMnt    [4]byte
+}
+
+// LockYield sent from agent to kernel to prevent lock reacquire.
+// Pad matches C struct letcd_lock_yield trailing padding.
+type LockYield struct {
+	GlockType   uint32
+	GlockNumber uint64
+	Pad         [4]byte
 }
 
 // Deny reasons.

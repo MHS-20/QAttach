@@ -162,6 +162,16 @@ func (s *Server) SendMountResponse(resp protocol.MountResponse) error {
 	return s.sendMsg(protocol.MsgMountResp, resp)
 }
 
+// SendLockYield tells the kernel to suppress reacquire of a lock.
+func (s *Server) SendLockYield(y protocol.LockYield) error {
+	return s.sendMsg(protocol.MsgLockYield, y)
+}
+
+// SendYieldClear tells the kernel to clear the yield flag for a lock.
+func (s *Server) SendYieldClear(y protocol.LockYield) error {
+	return s.sendMsg(protocol.MsgYieldClear, y)
+}
+
 // SendRegister sends a REGISTER message to the kernel so it learns the
 // agent's PID for subsequent unicast replies.
 func (s *Server) SendRegister() error {

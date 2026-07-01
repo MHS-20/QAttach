@@ -101,6 +101,14 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	req.glock_type     = gl->gl_name.ln_type;
 	req.requested_mode = req_state;
 
+	/* Yield check: if this lock was yielded, suppress the request.
+	 * letcd_yield_clear is called by the agent via netlink dispatch
+	 * when the waiter finishes I/O. */
+	if (letcd_yield_test(req.glock_type, req.glock_number)) {
+		gfs2_glock_complete(gl, 0);
+		return 0;
+	}
+
 	letcd_bast_insert(req.glock_type, req.glock_number, gl);
 	letcd_pending_insert(req.request_id, gl,
 			     req.glock_type, req.glock_number);
