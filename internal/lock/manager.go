@@ -95,9 +95,10 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		// cannot get A because B has a higher key — Node 1 must
 		// release B first.  Node 0 can then get both.
 		if m.holdsHigherLock(orderKey) {
-			log.Printf("lock out-of-order: type=%d num=%d (order=%x) — must release higher locks first",
+			log.Printf("lock out-of-order: type=%d num=%d (order=%x) — waiting for higher locks to release",
 				req.GlockType, req.GlockNumber, orderKey)
-			m.sendDeny(req.RequestID, protocol.DenyReasonStale)
+			m.sendWait(req.RequestID)
+			go m.watchAndRetry(ctx, req)
 			return
 		}
 
