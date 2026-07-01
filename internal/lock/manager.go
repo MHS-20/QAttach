@@ -121,9 +121,11 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
 		} else if holderNodeID == m.nodeID {
-			// Self-contention: check if another node is waiting
-			// via a bast key.  If so, yield so the waiter can
-			// acquire the lock on the next watch cycle.
+			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
+				req.GlockType, req.GlockNumber, holderMode, mode)
+			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
+			// Re-check after release: another node may have
+			// written a bast key while we were releasing.
 			if m.etcdCli.HasWaiter(ctx,
 				req.GlockType, req.GlockNumber) {
 				log.Printf("self-contention yielding to waiter: type=%d num=%d",
@@ -132,9 +134,6 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 				go m.watchAndRetry(ctx, req)
 				return
 			}
-			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
-				req.GlockType, req.GlockNumber, holderMode, mode)
-			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 			g2, r2, _, _, e2 := m.etcdCli.AcquireLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
 			if e2 != nil {
