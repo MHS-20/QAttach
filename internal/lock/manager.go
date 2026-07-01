@@ -139,21 +139,15 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 				go m.watchAndRetry(ctx, req)
 			}
 		} else {
-			// Cross-node AB/BA deadlock prevention:
-			// If we hold a type-2 or type-3 lock and are requesting
-			// the opposite type held by another node, release our
-			// held lock to break the cycle.  We'll retry both after.
+			// Cross-node deadlock prevention: if we're contending
+			// on a type-2 or type-3 lock, release ALL held
+			// type-2/3 locks to break the AB/BA cycle.  The other
+			// node can then complete, and we retry after.
 			if (req.GlockType == 2 || req.GlockType == 3) &&
 				holderNodeID != "" && holderNodeID != m.nodeID {
-				otherType := uint32(2)
-				if req.GlockType == 2 {
-					otherType = 3
-				}
-				if m.holdsLockType(otherType) {
-					log.Printf("deadlock risk: releasing our type=%d locks to break cycle",
-						otherType)
-					m.releaseHeldLocksByType(ctx, otherType)
-				}
+				log.Printf("deadlock risk: releasing all type-2/3 locks to break cycle")
+				m.releaseHeldLocksByType(ctx, 2)
+				m.releaseHeldLocksByType(ctx, 3)
 			}
 			log.Printf("lock contended by %s (mode=%s), waiting",
 				holderNodeID, holderMode)
