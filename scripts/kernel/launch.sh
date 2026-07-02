@@ -121,6 +121,16 @@ run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
 
 run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && make olddefconfig"
 
+# olddefconfig may revert NVMe. Force it back and accept dependencies.
+run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
+  sed -i 's/.*CONFIG_NVME_CORE.*/CONFIG_NVME_CORE=y/' .config && \
+  sed -i 's/.*CONFIG_BLK_DEV_NVME.*/CONFIG_BLK_DEV_NVME=y/' .config && \
+  yes '' | make oldconfig 2>&1 | tail -1"
+
+echo ""
+echo "=== Verifying NVMe ==="
+run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && grep -E 'CONFIG_NVME_CORE|CONFIG_BLK_DEV_NVME' .config"
+
 echo ""
 echo "========================================"
 echo " Integrating lock_etcd into kernel tree..."
