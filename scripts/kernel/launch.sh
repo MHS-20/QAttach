@@ -170,6 +170,10 @@ echo 'Enabled CONFIG_GFS2_FS_LOCKING_ETCD'
 python3 ~/patch-kernel.py \"\$SRC\"
 
 grep CONFIG_GFS2_FS_LOCKING .config
+echo ""
+echo "=== Verifying NVMe config ==="
+grep -E "CONFIG_NVME_CORE|CONFIG_BLK_DEV_NVME|CONFIG_XFS_FS" .config || true
+echo ""
 "
 
 echo ""
@@ -221,7 +225,7 @@ KERNEL_RELEASE=$(ssh -i "$SSH_KEY_PATH" \
 
 echo "Kernel release: $KERNEL_RELEASE"
 
-run "dracut --force /boot/initramfs-${KERNEL_RELEASE}.img ${KERNEL_RELEASE}"
+run "dracut --force --no-hostonly /boot/initramfs-${KERNEL_RELEASE}.img ${KERNEL_RELEASE}"
 run "mv /boot/vmlinuz /boot/vmlinuz-${KERNEL_RELEASE}-custom"
 run "mv /boot/initramfs-${KERNEL_RELEASE}.img /boot/initramfs-${KERNEL_RELEASE}-custom.img"
 
