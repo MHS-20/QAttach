@@ -112,9 +112,9 @@ run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
   ./scripts/config --enable CONFIG_DLM_DEBUG"
 
 run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
-  ./scripts/config --enable CONFIG_AMAZON_ENA_ETHERNET && \
-  ./scripts/config --enable CONFIG_NVME_CORE && \
-  ./scripts/config --enable CONFIG_BLK_DEV_NVME"
+  ./scripts/config --set-val CONFIG_AMAZON_ENA_ETHERNET y && \
+  ./scripts/config --set-val CONFIG_NVME_CORE y && \
+  ./scripts/config --set-val CONFIG_BLK_DEV_NVME y"
 
 run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
   ./scripts/config --disable CONFIG_MODULE_SIG_FORCE"
