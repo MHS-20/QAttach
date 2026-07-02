@@ -1,6 +1,5 @@
 *.csv
 *.out
-todo.md
 bin/
 certs/
 bin/cluster-agent

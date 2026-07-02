@@ -89,6 +89,11 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 			.glock_number = gl->gl_name.ln_number,
 			.glock_type   = gl->gl_name.ln_type,
 		};
+		/* Auto-yield on release: suppress immediate reacquire so
+		 * a waiting node has time to grab the lock.  The agent
+		 * clears the flag via LOCK_YIELD_CLEAR after the waiter
+		 * finishes. */
+		letcd_yield_set(gl->gl_name.ln_type, gl->gl_name.ln_number);
 		letcd_nl_send_msg(LETCD_MSG_LOCK_REL, &rel, sizeof(rel));
 		letcd_revision_clear(gl);
 		letcd_bast_remove(gl->gl_name.ln_type, gl->gl_name.ln_number);
@@ -105,6 +110,7 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	 * letcd_yield_clear is called by the agent via netlink dispatch
 	 * when the waiter finishes I/O. */
 	if (letcd_yield_test(req.glock_type, req.glock_number)) {
+		letcd_yield_clear(req.glock_type, req.glock_number);
 		gfs2_glock_complete(gl, 0);
 		return 0;
 	}
