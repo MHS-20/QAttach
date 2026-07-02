@@ -121,7 +121,21 @@ run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
 
 run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && make olddefconfig"
 
-run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && grep -E 'CONFIG_GFS2|CONFIG_DLM' .config"
+# Force NVMe, ENA, and XFS as built-in — olddefconfig may revert them.
+# sed + forced oldconfig ensures dependencies are satisfied.
+run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
+  sed -i 's/.*CONFIG_NVME_CORE.*/CONFIG_NVME_CORE=y/' .config && \
+  sed -i 's/.*CONFIG_BLK_DEV_NVME.*/CONFIG_BLK_DEV_NVME=y/' .config && \
+  sed -i 's/.*CONFIG_AMAZON_ENA_ETHERNET.*/CONFIG_AMAZON_ENA_ETHERNET=y/' .config && \
+  sed -i 's/.*CONFIG_XFS_FS.*/CONFIG_XFS_FS=y/' .config && \
+  yes '' | make oldconfig 2>&1 | tail -1"
+
+echo ""
+echo "=== Verifying critical config ==="
+run_user "cd ~/rpmbuild/BUILD/kernel-*/linux-*/ && \
+  echo 'NVMe:'; grep -E 'CONFIG_NVME_CORE|CONFIG_BLK_DEV_NVME' .config; \
+  echo 'ENA:'; grep CONFIG_AMAZON_ENA_ETHERNET .config; \
+  echo 'XFS:'; grep CONFIG_XFS_FS .config"
 
 echo ""
 echo "========================================"
