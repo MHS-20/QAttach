@@ -186,6 +186,34 @@ Filesystem is unmounting — agent should release all resources.
 Payload: 4 zero bytes
 ```
 
+### LOCK_YIELD (12) — agent → kernel
+
+Sets a persistent yield flag for a specific lock. The kernel suppresses all
+reacquire attempts until YIELD_CLEAR arrives. Used during BAST handoff.
+
+```
+Payload: struct letcd_lock_yield {
+    u32  glock_type
+    u64  glock_number
+}
+```
+
+The yield flag is tested in `letcd_lock()` before every lock request.
+If set, the request is suppressed with `gfs2_glock_complete(gl, 0)`.
+The flag is NOT auto-cleared.
+
+### YIELD_CLEAR (13) — agent → kernel
+
+Clears the yield flag for a lock. Sent when the waiter finishes I/O and
+releases the lock, allowing the previous holder to reacquire.
+
+```
+Payload: struct letcd_lock_yield {
+    u32  glock_type
+    u64  glock_number
+}
+```
+
 ## C/Go Struct Alignment
 
 Critical constraint: Go's `encoding/binary.Write` serializes struct fields

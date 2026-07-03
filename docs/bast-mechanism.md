@@ -100,42 +100,61 @@ but the holder may reacquire EX if it still needs it.
 For EX+EX: no BAST is sent because EX cannot coexist with EX.  The waiter
 must wait for the holder to release naturally (I/O completion, unmount, etc.).
 
-## Implemented Solution: Atomic Handoff
+## Implemented Solution: Persistent Yield + Handoff Watch
 
-To eliminate the race window, the holder's release must atomically reserve
-the lock for the waiter.  The handoff token is at `/locks/glock/{type}/{number}/next`
-with the waiter's nodeID.
+The solution combines three mechanisms:
+
+### 1. Proactive BAST watcher per held lock
+
+Every time the agent acquires a lock, `trackHeldLock()` spawns a
+`watchBastAndYield` goroutine that watches `/locks/bast/{type}/{num}`
+in etcd. When another node writes a BAST, the watcher fires
+immediately — no need to wait for self-contention.
+
+### 2. Persistent yield flag in the kernel
+
+When the agent detects a BAST, it sends:
+- `BAST(UNLOCK)` to the kernel → triggers `gfs2_glock_cb` to demote the lock
+- `LOCK_YIELD` to the kernel → sets a persistent yield flag for this lock
+- `ReleaseLock` to etcd → removes the holder from the etcd array
+
+The kernel's `letcd_lock()` checks the yield flag on every reacquire attempt
+and suppresses it. The flag is **not** auto-cleared — it persists until the
+agent sends `YIELD_CLEAR`.
+
+### 3. Handoff completion watch
+
+After yielding, `watchBastAndYield` watches the lock etcd key for the
+handoff to complete (lock key deleted = all holders gone, or BAST lease expires).
+When either happens, the agent sends `YIELD_CLEAR` to the kernel and the
+lock can be reacquired.
 
 ```
-Holder releases (BAST-triggered) in a single etcd Txn:
-  IF (lock key Version matches AND I am in the holder array)
-  THEN:
-    1. Remove my entry from the holder array
-    2. If array is now empty, Delete the lock key
-    3. Put /locks/glock/{type}/{number}/next = waiterID (lease=5s)
-
-Waiter watches:
-  if /next appears with my ID → I have priority, Txn succeeds
-  if lock key deleted/modified without /next → normal retry
+Holder agent (node A):                   Waiter agent (node B):
+  watchBastAndYield runs                   AcquireLock fails → write bast
+  bast watch fires                         send LOCK_WAIT to kernel
+  → sendBast(UNLOCK) to kernel             watch lock key
+  → sendLockYield to kernel
+  → releaseLock from etcd
+  → watch lock key for handoff complete
+                                           lock key changes → retry → succeeds
+                                           does I/O → releases
+  lock key deleted → sendYieldClear
+  kernel: yield flag cleared → reacquire OK
 ```
 
-The holder's release transaction deletes the lock key (if all holders removed)
-and writes the handoff token atomically.  The 5s lease prevents permanent
-reservation if the waiter crashes.  The transaction is atomic: either the
-holder holds the lock OR the handoff token exists — never both, never neither.
+### 4. BAST expiry safety net
 
-This guarantees the waiter wins the race because:
-1. Holder atomically removes self from array + writes handoff
-2. Holder's glock work runs, tries to CAS → fails (handoff exists)
-3. Waiter's watch fires on /next → Txn → succeeds
-4. Waiter deletes /next
+If the waiter crashes before acquiring, the BAST key expires after its
+15s lease. The holder's `watchBastAndYield` watches for this and sends
+`YIELD_CLEAR` on BAST key deletion, allowing the holder to reacquire.
 
-The holder can only reacquire after the handoff expires (if waiter crashes)
-or after the waiter acquires (holder watches for the waiter's acquisition).
+### Why this beats the old approach
 
-## Persistent BAST Watch
+| Old (atomic handoff) | New (persistent yield + watch) |
+|---|---|
+| Handoff token at `/next` with 5s TTL | No handoff token needed |
+| Holder reacquires after handoff expires | Yield persists until YIELD_CLEAR |
+| Race window between delete and handoff | Kernel suppresses ALL reacquires |
+| Waiter must check handoff token | Waiter just watches lock key |
 
-The bast watch goroutine must stay alive, not exit after the first BAST.
-If GFS2 reacquires EX after a BAST was processed, the holder may receive
-additional BAST requests (from the same or different waiters).  The watch
-only exits when the lock is released (context cancelled).

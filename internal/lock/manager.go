@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"sync"
 
+	"go.etcd.io/etcd/api/v3/mvccpb"
+
 	"github.com/polarity/qattach/internal/etcd"
 	"github.com/polarity/qattach/internal/netlink"
 	"github.com/polarity/qattach/pkg/protocol"
@@ -139,7 +141,77 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string,
 	}
 	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode, orderKey: orderKey}
 	m.mu.Unlock()
-	_ = ctx
+
+	// Watch for BAST keys: if another node writes a bast for this lock,
+	// yield immediately so the waiter can proceed.
+	go m.watchBastAndYield(ctx, lockType, lockNumber)
+}
+
+// watchBastAndYield watches the BAST etcd key for a lock we hold.
+// When a bast key appears (another node wants this lock), we send
+// a BAST notification to the kernel (triggering gfs2_glock_cb),
+// release from etcd, and set the yield flag so the kernel suppresses
+// immediate reacquire.  The yield flag persists until the handoff is
+// complete (the waiter acquires and releases the lock) or the BAST
+// key expires (waiter crashed before acquiring).
+func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNumber uint64) {
+	bastCh := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
+	for range bastCh {
+		log.Printf("bast received: type=%d num=%d — yielding",
+			lockType, lockNumber)
+
+		// Send BAST to kernel: gfs2_glock_cb demotes the lock.
+		if m.nlSrv != nil {
+			m.nlSrv.SendBast(protocol.BastNotification{
+				GlockType:   lockType,
+				GlockNumber: lockNumber,
+				TargetMode:  0,
+			})
+		}
+		// Set persistent yield flag; kernel suppresses all reacquire
+		// until YIELD_CLEAR.
+		m.sendLockYield(lockType, lockNumber)
+		m.releaseHeldLock(context.Background(), lockType, lockNumber)
+
+		// Watch for handoff completion OR bast expiry.
+		lockCh := m.etcdCli.WatchLockKey(ctx, lockType, lockNumber)
+		bastCh2 := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
+
+		for {
+			select {
+			case resp, ok := <-lockCh:
+				if !ok {
+					return
+				}
+				for _, ev := range resp.Events {
+					// Lock key deleted (all holders gone):
+					// waiter finished I/O, handoff complete.
+					if ev.Type == mvccpb.DELETE {
+						log.Printf("yield handoff done: type=%d num=%d",
+							lockType, lockNumber)
+						m.sendYieldClear(lockType, lockNumber)
+						return
+					}
+				}
+			case resp, ok := <-bastCh2:
+				if !ok {
+					return
+				}
+				for _, ev := range resp.Events {
+					// BAST key deleted (lease expired):
+					// waiter crashed before acquiring.
+					if ev.Type == mvccpb.DELETE {
+						log.Printf("yield bast expired: type=%d num=%d",
+							lockType, lockNumber)
+						m.sendYieldClear(lockType, lockNumber)
+						return
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 }
 
 func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumber uint64) {

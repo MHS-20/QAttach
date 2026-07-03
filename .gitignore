@@ -1,7 +1,10 @@
 *.csv
 *.out
+*.tar.gz
 bin/
 certs/
 bin/cluster-agent
+build.log
 infra-state.json
+__pycache__/
 test-results/

@@ -29,19 +29,28 @@ log ""
 
 # ---- Step 1: Key Pair ----
 
+# NEVER overwrite an existing private key.
+# Always use QATTACH_KEY_NAME=muhamad-keypair.
+REAL_PEM="${PEM_PATH/#\~/$HOME}"
+
 if [[ -z "$KEY_NAME" ]]; then
-    KEY_NAME="${CLUSTER_NAME}-key"
+    die "QATTACH_KEY_NAME must be set (e.g. QATTACH_KEY_NAME=muhamad-keypair)"
 fi
 
+if [[ ! -f "$REAL_PEM" ]]; then
+    die "Private key not found at $REAL_PEM. Create one with: ssh-keygen -t ed25519 -f $REAL_PEM"
+fi
+
+log "Using existing key: $REAL_PEM (key pair: $KEY_NAME)"
+
 if aws ec2 describe-key-pairs --key-names "$KEY_NAME" &>/dev/null; then
-    log "Key pair '$KEY_NAME' already exists"
+    log "Key pair '$KEY_NAME' already exists in AWS"
 else
-    log "Creating key pair: $KEY_NAME"
-    aws ec2 create-key-pair \
+    log "Importing local public key as AWS key pair '$KEY_NAME'..."
+    aws ec2 import-key-pair \
         --key-name "$KEY_NAME" \
-        --query 'KeyMaterial' --output text > "${PEM_PATH/#\~/$HOME}"
-    chmod 400 "${PEM_PATH/#\~/$HOME}"
-    log "Saved to ${PEM_PATH}"
+        --public-key-material "fileb://${REAL_PEM}.pub"
+    log "Imported."
 fi
 
 state_put key_name "\"$KEY_NAME\""

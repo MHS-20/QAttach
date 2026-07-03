@@ -20,7 +20,7 @@ Time  Node 0 (holder)                           Node 1 (waiter)
   8   self-contention: release → CAS → reacquire EX
   9                                               watch sees DELETE
  10                                               tries CAS → key exists
- 11                                               🔁 contention loop
+ 11                                               contention loop
 ```
 
 The holder releases every ~30s via GFS2's periodic glock work function,
@@ -152,9 +152,35 @@ The single etcd transaction guarantees the waiter wins — there's no race
 window between the holder deleting the key and the waiter CASing.  The 5s
 lease on `/next` prevents permanent reservation if the waiter crashes.
 
-**Status: committed, untested on clean infra.**  The last deploy had a build
-error (missing `strings` import in `client.go`) that was fixed but not
-deployed to a working cluster.
+**Status: superseded by proactive BAST watch + persistent yield (see #10).**
+
+### 10. Proactive BAST Watch + Persistent Yield (Implemented & Tested)
+
+Each held lock spawns a `watchBastAndYield` goroutine in `trackHeldLock`
+(`internal/lock/manager.go`). The kernel's yield flag persists across
+reacquire attempts (auto-clear removed from `kernel/lock_etcd_lock.c`).
+Full handoff completion is watched before sending YIELD_CLEAR.
+
+**Test results (2026-07-03):**
+- Cross-node concurrent writes: **PASS**
+- Cross-node reads (both nodes see each other's files): **PASS**
+- Multi-round concurrent append: **PASS**
+- Mount-time cross-node journal BAST: **PASS** (node2 mount triggers node1's
+  journal lock yield, node2 acquires)
+- Large file I/O (`dd bs=1M count=5`): **HUNG** — livelock between holder's
+  reacquire and waiter's claim under sustained I/O; yield flag only
+  suppresses one reacquire but GFS2 reacquires faster than waiter claims
+- Metadata ops (`chmod`): **HUNG** — `gfs2_qa_get` blocks before lock manager;
+  quota glock held by other node is not mediated by BAST watch
+  (see `docs/known-limitation-mount-glocks.md`)
+
+## Known Limitation
+
+Mount-time glocks (type=1 nondisk, type=8 quota, type=9 journal after initial
+handoff) are acquired by GFS2 internally and may not pass through `letcd_lock`
+during normal operation. The agent never starts a BAST watcher for them.
+When another node later needs these locks, the holder never yields.
+See `docs/known-limitation-mount-glocks.md`.
 
 ## Summary
 
@@ -169,3 +195,4 @@ deployed to a working cluster.
 | 7 | Release all type-2/3 | Wrong diagnosis |
 | 8 | HasWaiter + yield | TOCTOU + self-yield + watch events |
 | 9 | Atomic handoff on yield | Untested |
+| 10 | Proactive BAST + persistent yield | Works for agent-mediated locks; hangs on mount-time glocks (quota) + sustained I/O livelock

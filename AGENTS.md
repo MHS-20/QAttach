@@ -96,22 +96,52 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 ### Working
 
 - Single-key lock model (one key per lock, JSON holder array)
-- Cross-node reads (node1 reads files written by node0)
-- BAST delivery end-to-end
+- **Cross-node concurrent writes** — both nodes write files, both nodes see them
+- **Cross-node reads** — file written on node0 visible on node1 (and vice versa)
+- **Multi-round concurrent append** — sequential writes from both nodes interleave correctly
+- BAST delivery end-to-end (via `gfs2_glock_cb`)
+- **Proactive BAST watch** — agent watches `/locks/bast/{type}/{num}` per held lock; sends BAST + LOCK_YIELD on arrival (`internal/lock/manager.go:148-171`)
+- **LOCK_YIELD kernel mechanism** — yield flag set on `LM_ST_UNLOCKED`, auto-cleared after one suppression (`kernel/lock_etcd_lock.c:96,112`)
 - Atomic handoff (holder→waiter reservation via `/next` key)
 - Self-contention handling with other holders
 - Journal ID CAS assignment
 - Go↔C struct padding
 - Agent PID re-registration on restart
+- **Custom kernel build pipeline** — `scripts/kernel/launch.sh` compiles kernel 6.18.35 with lock_etcd in-tree, NVMe built-in, uploads to S3
 
 ### Not yet working
 
-- Node1 writes hang: GFS2 metadata locks EX→SH demotion not guaranteed
+- **Large file I/O hangs** (e.g., `dd bs=1M count=5`) — sustained writes cause lock starvation. The BAST watch releases the lock from etcd, but the kernel yield flag only suppresses *one* reacquire; GFS2 may reacquire faster than the waiter can claim it, creating a livelock.
+- GFS2 metadata locks EX→SH demotion not guaranteed during heavy I/O
+- `mkfs.gfs2` doesn't recognize `lock_etcd` protocol — must format with `lock_dlm`, mount with `lockproto=lock_etcd`
 
-See `docs/etcd-schema.md` for the single-key holder-array key layout and `docs/bast-mechanism.md` for the atomic handoff design.
+### Kernel deployment workflow
+
+The custom kernel (6.18.35, NVMe built-in, lock_etcd in gfs2.ko) must be deployed **before** `setup-compute.sh`:
+
+```bash
+# 1. Build kernel (optional — prebuilt archive is on S3)
+scripts/kernel/launch.sh
+# Teardown builder instance after upload
+
+# 2. Create infra
+QATTACH_KEY_NAME=muhamad-keypair scripts/infra/create-infra.sh
+
+# 3. Setup etcd
+scripts/infra/setup-etcd.sh
+
+# 4. Deploy custom kernel to compute (SCP 784MB archive, extract, grubby, reboot)
+scp /tmp/kernel-6.18.35-custom.tar.gz ec2-user@<ip>:/tmp/
+# On compute: tar xzf -C /, grubby --add-kernel ..., reboot
+
+# 5. Build agent locally, push to compute, start systemd unit
+# 6. Format GFS2 on node1: mkfs.gfs2 -p lock_dlm -t <cluster>:sharedfs -j 2
+# 7. Mount both: mount -t gfs2 -o lockproto=lock_etcd,locktable=<cluster>:sharedfs,noatime
+```
 
 ### Test workflow quirks
 
 - **The cluster-agent systemd unit must NOT have `ExecStop=umount`** — it bricks agent restarts. If GFS2 is mounted and the unit has an ExecStop umount, systemd will try to unmount on restart, hang because the filesystem is busy, and the agent will never come back.
 - **Agent restart requires a reboot if GFS2 is mounted** when ExecStop includes umount. Removing ExecStop fixes this — the agent can restart cleanly while GFS2 stays mounted.
 - **Nodes with hung GFS2 need force-terminate, not graceful shutdown** — graceful shutdown tries to unmount, which hangs. Use `aws ec2 stop-instances --force` or `aws ec2 terminate-instances`.
+- **`create-infra.sh` overwrites `~/.ssh/id_ed25519`** when creating a new keypair. Use `QATTACH_KEY_NAME=muhamad-keypair` with an existing keypair. The SSH agent must hold the private key (the file itself may be stale).

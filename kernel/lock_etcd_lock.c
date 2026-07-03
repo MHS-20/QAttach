@@ -43,13 +43,24 @@ void letcd_ordered_enqueue(struct letcd_ordered_entry *e,
 void letcd_ordered_drain(struct letcd_ordered_entry *e)
 {
 	unsigned long flags;
+	struct letcd_ordered_entry *head;
+	int loops = 0;
 
 	spin_lock_irqsave(&letcd_ordered_lock, flags);
 	while (!list_is_first(&e->list, &letcd_ordered_list) && !e->completed) {
+		head = list_first_entry_or_null(&letcd_ordered_list,
+						struct letcd_ordered_entry, list);
+		if (head && loops == 0)
+			pr_info("  DRAIN-BLOCKED: waiting behind ord=%#018llx (completed=%d)\n",
+				head->order_key, head->completed);
+		loops++;
 		spin_unlock_irqrestore(&letcd_ordered_lock, flags);
 		wait_for_completion(&e->done);
 		spin_lock_irqsave(&letcd_ordered_lock, flags);
 	}
+	if (loops > 0)
+		pr_info("  DRAIN-UNBLOCKED after %d waits, completed=%d\n",
+			loops, e->completed);
 	spin_unlock_irqrestore(&letcd_ordered_lock, flags);
 }
 
@@ -59,14 +70,18 @@ void letcd_ordered_complete(struct letcd_ordered_entry *e)
 	struct letcd_ordered_entry *next;
 	unsigned long flags;
 
+	pr_info("  ORD-COMPLETE ord=%#018llx\n", e->order_key);
+
 	spin_lock_irqsave(&letcd_ordered_lock, flags);
 	e->completed = true;
 	if (!list_empty(&e->list)) {
 		list_del_init(&e->list);
 		next = list_first_entry_or_null(&letcd_ordered_list,
 						struct letcd_ordered_entry, list);
-		if (next)
+		if (next) {
+			pr_info("  ORD-NEXT ord=%#018llx\n", next->order_key);
 			complete(&next->done);
+		}
 	} else {
 		/* Enqueue hasn't run yet — wake the enqueuer by completing now. */
 		complete(&e->done);
@@ -81,19 +96,22 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 {
 	struct letcd_lock_req req;
 	struct letcd_pending_entry *pe;
+	int ret;
 
 	gl->gl_req = req_state;
+
+	pr_info("==> t=%u n=%llu st=%u fl=%u glst=%u gltgt=%u tr=%u\n",
+		gl->gl_name.ln_type, gl->gl_name.ln_number,
+		req_state, flags, gl->gl_state, gl->gl_target,
+		test_bit(GLF_BLOCKING, &gl->gl_flags) ? 1 : 0);
 
 	if (req_state == LM_ST_UNLOCKED) {
 		struct letcd_lock_rel rel = {
 			.glock_number = gl->gl_name.ln_number,
 			.glock_type   = gl->gl_name.ln_type,
 		};
-		/* Auto-yield on release: suppress immediate reacquire so
-		 * a waiting node has time to grab the lock.  The agent
-		 * clears the flag via LOCK_YIELD_CLEAR after the waiter
-		 * finishes. */
-		letcd_yield_set(gl->gl_name.ln_type, gl->gl_name.ln_number);
+		pr_info("  UNLOCK t=%u n=%llu\n",
+			gl->gl_name.ln_type, gl->gl_name.ln_number);
 		letcd_nl_send_msg(LETCD_MSG_LOCK_REL, &rel, sizeof(rel));
 		letcd_revision_clear(gl);
 		letcd_bast_remove(gl->gl_name.ln_type, gl->gl_name.ln_number);
@@ -106,11 +124,16 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	req.glock_type     = gl->gl_name.ln_type;
 	req.requested_mode = req_state;
 
-	/* Yield check: if this lock was yielded, suppress the request.
-	 * letcd_yield_clear is called by the agent via netlink dispatch
-	 * when the waiter finishes I/O. */
+	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
+		req.glock_type, req.glock_number,
+		req.requested_mode, req.request_id);
+
+	/* Yield check: if this lock was yielded (by agent BAST watch),
+	 * suppress reacquire.  The flag persists until the agent sends
+	 * YIELD_CLEAR after the waiter finishes I/O. */
 	if (letcd_yield_test(req.glock_type, req.glock_number)) {
-		letcd_yield_clear(req.glock_type, req.glock_number);
+		pr_info("  YIELD-SUPPRESS t=%u n=%llu\n",
+			req.glock_type, req.glock_number);
 		gfs2_glock_complete(gl, 0);
 		return 0;
 	}
@@ -118,6 +141,10 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	letcd_bast_insert(req.glock_type, req.glock_number, gl);
 	letcd_pending_insert(req.request_id, gl,
 			     req.glock_type, req.glock_number);
+
+	pr_info("  INSERTED t=%u n=%llu reqid=%lld ord=%#018llx\n",
+		req.glock_type, req.glock_number, req.request_id,
+		letcd_order_key(req.glock_type, req.glock_number));
 
 	if (!(flags & (LM_FLAG_TRY | LM_FLAG_TRY_1CB)))
 		set_bit(GLF_BLOCKING, &gl->gl_flags);
@@ -129,10 +156,16 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	 */
 	pe = letcd_pending_lookup(req.request_id);
 	if (pe) {
+		pr_info("  DRAIN-WAIT t=%u n=%llu reqid=%lld\n",
+			req.glock_type, req.glock_number, req.request_id);
 		letcd_ordered_drain(&pe->ordered);
+		pr_info("  DRAIN-DONE t=%u n=%llu reqid=%lld\n",
+			req.glock_type, req.glock_number, req.request_id);
 	}
 
-	letcd_nl_send_msg(LETCD_MSG_LOCK_REQ, &req, sizeof(req));
+	ret = letcd_nl_send_msg(LETCD_MSG_LOCK_REQ, &req, sizeof(req));
+	pr_info("  NL-SENT t=%u n=%llu reqid=%lld ret=%d\n",
+		req.glock_type, req.glock_number, req.request_id, ret);
 	return 0;
 }
 

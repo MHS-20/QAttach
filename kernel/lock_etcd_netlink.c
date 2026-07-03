@@ -26,8 +26,14 @@ static void dispatch_mount_resp(struct letcd_mount_resp *resp)
 static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 {
 	struct gfs2_glock *gl = letcd_pending_remove(grant->request_id);
-	if (!gl)
+	if (!gl) {
+		pr_info("  GRANT-DROPPED reqid=%lld (no pending entry)\n",
+			grant->request_id);
 		return;
+	}
+	pr_info("  GRANT reqid=%lld mode=%u rev=%lld\n",
+		grant->request_id, grant->granted_mode,
+		grant->etcd_revision);
 	letcd_revision_set(gl, grant->etcd_revision);
 	gfs2_glock_complete(gl, gl->gl_req);
 }
@@ -37,8 +43,12 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 	struct gfs2_glock *gl = letcd_pending_remove(deny->request_id);
 	int ret = -EIO;
 
-	if (!gl)
+	if (!gl) {
+		pr_info("  DENY-DROPPED reqid=%lld\n", deny->request_id);
 		return;
+	}
+	pr_info("  DENY reqid=%lld reason=%u\n",
+		deny->request_id, deny->reason);
 	if (deny->reason == LETCD_DENY_STALE)
 		ret = -ESTALE;
 	else if (deny->reason == LETCD_DENY_CONTENDED)
@@ -49,8 +59,11 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 static void dispatch_lock_wait(struct letcd_lock_wait *wait)
 {
 	struct gfs2_glock *gl = letcd_pending_remove(wait->request_id);
-	if (!gl)
+	if (!gl) {
+		pr_info("  WAIT-DROPPED reqid=%lld\n", wait->request_id);
 		return;
+	}
+	pr_info("  WAIT reqid=%lld\n", wait->request_id);
 	letcd_pending_insert(wait->request_id, gl,
 			     gl->gl_name.ln_type, gl->gl_name.ln_number);
 }
@@ -59,9 +72,15 @@ static void dispatch_bast(struct letcd_bast *bast)
 {
 	struct gfs2_glock *gl;
 
+	pr_info("  BAST t=%u n=%llu target=%u\n",
+		bast->glock_type, bast->glock_number, bast->target_mode);
+
 	gl = letcd_bast_lookup(bast->glock_type, bast->glock_number);
-	if (!gl)
+	if (!gl) {
+		pr_info("  BAST-DROPPED t=%u n=%llu (no glock)\n",
+			bast->glock_type, bast->glock_number);
 		return;
+	}
 	gfs2_glock_cb(gl, bast->target_mode);
 }
 
