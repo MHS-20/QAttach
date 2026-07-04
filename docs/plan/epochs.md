@@ -1,18 +1,10 @@
-# Epoch Counter Plan
+# Epoch Counter — Implementation Plan (Fully Implemented)
 
-## Current state
+> **Status: Complete** — all 5 phases implemented. See `docs/epoch-mechanism.md` for the
+> conceptual design and rationale. This document captures the original implementation
+> plan and serves as a reference for what was changed.
 
-- `cluster/epoch` key exists in etcd (`pkg/protocol/etcd.go:7`)
-- `IncrementEpoch()` implemented (`internal/etcd/client.go:356`) — bumps key on fence
-- Called once: after EC2 `StopInstances` succeeds (`internal/fencing/fencer.go:142`)
-- `EtcdRevision` sent to kernel in `LockGrant` message (`pkg/protocol/netlink.go`)
-- Kernel stores revision in glock private data (`lock_etcd_glock.c`)
-
-**Gaps:**
-- Nothing validates the epoch on mount or lock grant
-- No clean-shutdown epoch behavior
-- No crash-recovery path using epoch
-- Kernel never queries or compares epoch — just stores the raw revision
+## State before implementation
 
 ## Goal
 
@@ -101,7 +93,7 @@ struct letcd_lock_req {
 
 ### New deny reason
 ```
-DenyReasonStaleEpoch = 3  // in pkg/protocol/netlink.go
+DenyReasonStaleEpoch = 4  // in pkg/protocol/netlink.go
 ```
 
 ## etcd key behavior

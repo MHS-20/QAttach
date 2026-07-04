@@ -145,6 +145,28 @@ The yield flag is persistent — not auto-cleared on reacquire attempts.
 The kernel suppresses all lock reacquisitions until the agent explicitly
 clears it after the waiter finishes I/O.
 
+### Epoch Validation
+
+```
+Mount:
+  kernel → MOUNT_REQ → agent
+  agent reads cluster/epoch → returns epoch in MOUNT_RESP
+  kernel stores epoch
+
+Lock Acquire:
+  kernel sends LOCK_REQ with node_epoch
+  agent compares node_epoch vs cached cluster_epoch
+  if cluster_epoch > node_epoch: deny (DenyReasonStaleEpoch)
+  → kernel returns -ESTALE to GFS2 → node withdraws
+```
+
+The epoch is a monotonically-increasing counter stored at `cluster/epoch` in etcd.
+It advances ONLY when a node is fenced (EC2 StopInstances succeeds). This ensures
+a fenced node — whose local epoch is now behind — cannot reacquire locks even if
+it restarts and reconnects. Clean shutdown does NOT increment the epoch.
+
+See `docs/epoch-mechanism.md` for the full design rationale.
+
 ## Session & Fencing
 
 Every cluster-agent maintains an etcd session lease (15s TTL, keepalive every 5s).
@@ -155,8 +177,14 @@ expires and all keys are automatically deleted by etcd.
 Surviving agents watch the member key prefix. When a member key disappears
 (lease expiry), the survivors race to claim the fencing key via CAS. The winner
 calls the EC2 API to stop the failed instance and detach its EBS volume. Once
-fencing completes, the winner signals recovery-ok to the kernel so GFS2 can
-replay the failed node's journal.
+fencing completes, the winner:
+
+1. Increments the cluster epoch (preventing the fenced node from ever rejoining
+   unnoticed)
+2. Signals recovery-ok to the kernel so GFS2 can replay the failed node's journal
+
+With colocated etcd, the fenced node's etcd member is also dead. The remaining
+cluster auto-removes the dead member via etcd's built-in failure detection.
 
 ## Key Constraints
 
@@ -167,22 +195,13 @@ replay the failed node's journal.
   which journal slot each node claims.
 - **Fencing token = etcd revision** — stored in kernel, validated on every grant to
   prevent stale lock usage after a crash.
+- **Cluster epoch** — incremented on fence, validated on mount and every lock grant.
+  A fenced node with a stale epoch is rejected before any lock I/O.
 - **Kernel ordered queue** — `letcd_ordered_drain` serialises lock acquisition per-node
   by `(type ≪ 56 | number)` to prevent AB/BA deadlocks.
 - **Persistent yield flag** — agent sends LOCK_YIELD to kernel, which suppresses all
   reacquire attempts until YIELD_CLEAR. Not auto-cleared.
 - **BAST watch per held lock** — `trackHeldLock` spawns a goroutine that watches
   `/locks/bast/{type}/{num}` and triggers yield on contention.
-
-## Known Limitations
-
-Mount-time glocks (type=1 nondisk, type=8 quota, type=9 journal) are acquired
-by GFS2 internally and may not pass through `letcd_lock` during normal operation.
-The agent never starts a BAST watcher for them. Metadata operations like `chmod`
-hang because `gfs2_qa_get` blocks waiting for a quota glock that will never yield.
-See `docs/known-limitation-mount-glocks.md`.
-
-## Next: etcd-Compute Colocation
-
-A plan exists to move etcd onto the compute instances (eliminating dedicated etcd
-nodes and the internal NLB). See `docs/etcd-compute-colocation.md`.
+- **etcd colocated** — etcd runs on compute nodes, managed by the agent's membership
+  package. No dedicated etcd instances or NLB. See `docs/plan/etcd-compute-colocation.md`.

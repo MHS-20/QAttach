@@ -1,4 +1,7 @@
-# etcd-Compute Colocation Plan
+# etcd-Compute Colocation — Implementation Plan (Fully Implemented)
+
+> **Status: Complete** — colocation is the default deployment mode. No dedicated etcd
+> instances or NLB. See `docs/architecture.md` for the current architecture description.
 
 ## Goal
 

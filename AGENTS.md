@@ -84,7 +84,8 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 | `scripts/infra/` | AWS infra provisioning, etcd setup, compute setup, e2e tests |
 | `scripts/` | GFS2 format, mount, journal management, module loader |
 | `scripts/test/` | Standalone test suite, partition sim, fencing test, glock monitor |
-| `docs/` | Architecture, design, colocation plan, known limitations |
+| `docs/` | Architecture, epoch mechanism, known limitations |
+| `docs/plan/` | Colocation plan, epoch implementation plan |
 
 ## Design doc
 
@@ -106,7 +107,8 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 - Go↔C struct padding
 - Agent PID re-registration on restart
 - **Custom kernel build pipeline** — `scripts/kernel/launch.sh` compiles kernel 6.18.35 with lock_etcd in-tree, NVMe built-in, uploads to S3
-- **etcd colocation** — etcd runs on compute nodes, agent handles bootstrap/join/member-remove. See `docs/etcd-compute-colocation.md`.
+- **etcd colocation** — etcd runs on compute nodes, agent handles bootstrap/join/member-remove. See `docs/plan/etcd-compute-colocation.md`.
+- **Cluster epoch** — monotonically-increasing counter on fence; validated at mount and every lock grant to reject fenced nodes. See `docs/epoch-mechanism.md`.
 
 ### Not yet working
 
