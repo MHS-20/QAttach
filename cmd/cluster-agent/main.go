@@ -61,6 +61,11 @@ func main() {
 	}
 	log.Printf("registered node %s in etcd", cfg.NodeID)
 
+	// Ensure epoch key exists (first node to bootstrap creates it).
+	if _, err := ec.InitEpoch(ctx); err != nil {
+		log.Printf("epoch init warning: %v", err)
+	}
+
 	// Create lock manager.
 	lm := lock.NewManager(ec, cfg.NodeID)
 

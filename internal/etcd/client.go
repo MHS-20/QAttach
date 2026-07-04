@@ -361,6 +361,31 @@ func (c *Client) IncrementEpoch(ctx context.Context) (int64, error) {
 	return resp.Header.Revision, nil
 }
 
+// GetEpoch returns the current cluster epoch revision.
+// Returns 0 if the key doesn't exist yet (pre-bootstrap).
+func (c *Client) GetEpoch(ctx context.Context) (int64, error) {
+	resp, err := c.cli.Get(ctx, protocol.KeyEpoch)
+	if err != nil {
+		return 0, err
+	}
+	if resp.Count == 0 {
+		return 0, nil
+	}
+	return resp.Kvs[0].ModRevision, nil
+}
+
+// InitEpoch writes the epoch key if it doesn't exist (first bootstrap).
+func (c *Client) InitEpoch(ctx context.Context) (int64, error) {
+	txnResp, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Version(protocol.KeyEpoch), "=", 0)).
+		Then(clientv3.OpPut(protocol.KeyEpoch, "0")).
+		Commit()
+	if err != nil {
+		return 0, err
+	}
+	return txnResp.Header.Revision, nil
+}
+
 func (c *Client) GetLockRevision(ctx context.Context, lockType uint32, lockNumber uint64) (int64, error) {
 	key := lockKey(lockType, lockNumber)
 	resp, err := c.cli.Get(ctx, key)

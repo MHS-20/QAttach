@@ -139,6 +139,14 @@ func (f *Fencer) executeFencing(ctx context.Context, instanceID, failedNodeID st
 	}
 
 	// Step 3: Increment cluster epoch.
+	// With colocated etcd, the fenced node's etcd member is now dead.
+	// The epoch increment ensures the fenced node can never rejoin
+	// without a full reset. The remaining etcd cluster auto-removes
+	// the dead member via etcd's built-in failure detection.
+	//
+	// TODO: explicitly remove fenced node from etcd membership before
+	// epoch increment when the node is still reachable (e.g. graceful
+	// leave via ASG lifecycle hook).
 	if _, err := f.etcdCli.IncrementEpoch(ctx); err != nil {
 		log.Printf("increment epoch error: %v", err)
 	}

@@ -35,6 +35,7 @@ type Manager struct {
 	mountReqs map[uint64]chan int32
 	mountJID  int32
 	heldLocks map[string]*heldLock
+	epoch     int64 // current cluster epoch, set at mount
 }
 
 func NewManager(ec *etcd.Client, nodeID string) *Manager {
@@ -62,8 +63,22 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 	go func() {
 		ctx := context.Background()
 
-		log.Printf("lock request: id=%d type=%d num=%d mode=%d",
-			req.RequestID, req.GlockType, req.GlockNumber, req.RequestedMode)
+		log.Printf("lock request: id=%d type=%d num=%d mode=%d epoch=%d",
+			req.RequestID, req.GlockType, req.GlockNumber, req.RequestedMode, req.NodeEpoch)
+
+		// Epoch validation: if kernel sent an epoch and it's behind the
+		// cluster epoch, this node was fenced. Reject the lock.
+		if req.NodeEpoch > 0 {
+			m.mu.Lock()
+			curEpoch := m.epoch
+			m.mu.Unlock()
+			if curEpoch > req.NodeEpoch {
+				log.Printf("lock deny: stale epoch node=%d cluster=%d type=%d num=%d",
+					req.NodeEpoch, curEpoch, req.GlockType, req.GlockNumber)
+				m.sendDeny(req.RequestID, protocol.DenyReasonStaleEpoch)
+				return
+			}
+		}
 
 		mode := protocol.LockModeToEtcd(req.RequestedMode)
 		if mode == "" {
@@ -250,13 +265,25 @@ func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 		}
 		if jid < 0 {
 			log.Printf("mount request: no free journal slots")
-			m.sendMountResponse(req.RequestID, -1)
+			m.sendMountResponse(req.RequestID, -1, 0)
 			return
 		}
+
+		// Acquire current cluster epoch.
+		epoch, err := m.etcdCli.GetEpoch(ctx)
+		if err != nil {
+			log.Printf("epoch read error: %v", err)
+			epoch = 0
+		}
+
+		m.mu.Lock()
 		m.mountJID = jid
-		log.Printf("mount request: cluster=%s, assigned jid=%d",
-			cstring(req.FilesystemName[:]), jid)
-		m.sendMountResponse(req.RequestID, jid)
+		m.epoch = epoch
+		m.mu.Unlock()
+
+		log.Printf("mount request: cluster=%s, assigned jid=%d, epoch=%d",
+			cstring(req.FilesystemName[:]), jid, epoch)
+		m.sendMountResponse(req.RequestID, jid, epoch)
 	}()
 }
 
@@ -377,14 +404,14 @@ func (m *Manager) sendWait(requestID uint64) {
 	}
 }
 
-func (m *Manager) sendMountResponse(requestID uint64, jid int32) {
+func (m *Manager) sendMountResponse(requestID uint64, jid int32, epoch int64) {
 	if m.nlSrv == nil {
 		log.Printf("mount response NOT SENT: netlink server is nil")
 		return
 	}
-	log.Printf("sending mount response: jid=%d via netlink", jid)
+	log.Printf("sending mount response: jid=%d epoch=%d via netlink", jid, epoch)
 	if err := m.nlSrv.SendMountResponse(protocol.MountResponse{
-		RequestID: requestID, JID: jid,
+		RequestID: requestID, JID: jid, Epoch: epoch,
 	}); err != nil {
 		log.Printf("send mount response error: %v", err)
 	}

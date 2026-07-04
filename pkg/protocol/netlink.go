@@ -29,6 +29,7 @@ type LockRequest struct {
 	GlockNumber   uint64
 	GlockType     uint32
 	RequestedMode uint32
+	NodeEpoch     int64 // node's last-known cluster epoch (0 = pre-epoch kernel)
 }
 
 // LockGrant sent from agent to kernel on successful acquisition.
@@ -80,13 +81,12 @@ type MountRequest struct {
 	FilesystemName [32]byte
 }
 
-// MountResponse sent from agent to kernel with assigned journal ID.
-// PadMnt ensures 16-byte size matching C struct letcd_mount_resp
-// (Go binary.Write omits trailing padding; C adds 4 bytes to align to 8).
+// MountResponse sent from agent to kernel with assigned journal ID and cluster epoch.
 type MountResponse struct {
 	RequestID uint64
 	JID       int32 // negative on error
 	PadMnt    [4]byte
+	Epoch     int64 // cluster/epoch revision at mount time
 }
 
 // LockYield sent from agent to kernel to prevent lock reacquire.
@@ -99,7 +99,8 @@ type LockYield struct {
 
 // Deny reasons.
 const (
-	DenyReasonContended = 1 // another node holds the lock
-	DenyReasonStale     = 2 // fencing token mismatch — cache is stale
-	DenyReasonError     = 3 // internal error
+	DenyReasonContended  = 1 // another node holds the lock
+	DenyReasonStale      = 2 // fencing token mismatch — cache is stale
+	DenyReasonError      = 3 // internal error
+	DenyReasonStaleEpoch = 4 // node epoch < cluster epoch — node was fenced
 )

@@ -72,6 +72,7 @@ struct letcd_mount_context {
 	int mount_jid;
 	int mount_error;
 	u64 mount_request_id;
+	s64 mount_epoch;      /* cluster/epoch at mount time */
 	spinlock_t lock;
 };
 #endif

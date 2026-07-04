@@ -123,6 +123,7 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	req.glock_number   = gl->gl_name.ln_number;
 	req.glock_type     = gl->gl_name.ln_type;
 	req.requested_mode = req_state;
+	req.node_epoch     = letcd_mount_ctx.mount_epoch;
 
 	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
 		req.glock_type, req.glock_number,

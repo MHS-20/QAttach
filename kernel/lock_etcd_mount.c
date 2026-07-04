@@ -19,6 +19,7 @@ int letcd_mount(struct gfs2_sbd *sdp, const char *table)
 	reinit_completion(&letcd_mount_ctx.mount_done);
 	letcd_mount_ctx.mount_jid = -1;
 	letcd_mount_ctx.mount_error = 0;
+	letcd_mount_ctx.mount_epoch = 0;
 	letcd_mount_ctx.mount_request_id =
 		atomic64_inc_return(&letcd_req_counter);
 

@@ -32,15 +32,17 @@
 #define LETCD_LM_ST_SHARED    3
 
 /* Deny reasons */
-#define LETCD_DENY_CONTENDED  1
-#define LETCD_DENY_STALE      2
-#define LETCD_DENY_ERROR      3
+#define LETCD_DENY_CONTENDED   1
+#define LETCD_DENY_STALE       2
+#define LETCD_DENY_ERROR       3
+#define LETCD_DENY_STALE_EPOCH 4   /* node epoch < cluster epoch — node was fenced */
 
 struct letcd_lock_req {
 	__u64 request_id;
 	__u64 glock_number;
 	__u32 glock_type;
 	__u32 requested_mode;
+	__s64 node_epoch;       /* kernel's last-known epoch (0 = pre-epoch) */
 };
 
 struct letcd_lock_grant {
@@ -82,6 +84,7 @@ struct letcd_mount_req {
 struct letcd_mount_resp {
 	__u64 request_id;
 	__s32 jid;              /* negative on error */
+	__s64 epoch;            /* cluster/epoch revision at mount time */
 };
 
 struct letcd_lock_yield {

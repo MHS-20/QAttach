@@ -20,6 +20,7 @@ static void dispatch_mount_resp(struct letcd_mount_resp *resp)
 	spin_lock_irqsave(&letcd_mount_ctx.lock, flags);
 	letcd_mount_ctx.mount_jid = resp->jid;
 	letcd_mount_ctx.mount_error = (resp->jid < 0) ? resp->jid : 0;
+	letcd_mount_ctx.mount_epoch = resp->epoch;
 	spin_unlock_irqrestore(&letcd_mount_ctx.lock, flags);
 	complete(&letcd_mount_ctx.mount_done);
 }
@@ -50,7 +51,8 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 	}
 	pr_info("  DENY reqid=%lld reason=%u\n",
 		deny->request_id, deny->reason);
-	if (deny->reason == LETCD_DENY_STALE)
+	if (deny->reason == LETCD_DENY_STALE ||
+	    deny->reason == LETCD_DENY_STALE_EPOCH)
 		ret = -ESTALE;
 	else if (deny->reason == LETCD_DENY_CONTENDED)
 		ret = -EAGAIN;
