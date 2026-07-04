@@ -15,6 +15,13 @@ type Config struct {
 	EtcdKeyFile   string
 	EtcdCAFile    string
 
+	// etcd colocation
+	PeerURL        string // https://<node-ip>:2380
+	EtcdName       string // etcd member name (e.g. etcd-0)
+	EtcdDataDir    string // /var/lib/etcd
+	InitialCluster string // full initial-cluster spec
+	NoBootstrap    bool   // skip bootstrap (for testing with standalone etcd)
+
 	ASGName     string
 	ClusterName string
 	VolumeID    string
@@ -33,6 +40,7 @@ func Default() *Config {
 		KeepaliveInterval: protocol.KeepaliveInterval * time.Second,
 		FencingLeaseTTL:   protocol.FencingLeaseTTL * time.Second,
 		FencingTimeout:    60 * time.Second,
+		EtcdDataDir:       "/var/lib/etcd",
 	}
 }
 

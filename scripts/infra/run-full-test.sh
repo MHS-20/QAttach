@@ -6,7 +6,8 @@
 #
 # Usage: ./run-full-test.sh
 #
-# Prerequisites: create-infra.sh + setup-etcd.sh + setup-compute.sh
+# Prerequisites: create-infra.sh + setup-compute.sh
+# (etcd is colocated on compute nodes — no separate setup-etcd.sh)
 
 set -euo pipefail
 
@@ -18,9 +19,11 @@ PEM="${PEM_PATH/#\~/$HOME}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
 RESULTS="$PROJECT_ROOT/test-results"
 
-mapfile -t COMPUTE_IPS < <(state_get compute_ips | jq -r '.[]')
+mapfile -t COMPUTE_IPS < <(state_get compute_public_ips | jq -r '.[]')
+if [[ -z "${COMPUTE_IPS[*]}" || "${COMPUTE_IPS[0]}" == "null" ]]; then
+    mapfile -t COMPUTE_IPS < <(state_get compute_ips | jq -r '.[]')
+fi
 COMPUTE_COUNT=${#COMPUTE_IPS[@]}
-ETCD0_IP=$(state_get etcd_ips | jq -r '.[0]')
 CLUSTER=$(state_get cluster_name)
 
 if [[ "$COMPUTE_COUNT" -lt 2 ]]; then
@@ -40,6 +43,7 @@ IP1="${COMPUTE_IPS[1]}"
 log "=== QAttach End-to-End Test Suite ==="
 log "Node 0: $IP0"
 log "Node 1: $IP1"
+log "Mode: etcd colocated on compute nodes"
 log ""
 
 # ---- Test 1: GFS2 mounted on all nodes ----
@@ -54,13 +58,12 @@ for ip in "${COMPUTE_IPS[@]}"; do
 done
 echo
 
-# ---- Test 2: etcd membership ----
+# ---- Test 2: etcd membership (colocated — check on node 0) ----
 log "=== Test 2: etcd membership ==="
 
-CERT_DIR="$PROJECT_ROOT/certs"
 MEMBER_COUNT=$(ssh $SSH_OPTS "ec2-user@$IP0" \
     "ETCDCTL_API=3 etcdctl \
-      --endpoints=https://${ETCD0_IP}:2379 \
+      --endpoints=https://localhost:2379 \
       --cacert=/etc/cluster-agent/ca.crt \
       --cert=/etc/cluster-agent/client.crt \
       --key=/etc/cluster-agent/client.key \
@@ -126,16 +129,16 @@ else
 fi
 echo
 
-# ---- Test 6: etcd health ----
-log "=== Test 6: etcd health ==="
+# ---- Test 6: etcd cluster health (colocated) ----
+log "=== Test 6: etcd cluster health ==="
 
-ETCD0_IP=$(state_get etcd_ips | jq -r '.[0]')
-ETCD_HEALTH=$(ssh $SSH_OPTS "ec2-user@$ETCD0_IP" \
+# Check etcd health from node 0 (etcd colocated, use localhost)
+ETCD_HEALTH=$(ssh $SSH_OPTS "ec2-user@$IP0" \
     "ETCDCTL_API=3 etcdctl \
       --endpoints=https://localhost:2379 \
-      --cacert=/etc/etcd/tls/ca.crt \
-      --cert=/etc/etcd/tls/server.crt \
-      --key=/etc/etcd/tls/server.key \
+      --cacert=/etc/cluster-agent/ca.crt \
+      --cert=/etc/cluster-agent/client.crt \
+      --key=/etc/cluster-agent/client.key \
       endpoint health --cluster" 2>/dev/null)
 
 HEALTHY_COUNT=$(echo "$ETCD_HEALTH" | grep -c "is healthy" || echo 0)

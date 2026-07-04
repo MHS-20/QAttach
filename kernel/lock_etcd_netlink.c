@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #define pr_fmt(fmt) "lock_etcd: " fmt
 #include <linux/netlink.h>
+#include <net/net_namespace.h>
 #include <net/netlink.h>
 #include <linux/skbuff.h>
 #include "lock_etcd_internal.h"

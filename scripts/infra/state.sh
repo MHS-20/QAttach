@@ -21,10 +21,8 @@ AZ="${QATTACH_AZ:-eu-west-1b}"
 CLUSTER_NAME="${QATTACH_CLUSTER:-ebs-ma}"
 KEY_NAME="${QATTACH_KEY_NAME:-muhamad-keypair}"
 PEM_PATH="${QATTACH_PEM_PATH:-~/.ssh/id_ed25519}"
-ETCD_NODES="${QATTACH_ETCD_NODES:-3}"
-COMPUTE_NODES="${QATTACH_COMPUTE_NODES:-2}"
+COMPUTE_NODES="${QATTACH_COMPUTE_NODES:-3}"
 INSTANCE_TYPE="${QATTACH_INSTANCE_TYPE:-m7i.large}"
-ETCD_INSTANCE_TYPE="${QATTACH_ETCD_INSTANCE_TYPE:-m7i.large}"
 VOLUME_SIZE_GB="${QATTACH_VOLUME_SIZE:-30}"
 VOLUME_IOPS="${QATTACH_VOLUME_IOPS:-100}"
 
@@ -48,11 +46,10 @@ state_init() {
   "subnet_id": "",
   "ami_id": "",
   "volume_id": "",
-  "etcd_ips": [],
-  "etcd_instance_ids": [],
-  "etcd_nlb_dns": "",
   "compute_ips": [],
+  "compute_public_ips": [],
   "compute_instance_ids": [],
+  "etcd_endpoints": "",
   "created_at": ""
 }
 JSON
@@ -100,9 +97,14 @@ discover_subnet() {
 }
 
 discover_ami() {
+    # Use standard AL2023 with 6.1 kernel (not ECS, not EKS 6.18).
     aws ec2 describe-images \
         --owners amazon \
-        --filters "Name=name,Values=al2023-ami-*-x86_64" \
+        --filters \
+            "Name=name,Values=al2023-ami-2023*" \
+            "Name=name,Values=*kernel-6.1-x86_64*" \
+            "Name=architecture,Values=x86_64" \
+            "Name=state,Values=available" \
         --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
 }
 

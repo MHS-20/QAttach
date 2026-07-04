@@ -15,6 +15,7 @@ import (
 	"github.com/polarity/qattach/internal/identity"
 	"github.com/polarity/qattach/internal/lifecycle"
 	"github.com/polarity/qattach/internal/lock"
+	"github.com/polarity/qattach/internal/membership"
 	"github.com/polarity/qattach/internal/netlink"
 	"github.com/polarity/qattach/internal/signal"
 )
@@ -36,6 +37,14 @@ func main() {
 
 	if cfg.NodeID == "" {
 		cfg.NodeID = id.InstanceID
+	}
+
+	// Bootstrap etcd membership (colocated mode).
+	if !cfg.NoBootstrap && cfg.EtcdName != "" && cfg.PeerURL != "" {
+		mm := membership.NewManager(cfg)
+		if err := mm.Bootstrap(ctx); err != nil {
+			log.Fatalf("membership bootstrap: %v", err)
+		}
 	}
 
 	// Connect to etcd.
@@ -114,6 +123,15 @@ func main() {
 		if err := ec.DeregisterNode(context.Background(), cfg.NodeID); err != nil {
 			log.Printf("deregister error: %v", err)
 		}
+
+		// Remove self from etcd cluster membership (colocated mode).
+		if !cfg.NoBootstrap && cfg.EtcdName != "" && cfg.PeerURL != "" {
+			mm := membership.NewManager(cfg)
+			if err := mm.Deregister(context.Background()); err != nil {
+				log.Printf("membership deregister warning: %v", err)
+			}
+		}
+
 		if nlSrv != nil {
 			nlSrv.Stop()
 		}
@@ -138,6 +156,13 @@ func parseFlags() *config.Config {
 	flag.StringVar(&cfg.ClusterName, "cluster-name", "mycluster", "GFS2 cluster name")
 	flag.StringVar(&cfg.VolumeID, "volume-id", "", "EBS volume ID for fencing")
 	flag.StringVar(&cfg.AZ, "az", "us-east-1a", "availability zone")
+
+	// etcd colocation
+	flag.StringVar(&cfg.PeerURL, "peer-url", "", "etcd peer URL (e.g. https://10.0.1.10:2380)")
+	flag.StringVar(&cfg.EtcdName, "etcd-name", "", "etcd member name (e.g. etcd-0)")
+	flag.StringVar(&cfg.EtcdDataDir, "etcd-data-dir", "/var/lib/etcd", "etcd data directory")
+	flag.StringVar(&cfg.InitialCluster, "initial-cluster", "", "etcd initial cluster (name=peerURL,...)")
+	flag.BoolVar(&cfg.NoBootstrap, "no-bootstrap", false, "skip etcd bootstrap (use existing remote etcd)")
 
 	flag.Parse()
 

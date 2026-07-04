@@ -5,12 +5,12 @@ etcd-backed distributed lock manager (DLM) replacement for GFS2 on EBS Multi-Att
 ## Architecture
 
 ```
-lock_etcd (kernel module, lm_lockops impl) ←Netlink→ cluster-agent (Go daemon) ←gRPC→ etcd (3-node Raft)
+lock_etcd (kernel module, lm_lockops impl) ←Netlink→ cluster-agent (Go daemon) ←gRPC→ etcd (colocated, 3-node Raft)
 ```
 
 - **`lock_etcd`** — kernel module (C) implementing GFS2's `lm_lockops`. Replaces `lock_dlm`.
 - **`cluster-agent`** — Go userspace daemon (one per compute node). Owns etcd, fencing, Netlink server.
-- **etcd** — fixed 3-node Raft cluster behind internal NLB. Source of truth for membership, glocks, fencing.
+- **etcd** — 3-node Raft cluster colocated on compute nodes. Source of truth for membership, glocks, fencing.
 - **GFS2** — unchanged on-disk format. Journals on-disk only (not in etcd).
 - **EBS io2 Multi-Attach** — one volume per AZ shared by all compute nodes.
 
@@ -22,6 +22,7 @@ lock_etcd (kernel module, lm_lockops impl) ←Netlink→ cluster-agent (Go daemo
 - No node-to-node monitoring — etcd Watch + session expiry are the sole liveness signals.
 - Glock mode mapping: EX→EX, SH→PR, DF→CW, UN→delete key.
 - etcd keys: `/cluster/members/{id}`, `/cluster/fencing/{id}`, `/cluster/epoch`, `/locks/glock/{type}/{number}`.
+- etCD colocated on compute nodes — no dedicated etcd instances or NLB.
 
 ## Build & test
 
@@ -36,19 +37,16 @@ go vet ./...            # static analysis
 Run these in order from the repo root:
 
 ```bash
-# 1. Provision AWS infrastructure (VPC, EC2, EBS, NLB)
+# 1. Provision AWS infrastructure (VPC, EC2, EBS, etcd colocated on compute)
 QATTACH_KEY_NAME=muhamad-keypair scripts/infra/create-infra.sh
 
-# 2. Install etcd cluster with mTLS
-scripts/infra/setup-etcd.sh
-
-# 3. Install agent + kernel module + GFS2 on compute nodes
+# 2. Install etcd + agent + kernel module + GFS2 on compute nodes
 scripts/infra/setup-compute.sh
 
-# 4. Run end-to-end tests
+# 3. Run end-to-end tests
 scripts/infra/run-full-test.sh
 
-# 5. Tear down everything
+# 4. Tear down everything
 scripts/infra/destroy-infra.sh --force
 ```
 
@@ -73,6 +71,7 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 |------|---------|
 | `cmd/cluster-agent/` | CLI entrypoint |
 | `internal/etcd/` | etcd client (mTLS, sessions, CAS, Watch) |
+| `internal/membership/` | etcd cluster membership (bootstrap, join, member remove) |
 | `internal/netlink/` | Raw AF_NETLINK server (kernel↔userspace) |
 | `internal/lock/` | Glock request handler (acquire, release, watch-and-retry) |
 | `internal/fencing/` | Member Watch, CAS race, EC2 fencing |
@@ -85,7 +84,7 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 | `scripts/infra/` | AWS infra provisioning, etcd setup, compute setup, e2e tests |
 | `scripts/` | GFS2 format, mount, journal management, module loader |
 | `scripts/test/` | Standalone test suite, partition sim, fencing test, glock monitor |
-| `docs/` | Design plan, AWS setup, env info |
+| `docs/` | Architecture, design, colocation plan, known limitations |
 
 ## Design doc
 
@@ -101,13 +100,13 @@ Set overrides via env: `QATTACH_KEY_NAME`, `QATTACH_PEM_PATH`, `QATTACH_AZ`, `QA
 - **Multi-round concurrent append** — sequential writes from both nodes interleave correctly
 - BAST delivery end-to-end (via `gfs2_glock_cb`)
 - **Proactive BAST watch** — agent watches `/locks/bast/{type}/{num}` per held lock; sends BAST + LOCK_YIELD on arrival (`internal/lock/manager.go:148-171`)
-- **LOCK_YIELD kernel mechanism** — yield flag set on `LM_ST_UNLOCKED`, auto-cleared after one suppression (`kernel/lock_etcd_lock.c:96,112`)
-- Atomic handoff (holder→waiter reservation via `/next` key)
+- **LOCK_YIELD kernel mechanism** — persistent yield flag, cleared only by agent on handoff completion
 - Self-contention handling with other holders
 - Journal ID CAS assignment
 - Go↔C struct padding
 - Agent PID re-registration on restart
 - **Custom kernel build pipeline** — `scripts/kernel/launch.sh` compiles kernel 6.18.35 with lock_etcd in-tree, NVMe built-in, uploads to S3
+- **etcd colocation** — etcd runs on compute nodes, agent handles bootstrap/join/member-remove. See `docs/etcd-compute-colocation.md`.
 
 ### Not yet working
 
@@ -127,16 +126,8 @@ scripts/kernel/launch.sh
 # 2. Create infra
 QATTACH_KEY_NAME=muhamad-keypair scripts/infra/create-infra.sh
 
-# 3. Setup etcd
-scripts/infra/setup-etcd.sh
-
-# 4. Deploy custom kernel to compute (SCP 784MB archive, extract, grubby, reboot)
-scp /tmp/kernel-6.18.35-custom.tar.gz ec2-user@<ip>:/tmp/
-# On compute: tar xzf -C /, grubby --add-kernel ..., reboot
-
-# 5. Build agent locally, push to compute, start systemd unit
-# 6. Format GFS2 on node1: mkfs.gfs2 -p lock_dlm -t <cluster>:sharedfs -j 2
-# 7. Mount both: mount -t gfs2 -o lockproto=lock_etcd,locktable=<cluster>:sharedfs,noatime
+# 3. Setup etcd (now part of setup-compute.sh)
+scripts/infra/setup-compute.sh
 ```
 
 ### Test workflow quirks

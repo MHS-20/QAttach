@@ -26,7 +26,7 @@ type Client struct {
 
 // New creates a new etcd client with mTLS and session lease.
 func New(ctx context.Context, cfg *config.Config) (*Client, error) {
-	tlsCfg, err := buildTLSConfig(cfg)
+	tlsCfg, err := BuildTLSConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("tls config: %w", err)
 	}
@@ -399,7 +399,7 @@ func (c *Client) Lease() clientv3.LeaseID {
 	return c.sess.Lease()
 }
 
-func buildTLSConfig(cfg *config.Config) (*tls.Config, error) {
+func BuildTLSConfig(cfg *config.Config) (*tls.Config, error) {
 	if cfg.EtcdCAFile == "" && cfg.EtcdCertFile == "" {
 		return nil, nil
 	}

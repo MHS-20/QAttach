@@ -3,6 +3,7 @@
 #
 # Reads state from $QATTACH_STATE and destroys everything created
 # by create-infra.sh.  Use --force to skip confirmation.
+# Etcd is colocated on compute nodes — no separate etcd instances or NLB.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,19 +17,15 @@ log "=== QAttach Infrastructure Teardown ==="
 
 VOL_ID=$(state_get volume_id)
 SG_ID=$(state_get sg_id)
-KEY_NAME=$(state_get key_name)
 CLUSTER=$(state_get cluster_name)
 
-ETCD_IDS=$(state_get etcd_instance_ids | jq -r '.[]' 2>/dev/null || echo "")
 COMPUTE_IDS=$(state_get compute_instance_ids | jq -r '.[]' 2>/dev/null || echo "")
 
-ALL_IDS="$ETCD_IDS $COMPUTE_IDS"
+ALL_IDS="$COMPUTE_IDS"
 
 log "Volume:        $VOL_ID"
 log "Security Grp:  $SG_ID"
-log "Key pair:      $KEY_NAME (preserved)"
-log "etcd nodes:    $(echo $ETCD_IDS | wc -w)"
-log "Compute nodes: $(echo $COMPUTE_IDS | wc -w)"
+log "Nodes:         $(echo $ALL_IDS | wc -w)"
 
 if [[ "$FORCE" != "--force" ]]; then
     echo ""
@@ -55,25 +52,7 @@ if [[ -n "$ALL_IDS" ]]; then
     done
 fi
 
-# ---- Step 2: Delete NLB (if it exists) ----
-
-NLB_ARN=$(aws elbv2 describe-load-balancers \
-    --names "${CLUSTER}-etcd" \
-    --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
-
-if [[ -n "$NLB_ARN" && "$NLB_ARN" != "None" ]]; then
-    log "Deleting NLB..."
-    aws elbv2 delete-load-balancer --load-balancer-arn "$NLB_ARN" 2>/dev/null || true
-    for tg in $(aws elbv2 describe-target-groups \
-        --names "${CLUSTER}-etcd-tg" \
-        --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo ""); do
-        [[ "$tg" == "None" ]] && continue
-        sleep 2
-        aws elbv2 delete-target-group --target-group-arn "$tg" 2>/dev/null || true
-    done
-fi
-
-# ---- Step 3: Delete EBS volume ----
+# ---- Step 2: Delete EBS volume ----
 
 if [[ -n "$VOL_ID" && "$VOL_ID" != "null" ]]; then
     log "Waiting for volume to detach..."
@@ -82,15 +61,13 @@ if [[ -n "$VOL_ID" && "$VOL_ID" != "null" ]]; then
     log "Volume $VOL_ID deleted"
 fi
 
-# ---- Step 4: Delete security group ----
+# ---- Step 3: Delete security group ----
 
 if [[ -n "$SG_ID" && "$SG_ID" != "null" ]]; then
     sleep 5
     aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
     log "Security group $SG_ID deleted"
 fi
-
-# ---- Key pair is NOT deleted (shared across deployments) ----
 
 # ---- Clean up state ----
 

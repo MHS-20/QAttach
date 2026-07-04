@@ -7,30 +7,35 @@ QAttach replaces the DLM (Distributed Lock Manager) stack traditionally used wit
 kernel module (`lock_etcd`) implements GFS2's `lm_lockops` interface and communicates
 with a userspace Go daemon (`cluster-agent`) over AF_NETLINK.  The daemon uses etcd
 as the single source of truth for lock state, membership, and fencing coordination.
+etcd is colocated on each compute node; the agent handles bootstrap, join, and member
+removal (`internal/membership/`).  No dedicated etcd instances or NLB are needed.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Compute Node                            │
-│                                                             │
-│  ┌───────────┐   Netlink   ┌──────────────┐   gRPC+mTLS     │ 
-│  │ lock_etcd │◄───────────►│ cluster-agent│◄──────────────┐ │
-│  │ (kernel)  │  family 31  │   (Go)       │               │ │
-│  └────┬──────┘             └──────┬───────┘               │ │
-│       │ lm_lockops                │ EC2 API               │ │
-│  ┌────┴──────┐                    │ (fencing)             │ │
-│  │   GFS2    │                    │                       │ │
-│  └────┬──────┘                    │                       │ │
-│       │                           │                       │ │
-│  ┌────┴──────┐                    │                       │ │
-│  │ EBS io2   │                    │                       │ │
-│  │ MultiAttach│                   │                       │ │
-│  └───────────┘                    │                       │ │
-└───────────────────────────────────┼───────────────────────┘
-                                    │
-                          ┌─────────┴─────────┐
-                          │  etcd (3 nodes)   │
-                          │  Raft cluster     │
-                          └───────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                     Compute Node 0                           │
+│                                                              │
+│  ┌───────────┐   Netlink   ┌──────────────┐  gRPC+mTLS      │
+│  │ lock_etcd │◄───────────►│ cluster-agent│◄───────┐        │
+│  │ (kernel)  │  family 31  │   (Go)       │        │        │
+│  └────┬──────┘             └──────┬───────┘   ┌────┴──────┐ │
+│       │ lm_lockops                │ EC2 API   │   etcd    │ │
+│  ┌────┴──────┐                    │(fencing)  │ (local)   │ │
+│  │   GFS2    │                    │           └────┬──────┘ │
+│  └────┬──────┘                    │◄──peer─────────┼──────┐ │
+│       │                           │                │      │ │
+│  ┌────┴──────┐                    │                │      │ │
+│  │ EBS io2   │                    │                │      │ │
+│  │ MultiAttach│                   │                │      │ │
+│  └───────────┘                    │                │      │ │
+└───────────────────────────────────┼────────────────┼──────┼─┘
+                                    │                │      │
+                         ┌──────────┴─────┐  ┌───────┴──────┴─┐
+                         │ Compute Node 1 │  │ Compute Node 2 │
+                         │ (identical)    │  │ (identical)    │
+                         └────────────────┘  └────────────────┘
+                                    │                │
+                                    └────────┬───────┘
+                                    EBS io2 Multi-Attach
 ```
 
 ## Components
@@ -176,3 +181,8 @@ by GFS2 internally and may not pass through `letcd_lock` during normal operation
 The agent never starts a BAST watcher for them. Metadata operations like `chmod`
 hang because `gfs2_qa_get` blocks waiting for a quota glock that will never yield.
 See `docs/known-limitation-mount-glocks.md`.
+
+## Next: etcd-Compute Colocation
+
+A plan exists to move etcd onto the compute instances (eliminating dedicated etcd
+nodes and the internal NLB). See `docs/etcd-compute-colocation.md`.
