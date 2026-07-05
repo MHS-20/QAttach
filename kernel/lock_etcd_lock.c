@@ -45,6 +45,7 @@ void letcd_ordered_drain(struct letcd_ordered_entry *e)
 	unsigned long flags;
 	struct letcd_ordered_entry *head;
 	int loops = 0;
+	int timed_out = 0;
 
 	spin_lock_irqsave(&letcd_ordered_lock, flags);
 	while (!list_is_first(&e->list, &letcd_ordered_list) && !e->completed) {
@@ -55,10 +56,16 @@ void letcd_ordered_drain(struct letcd_ordered_entry *e)
 				head->order_key, head->completed);
 		loops++;
 		spin_unlock_irqrestore(&letcd_ordered_lock, flags);
-		wait_for_completion(&e->done);
+		if (!wait_for_completion_timeout(&e->done,
+					msecs_to_jiffies(30000))) {
+			pr_err("  DRAIN-TIMEOUT after 30s ord=%#018llx\n",
+			       e->order_key);
+			timed_out = 1;
+			break;
+		}
 		spin_lock_irqsave(&letcd_ordered_lock, flags);
 	}
-	if (loops > 0)
+	if (loops > 0 && !timed_out)
 		pr_info("  DRAIN-UNBLOCKED after %d waits, completed=%d\n",
 			loops, e->completed);
 	spin_unlock_irqrestore(&letcd_ordered_lock, flags);

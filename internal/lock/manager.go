@@ -291,9 +291,6 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 	watchCh := m.etcdCli.WatchLockKey(ctx, req.GlockType, req.GlockNumber)
 	for resp := range watchCh {
 		for _, ev := range resp.Events {
-			// DELETE (Type=1) or PUT (Type=0): any change may
-			// mean the lock became available (self-contention
-			// yield removed a holder, etc).
 			if ev.Type == 1 || ev.Type == 0 {
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
 				orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
@@ -308,8 +305,9 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 				if granted {
 					m.sendGrant(req.RequestID, req.RequestedMode, rev)
 					m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
+					return
 				}
-				return
+				break
 			}
 		}
 	}
@@ -362,8 +360,9 @@ func (m *Manager) watchAndRetryYield(ctx context.Context,
 					m.sendGrant(req.RequestID, req.RequestedMode, rev)
 					m.trackHeldLock(req.GlockType, req.GlockNumber,
 						mode, orderKey)
+					return
 				}
-				return
+				break
 			}
 		}
 	}
