@@ -165,17 +165,16 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string,
 // watchBastAndYield watches the BAST etcd key for a lock we hold.
 // When a bast key appears (another node wants this lock), we send
 // a BAST notification to the kernel (triggering gfs2_glock_cb),
-// release from etcd, and set the yield flag so the kernel suppresses
-// immediate reacquire.  The yield flag persists until the handoff is
-// complete (the waiter acquires and releases the lock) or the BAST
-// key expires (waiter crashed before acquiring).
+// set the yield flag so the kernel suppresses immediate reacquire,
+// then wait for the kernel to release the glock (HandleLockRelease).
+// The yield flag persists until the waiter completes its I/O cycle
+// or the BAST key expires (waiter crashed).
 func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNumber uint64) {
 	bastCh := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
 	for range bastCh {
 		log.Printf("bast received: type=%d num=%d — yielding",
 			lockType, lockNumber)
 
-		// Send BAST to kernel: gfs2_glock_cb demotes the lock.
 		if m.nlSrv != nil {
 			m.nlSrv.SendBast(protocol.BastNotification{
 				GlockType:   lockType,
@@ -183,14 +182,22 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 				TargetMode:  0,
 			})
 		}
-		// Set persistent yield flag; kernel suppresses all reacquire
-		// until YIELD_CLEAR.
 		m.sendLockYield(lockType, lockNumber)
-		m.releaseHeldLock(context.Background(), lockType, lockNumber)
 
-		// Watch for handoff completion OR bast expiry.
-		lockCh := m.etcdCli.WatchLockKey(ctx, lockType, lockNumber)
-		bastCh2 := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
+		// Wait for kernel to process BAST and release the glock.
+		// HandleLockRelease -> releaseHeldLock -> hl.cancel() -> ctx.Done().
+		// Do NOT call releaseHeldLock here — that deletes the etcd key
+		// before the kernel has flushed the journal, letting the waiter
+		// read stale metadata.
+		<-ctx.Done()
+
+		// Now watch for handoff with a fresh context (old one was cancelled
+		// by releaseHeldLock).  The lock key was already deleted by
+		// releaseHeldLock; wait for the waiter to complete its I/O by
+		// detecting the next acquire->release cycle.
+		bg := context.Background()
+		lockCh := m.etcdCli.WatchLockKey(bg, lockType, lockNumber)
+		bastCh2 := m.etcdCli.WatchLockBast(bg, lockType, lockNumber)
 
 		for {
 			select {
@@ -199,8 +206,6 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 					return
 				}
 				for _, ev := range resp.Events {
-					// Lock key deleted (all holders gone):
-					// waiter finished I/O, handoff complete.
 					if ev.Type == mvccpb.DELETE {
 						log.Printf("yield handoff done: type=%d num=%d",
 							lockType, lockNumber)
@@ -213,8 +218,6 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 					return
 				}
 				for _, ev := range resp.Events {
-					// BAST key deleted (lease expired):
-					// waiter crashed before acquiring.
 					if ev.Type == mvccpb.DELETE {
 						log.Printf("yield bast expired: type=%d num=%d",
 							lockType, lockNumber)
@@ -222,8 +225,6 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 						return
 					}
 				}
-			case <-ctx.Done():
-				return
 			}
 		}
 	}
