@@ -11,10 +11,7 @@
 # Etcd is colocated on compute nodes — no dedicated etcd instances or NLB.
 # Compute node count is the etcd member count (min 3 for quorum).
 #
-# Usage:
-#   QATTACH_KEY_NAME=mykey QATTACH_PEM_PATH=~/.ssh/id_ed25519 ./create-infra.sh
-#
-# State is saved to $QATTACH_STATE (default: ../../infra-state.json).
+# Idempotent: skips already-created resources.
 
 set -euo pipefail
 
@@ -31,8 +28,6 @@ log ""
 
 # ---- Step 1: Key Pair ----
 
-# NEVER overwrite an existing private key.
-# Always use QATTACH_KEY_NAME=muhamad-keypair.
 REAL_PEM="${PEM_PATH/#\~/$HOME}"
 
 if [[ -z "$KEY_NAME" ]]; then
@@ -63,44 +58,49 @@ state_put cluster_name "\"$CLUSTER_NAME\""
 # ---- Step 2: Security Group ----
 
 VPC_ID=$(discover_vpc)
-SUBNET_ID=$(discover_subnet)
+log "VPC: $VPC_ID"
 
-log "VPC:     $VPC_ID"
-log "Subnet:  $SUBNET_ID"
+SG_ID=$(state_get sg_id 2>/dev/null || echo "")
+if [[ -n "$SG_ID" && "$SG_ID" != "null" && "$SG_ID" != "" ]]; then
+    if aws ec2 describe-security-groups --group-ids "$SG_ID" &>/dev/null; then
+        log "Security group already exists: $SG_ID"
+    else
+        SG_ID=""
+    fi
+fi
 
-SG_NAME="${CLUSTER_NAME}-sg"
-SG_ID=$(aws ec2 describe-security-groups \
-    --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
+if [[ -z "$SG_ID" ]]; then
+    SG_NAME="${CLUSTER_NAME}-sg"
+    SG_ID=$(aws ec2 describe-security-groups \
+        --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+        --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
 
-if [[ -n "$SG_ID" && "$SG_ID" != "None" ]]; then
-    log "Security group already exists: $SG_ID"
-else
-    log "Creating security group: $SG_NAME"
-    SG_ID=$(aws ec2 create-security-group \
-        --group-name "$SG_NAME" \
-        --description "QAttach cluster $CLUSTER_NAME" \
-        --vpc-id "$VPC_ID" \
-        --tag-specifications "ResourceType=security-group,Tags=[{Key=ClusterName,Value=$CLUSTER_NAME}]" \
-        --query 'GroupId' --output text)
+    if [[ -n "$SG_ID" && "$SG_ID" != "None" ]]; then
+        log "Security group already exists: $SG_ID"
+    else
+        log "Creating security group: $SG_NAME"
+        SG_ID=$(aws ec2 create-security-group \
+            --group-name "$SG_NAME" \
+            --description "QAttach cluster $CLUSTER_NAME" \
+            --vpc-id "$VPC_ID" \
+            --tag-specifications "ResourceType=security-group,Tags=[{Key=ClusterName,Value=$CLUSTER_NAME}]" \
+            --query 'GroupId' --output text)
 
-    # SSH from anywhere (tighten in production)
-    aws ec2 authorize-security-group-ingress \
-        --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+        MY_IP=$(curl -s https://checkip.amazonaws.com 2>/dev/null || echo "0.0.0.0/32")
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr "${MY_IP}/32" 2>/dev/null || \
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
 
-    # etcd client port (2379) — internal only
-    aws ec2 authorize-security-group-ingress \
-        --group-id "$SG_ID" --protocol tcp --port 2379 --source-group "$SG_ID"
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 2379 --source-group "$SG_ID"
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 2380 --source-group "$SG_ID"
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 0-65535 --source-group "$SG_ID" 2>/dev/null || true
 
-    # etcd peer port (2380) — internal only
-    aws ec2 authorize-security-group-ingress \
-        --group-id "$SG_ID" --protocol tcp --port 2380 --source-group "$SG_ID"
-
-    # All traffic within SG (GFS2, etcd, debugging)
-    aws ec2 authorize-security-group-ingress \
-        --group-id "$SG_ID" --protocol tcp --port 0-65535 --source-group "$SG_ID" 2>/dev/null || true
-
-    log "Security group created: $SG_ID"
+        log "Security group created: $SG_ID"
+    fi
 fi
 
 state_put vpc_id "\"$VPC_ID\""
@@ -115,67 +115,103 @@ state_put ami_id "\"$AMI_ID\""
 
 # ---- Step 4: EBS Multi-Attach volume ----
 
-log ""
-log "=== Creating EBS volume ==="
+VOL_ID=$(state_get volume_id 2>/dev/null || echo "")
+if [[ -n "$VOL_ID" && "$VOL_ID" != "null" && "$VOL_ID" != "" ]]; then
+    VOL_STATE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+        --query 'Volumes[0].State' --output text 2>/dev/null || echo "deleted")
+    if [[ "$VOL_STATE" != "deleted" && "$VOL_STATE" != "None" && "$VOL_STATE" != "null" ]]; then
+        log "EBS volume already exists: $VOL_ID ($VOL_STATE)"
+    else
+        VOL_ID=""
+    fi
+fi
 
-VOL_ID=$(aws ec2 create-volume \
-    --volume-type io2 \
-    --size "$VOLUME_SIZE_GB" \
-    --iops "$VOLUME_IOPS" \
-    --multi-attach-enabled \
-    --availability-zone "$AZ" \
-    --tag-specifications "ResourceType=volume,Tags=[{Key=ClusterName,Value=$CLUSTER_NAME},{Key=Name,Value=${CLUSTER_NAME}-gfs2}]" \
-    --query 'VolumeId' --output text)
+if [[ -z "$VOL_ID" ]]; then
+    log "Creating EBS volume..."
+    VOL_ID=$(aws ec2 create-volume \
+        --volume-type io2 \
+        --size "$VOLUME_SIZE_GB" \
+        --iops "$VOLUME_IOPS" \
+        --multi-attach-enabled \
+        --availability-zone "$AZ" \
+        --tag-specifications "ResourceType=volume,Tags=[{Key=ClusterName,Value=$CLUSTER_NAME},{Key=Name,Value=${CLUSTER_NAME}-gfs2}]" \
+        --query 'VolumeId' --output text)
+    log "Volume: $VOL_ID"
+fi
 
-log "Volume: $VOL_ID"
 state_put volume_id "\"$VOL_ID\""
 
 # ---- Step 5: Compute nodes (etcd colocated) ----
 
+EXISTING_IDS=$(state_get compute_instance_ids 2>/dev/null | jq -r '. | length' 2>/dev/null || echo "0")
+if [[ "$EXISTING_IDS" -ge "$COMPUTE_NODES" ]]; then
+    # Verify instances still exist and are running
+    ALL_RUNNING=true
+    mapfile -t CHECK_IDS < <(state_get compute_instance_ids | jq -r '.[]')
+    for cid in "${CHECK_IDS[@]}"; do
+        CSTATE=$(aws ec2 describe-instances --instance-ids "$cid" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "terminated")
+        if [[ "$CSTATE" != "running" ]]; then
+            ALL_RUNNING=false
+            break
+        fi
+    done
+    if $ALL_RUNNING; then
+        log "Compute nodes already exist and are running"
+    else
+        log "Some compute nodes are not running, will re-launch"
+        EXISTING_IDS=0
+    fi
+fi
+
+if [[ "$EXISTING_IDS" -lt "$COMPUTE_NODES" ]]; then
+    log "=== Creating compute nodes ($COMPUTE_NODES nodes) ==="
+
+    COMPUTE_IDS=()
+    COMPUTE_IPS=()
+    COMPUTE_PUB_IPS=()
+
+    for i in $(seq 1 $COMPUTE_NODES); do
+        NAME="${CLUSTER_NAME}-compute-${i}"
+        log "Launching $NAME..."
+        INST_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SG_ID" \
+            --subnet-id "$SUBNET_ID" \
+            --associate-public-ip-address \
+            --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":10,"VolumeType":"gp3"}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
+            --query 'Instances[0].InstanceId' --output text)
+
+        COMPUTE_IDS+=("$INST_ID")
+        log "  Instance: $INST_ID"
+    done
+
+    log "Waiting for compute nodes..."
+    for id in "${COMPUTE_IDS[@]}"; do
+        wait_for_instance "$id"
+        ip=$(get_instance_private_ip "$id")
+        pub=$(get_instance_public_ip "$id")
+        COMPUTE_IPS+=("$ip")
+        COMPUTE_PUB_IPS+=("$pub")
+        log "  $id → $pub / $ip"
+    done
+
+    state_save_array compute_instance_ids "${COMPUTE_IDS[@]}"
+    state_save_array compute_ips "${COMPUTE_IPS[@]}"
+    state_save_array compute_public_ips "${COMPUTE_PUB_IPS[@]}"
+else
+    log "Using existing compute nodes"
+    mapfile -t COMPUTE_IPS < <(state_get compute_ips | jq -r '.[]')
+    mapfile -t COMPUTE_IDS < <(state_get compute_instance_ids | jq -r '.[]')
+fi
+
+# ---- Step 6: etcd endpoints ----
+
 log ""
-log "=== Creating compute nodes ($COMPUTE_NODES nodes, etcd colocated) ==="
-
-COMPUTE_IDS=()
-COMPUTE_IPS=()
-COMPUTE_PUB_IPS=()
-
-for i in $(seq 1 $COMPUTE_NODES); do
-    NAME="${CLUSTER_NAME}-compute-${i}"
-    log "Launching $NAME..."
-    # Larger root disk for etcd WAL + GFS2 builds
-    INST_ID=$(aws ec2 run-instances \
-        --image-id "$AMI_ID" \
-        --instance-type "$INSTANCE_TYPE" \
-        --key-name "$KEY_NAME" \
-        --security-group-ids "$SG_ID" \
-        --subnet-id "$SUBNET_ID" \
-        --associate-public-ip-address \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":10,"VolumeType":"gp3"}}]' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
-        --query 'Instances[0].InstanceId' --output text)
-
-    COMPUTE_IDS+=("$INST_ID")
-    log "  Instance: $INST_ID"
-done
-
-log "Waiting for compute nodes..."
-for id in "${COMPUTE_IDS[@]}"; do
-    wait_for_instance "$id"
-    ip=$(get_instance_private_ip "$id")
-    pub=$(get_instance_public_ip "$id")
-    COMPUTE_IPS+=("$ip")
-    COMPUTE_PUB_IPS+=("$pub")
-    log "  $id → $pub / $ip"
-done
-
-state_save_array compute_instance_ids "${COMPUTE_IDS[@]}"
-state_save_array compute_ips "${COMPUTE_IPS[@]}"
-state_save_array compute_public_ips "${COMPUTE_PUB_IPS[@]}"
-
-# ---- Step 6: etcd endpoints (colocated — compute IPs) ----
-
-log ""
-log "=== Building etcd endpoint list (colocated) ==="
+log "=== Building etcd endpoint list ==="
 
 ETCD_ENDPOINTS=""
 for ip in "${COMPUTE_IPS[@]}"; do
@@ -191,22 +227,32 @@ state_put etcd_endpoints "\"$ETCD_ENDPOINTS\""
 log ""
 log "=== Attaching EBS to compute nodes ==="
 
-for id in "${COMPUTE_IDS[@]}"; do
+for i in "${!COMPUTE_IDS[@]}"; do
+    id="${COMPUTE_IDS[$i]}"
     log "Attaching $VOL_ID to $id..."
     aws ec2 attach-volume \
         --volume-id "$VOL_ID" \
         --instance-id "$id" \
-        --device /dev/sdf
+        --device /dev/sdf 2>/dev/null || true
 done
 
-log "Waiting for attachments..."
-for id in "${COMPUTE_IDS[@]}"; do
-    aws ec2 wait volume-in-use --volume-ids "$VOL_ID" 2>/dev/null || true
+log "Waiting for all attachments..."
+for i in $(seq 1 30); do
+    ATTACH_COUNT=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+        --query 'Volumes[0].Attachments | length(@)' --output text 2>/dev/null || echo "0")
+    if [[ "$ATTACH_COUNT" -ge "${#COMPUTE_IDS[@]}" ]]; then
+        log "All $ATTACH_COUNT attachments complete"
+        break
+    fi
+    if [[ $i -eq 30 ]]; then
+        log "WARNING: only $ATTACH_COUNT/${#COMPUTE_IDS[@]} attachments after 60s"
+    fi
+    sleep 2
 done
 
 # ---- Done ----
 
-state_put created_at "\"$(date -Iseconds)\""
+state_put created_at "\"$(date +%Y-%m-%dT%H:%M:%S%z)\""
 
 log ""
 log "============================================"
@@ -217,11 +263,6 @@ log "State file: $QATTACH_STATE"
 log "Compute nodes: $COMPUTE_NODES (etcd colocated)"
 log ""
 log "Next steps:"
-log "  1. Setup nodes:   ./scripts/infra/setup-compute.sh"
-log "  2. Run tests:     ./scripts/infra/run-full-test.sh"
-log ""
-log "To SSH:"
-log "  ssh -i ${PEM_PATH} ec2-user@<ip>"
-log ""
-log "To teardown:"
-log "  ./scripts/infra/destroy-infra.sh"
+log "  1. Deploy kernel:  ./scripts/infra/deploy-kernel.sh --local-tarball <path> <ips>"
+log "  2. Setup nodes:    ./scripts/infra/setup-compute.sh"
+log "  3. Run tests:      ./scripts/infra/run-full-test.sh"

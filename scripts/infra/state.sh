@@ -15,18 +15,28 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Default state file
 QATTACH_STATE="${QATTACH_STATE:-$PROJECT_ROOT/infra-state.json}"
 
-# Defaults from docs/awscli_info.txt (overridable via env)
+# Defaults (overridable via env)
 REGION="${AWS_DEFAULT_REGION:-eu-west-1}"
-AZ="${QATTACH_AZ:-eu-west-1b}"
+AZ="${QATTACH_AZ:-eu-west-1a}"
 CLUSTER_NAME="${QATTACH_CLUSTER:-ebs-ma}"
 KEY_NAME="${QATTACH_KEY_NAME:-muhamad-keypair}"
-PEM_PATH="${QATTACH_PEM_PATH:-~/.ssh/id_ed25519}"
+PEM_PATH="${QATTACH_PEM_PATH:-$HOME/.ssh/id_ed25519}"
 COMPUTE_NODES="${QATTACH_COMPUTE_NODES:-3}"
 INSTANCE_TYPE="${QATTACH_INSTANCE_TYPE:-m7i.large}"
 VOLUME_SIZE_GB="${QATTACH_VOLUME_SIZE:-30}"
 VOLUME_IOPS="${QATTACH_VOLUME_IOPS:-100}"
+SUBNET_ID="${QATTACH_SUBNET:-subnet-6570782d}"
+SECURITY_GROUP_ID="${QATTACH_SG:-sg-c56ee982}"
+BUILDER_AMI="${QATTACH_BUILDER_AMI:-ami-05cbf8a8aa4e4b755}"
+BUILDER_INSTANCE_TYPE="${QATTACH_BUILDER_INSTANCE:-m8i.4xlarge}"
+S3_BUCKET="${QATTACH_S3_BUCKET:-s3://muhamad-tirocinio-bucket-861507897222-eu-west-1-an}"
 
 export AWS_DEFAULT_REGION="$REGION"
+
+# Expand ~ in PEM_PATH
+PEM="${PEM_PATH/#\~/$HOME}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i $PEM"
+SSH_CMD="ssh $SSH_OPTS"
 
 log()  { echo "[$(date +%T)] $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -97,12 +107,10 @@ discover_subnet() {
 }
 
 discover_ami() {
-    # Use standard AL2023 with 6.1 kernel (not ECS, not EKS 6.18).
     aws ec2 describe-images \
         --owners amazon \
         --filters \
             "Name=name,Values=al2023-ami-2023*" \
-            "Name=name,Values=*kernel-6.1-x86_64*" \
             "Name=architecture,Values=x86_64" \
             "Name=state,Values=available" \
         --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
@@ -126,6 +134,84 @@ get_instance_public_ip() {
     local id="$1"
     aws ec2 describe-instances --instance-ids "$id" \
         --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+}
+
+# wait_for_ssh <ip> [max_retries] [delay_secs]
+# Polls SSH until ready. Returns 0 on success, 1 on timeout.
+wait_for_ssh() {
+    local ip="$1"
+    local max_retries="${2:-60}"
+    local delay="${3:-5}"
+    local i=0
+    while [[ $i -lt $max_retries ]]; do
+        if ssh $SSH_OPTS "ec2-user@${ip}" "echo ok" &>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep "$delay"
+    done
+    return 1
+}
+
+# wait_for_inactive <ip> <service>
+# Waits for a systemd service to be inactive (stopped).
+wait_for_inactive() {
+    local ip="$1" svc="$2"
+    local max_retries="${3:-30}"
+    local delay="${4:-2}"
+    local i=0
+    while [[ $i -lt $max_retries ]]; do
+        local state
+        state=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active $svc 2>/dev/null || true" 2>/dev/null)
+        if [[ "$state" != "active" ]]; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep "$delay"
+    done
+    return 1
+}
+
+# wait_for_active <ip> <service>
+# Waits for a systemd service to become active.
+wait_for_active() {
+    local ip="$1" svc="$2"
+    local max_retries="${3:-30}"
+    local delay="${4:-2}"
+    local i=0
+    while [[ $i -lt $max_retries ]]; do
+        local state
+        state=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active $svc 2>/dev/null || true" 2>/dev/null)
+        if [[ "$state" == "active" ]]; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep "$delay"
+    done
+    return 1
+}
+
+# wait_for_etcd <ip> [max_retries]
+# Waits for local etcd endpoint to respond.
+wait_for_etcd() {
+    local ip="$1"
+    local max_retries="${2:-30}"
+    local delay=2
+    local i=0
+    while [[ $i -lt $max_retries ]]; do
+        if ssh $SSH_OPTS "ec2-user@${ip}" \
+            "sudo ETCDCTL_API=3 etcdctl \
+              --endpoints=https://localhost:2379 \
+              --cacert=/etc/cluster-agent/ca.crt \
+              --cert=/etc/cluster-agent/client.crt \
+              --key=/etc/cluster-agent/client.key \
+              endpoint health 2>&1" | grep -q "is healthy"; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep "$delay"
+    done
+    return 1
 }
 
 # init state on source

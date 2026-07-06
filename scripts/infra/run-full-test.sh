@@ -1,13 +1,7 @@
 #!/bin/bash
 # run-full-test.sh — end-to-end test orchestration.
 #
-# Runs the test suite on the deployed cluster, plus additional
-# fencing and partition tests.
-#
-# Usage: ./run-full-test.sh
-#
-# Prerequisites: create-infra.sh + setup-compute.sh
-# (etcd is colocated on compute nodes — no separate setup-etcd.sh)
+# Prerequisites: create-infra.sh + deploy-kernel.sh + setup-compute.sh
 
 set -euo pipefail
 
@@ -15,8 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/state.sh"
 
-PEM="${PEM_PATH/#\~/$HOME}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
 RESULTS="$PROJECT_ROOT/test-results"
 
 mapfile -t COMPUTE_IPS < <(state_get compute_public_ips | jq -r '.[]')
@@ -50,7 +42,7 @@ log ""
 log "=== Test 1: GFS2 mount ==="
 
 for ip in "${COMPUTE_IPS[@]}"; do
-    if ssh $SSH_OPTS "ec2-user@$ip" "mountpoint -q /mnt/shared" 2>/dev/null; then
+    if $SSH_CMD "ec2-user@$ip" "mountpoint -q /mnt/shared" 2>/dev/null; then
         pass "GFS2 mounted on $ip"
     else
         fail "GFS2 NOT mounted on $ip"
@@ -58,11 +50,11 @@ for ip in "${COMPUTE_IPS[@]}"; do
 done
 echo
 
-# ---- Test 2: etcd membership (colocated — check on node 0) ----
+# ---- Test 2: etcd membership ----
 log "=== Test 2: etcd membership ==="
 
-MEMBER_COUNT=$(ssh $SSH_OPTS "ec2-user@$IP0" \
-    "ETCDCTL_API=3 etcdctl \
+MEMBER_COUNT=$($SSH_CMD "ec2-user@$IP0" \
+    "sudo ETCDCTL_API=3 etcdctl \
       --endpoints=https://localhost:2379 \
       --cacert=/etc/cluster-agent/ca.crt \
       --cert=/etc/cluster-agent/client.crt \
@@ -81,60 +73,56 @@ log "=== Test 3: Concurrent file write ==="
 
 TESTFILE="/mnt/shared/.e2e_test_$$"
 
-# Write from node 0
-ssh $SSH_OPTS "ec2-user@$IP0" "echo node0-\$(date +%s) > $TESTFILE" 2>/dev/null
+$SSH_CMD "ec2-user@$IP0" "sudo tee $TESTFILE <<< \"node0-\$(date +%s)\" > /dev/null" 2>/dev/null
+sync
 sleep 1
-# Write from node 1
-ssh $SSH_OPTS "ec2-user@$IP1" "echo node1-\$(date +%s) > $TESTFILE" 2>/dev/null
+$SSH_CMD "ec2-user@$IP1" "sudo tee $TESTFILE <<< \"node1-\$(date +%s)\" > /dev/null" 2>/dev/null
+sync
 sleep 1
-# Read from both
-CONTENT0=$(ssh $SSH_OPTS "ec2-user@$IP0" "cat $TESTFILE 2>/dev/null" || echo "MISSING")
-CONTENT1=$(ssh $SSH_OPTS "ec2-user@$IP1" "cat $TESTFILE 2>/dev/null" || echo "MISSING")
+CONTENT0=$($SSH_CMD "ec2-user@$IP0" "sudo cat $TESTFILE" 2>/dev/null || echo "MISSING")
+CONTENT1=$($SSH_CMD "ec2-user@$IP1" "sudo cat $TESTFILE" 2>/dev/null || echo "MISSING")
 
 if [[ "$CONTENT0" != "MISSING" ]] && [[ "$CONTENT1" != "MISSING" ]]; then
     pass "concurrent write: node0='$CONTENT0' node1='$CONTENT1'"
 else
     fail "concurrent write failed"
 fi
-ssh $SSH_OPTS "ec2-user@$IP0" "rm -f $TESTFILE" 2>/dev/null || true
+$SSH_CMD "ec2-user@$IP0" "sudo rm -f $TESTFILE" 2>/dev/null || true
 echo
 
 # ---- Test 4: File visible from both nodes ----
 log "=== Test 4: Cross-node visibility ==="
 
 VIS_FILE="/mnt/shared/.e2e_vis_$$"
-ssh $SSH_OPTS "ec2-user@$IP0" "echo visible > $VIS_FILE" 2>/dev/null
+$SSH_CMD "ec2-user@$IP0" "sudo tee $VIS_FILE <<< visible > /dev/null" 2>/dev/null
+sync
 sleep 1
-VIS1=$(ssh $SSH_OPTS "ec2-user@$IP1" "cat $VIS_FILE 2>/dev/null" || echo "MISSING")
+VIS1=$($SSH_CMD "ec2-user@$IP1" "sudo cat $VIS_FILE" 2>/dev/null || echo "MISSING")
 
 if [[ "$VIS1" == "visible" ]]; then
     pass "cross-node visibility: file written on node0 visible on node1"
 else
     fail "cross-node visibility failed: got '$VIS1'"
 fi
-ssh $SSH_OPTS "ec2-user@$IP0" "rm -f $VIS_FILE" 2>/dev/null || true
+$SSH_CMD "ec2-user@$IP0" "sudo rm -f $VIS_FILE" 2>/dev/null || true
 echo
 
 # ---- Test 5: Agent restart survival ----
 log "=== Test 5: Agent restart ==="
 
-ssh $SSH_OPTS "ec2-user@$IP0" "sudo systemctl restart cluster-agent" 2>/dev/null
-sleep 5
-
-AGENT_ALIVE=$(ssh $SSH_OPTS "ec2-user@$IP0" "sudo systemctl is-active cluster-agent" 2>/dev/null)
-if [[ "$AGENT_ALIVE" == "active" ]]; then
+$SSH_CMD "ec2-user@$IP0" "sudo systemctl restart cluster-agent" 2>/dev/null
+if wait_for_active "$IP0" "cluster-agent" 12 5; then
     pass "agent restart: active after restart"
 else
-    fail "agent restart: state=$AGENT_ALIVE"
+    fail "agent restart: did not become active"
 fi
 echo
 
-# ---- Test 6: etcd cluster health (colocated) ----
+# ---- Test 6: etcd cluster health ----
 log "=== Test 6: etcd cluster health ==="
 
-# Check etcd health from node 0 (etcd colocated, use localhost)
-ETCD_HEALTH=$(ssh $SSH_OPTS "ec2-user@$IP0" \
-    "ETCDCTL_API=3 etcdctl \
+ETCD_HEALTH=$($SSH_CMD "ec2-user@$IP0" \
+    "sudo ETCDCTL_API=3 etcdctl \
       --endpoints=https://localhost:2379 \
       --cacert=/etc/cluster-agent/ca.crt \
       --cert=/etc/cluster-agent/client.crt \
@@ -153,10 +141,10 @@ echo
 log "=== Test 7: Kernel module ==="
 
 for ip in "${COMPUTE_IPS[@]}"; do
-    if ssh $SSH_OPTS "ec2-user@$ip" "lsmod | grep -q lock_etcd" 2>/dev/null; then
-        pass "lock_etcd loaded on $ip"
+    if $SSH_CMD "ec2-user@$ip" "lsmod | grep -q gfs2" 2>/dev/null; then
+        pass "gfs2 module loaded on $ip"
     else
-        fail "lock_etcd NOT loaded on $ip"
+        fail "gfs2 module NOT loaded on $ip"
     fi
 done
 echo

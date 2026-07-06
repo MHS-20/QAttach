@@ -1,80 +1,118 @@
 #!/bin/bash
-# deploy-kernel.sh — install custom kernel with GFS2+lock_etcd on compute nodes.
+# deploy-kernel.sh — install custom kernel on compute nodes.
 #
-# Downloads the kernel archive from S3, extracts to /boot + /lib/modules,
-# updates grub, and reboots.
+# Usage:
+#   ./deploy-kernel.sh [--local-tarball <path>] <ip1> [ip2 ...]
+#   ./deploy-kernel.sh <ip1> [ip2 ...]                    # downloads from S3
 #
-# Usage: ./deploy-kernel.sh <ip1> <ip2> ...
-#
-# Env: S3_KERNEL_URL (default: s3://muhamad-tirocinio-bucket-.../kernel-6.18.35-custom.tar.gz)
+# Env: QATTACH_PEM_PATH, AWS_DEFAULT_REGION (via state.sh)
 
 set -euo pipefail
-PEM="${QATTACH_PEM_PATH:-$HOME/.ssh/id_ed25519}"
-PEM="${PEM/#\~/$HOME}"
-SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
-KERNEL_URL="${S3_KERNEL_URL:-s3://muhamad-tirocinio-bucket-861507897222-eu-west-1-an/kernel-6.18.35-custom.tar.gz}"
-KERNEL_FILE="$(basename "$KERNEL_URL")"
 
-log() { echo "[$(date +%T)] $*"; }
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/state.sh"
+
+LOCAL_TARBALL=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --local-tarball) LOCAL_TARBALL="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
 
 if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 <ip1> [ip2 ...]"
-    exit 1
+    die "Usage: $0 [--local-tarball <path>] <ip1> [ip2 ...]"
 fi
 
-for IP in "$@"; do
-    log "=== Deploying custom kernel to $IP ==="
+IPS=("$@")
+S3_URL="${S3_BUCKET}/kernel-6.18.35-custom.tar.gz"
+KERNEL_FILE="kernel-6.18.35-custom.tar.gz"
+SSH_CMD="ssh $SSH_OPTS"
 
-    # Download from S3 (instance needs S3 access via IAM role or instance profile)
-    $SSH "ec2-user@$IP" "
+log "=== Deploying custom kernel ==="
+log "Nodes: ${IPS[*]}"
+
+# ---- Upload tarball to each node ----
+
+for ip in "${IPS[@]}"; do
+    log "--- Setting up $ip ---"
+
+    if [[ -n "$LOCAL_TARBALL" ]]; then
+        log "Uploading tarball to $ip..."
+        scp $SSH_OPTS "$LOCAL_TARBALL" "ec2-user@${ip}:/tmp/${KERNEL_FILE}"
+    else
+        log "Downloading kernel from S3 on $ip..."
+        $SSH_CMD "ec2-user@${ip}" "
 set -e
 cd /tmp
-echo 'Downloading kernel...'
-aws s3 cp '$KERNEL_URL' /tmp/ 2>/dev/null || { echo 'aws s3 failed, trying curl...'; curl -sLO 'https://muhamad-tirocinio-bucket-861507897222-eu-west-1-an.s3.eu-west-1.amazonaws.com/$KERNEL_FILE'; }
-ls -lh /tmp/$KERNEL_FILE
-echo 'Extracting...'
-sudo tar xzf /tmp/$KERNEL_FILE -C /
-rm -f /tmp/$KERNEL_FILE
-
-# Install gfs2-utils (if included in archive)
-for bin in mkfs.gfs2 mount.gfs2 fsck.gfs2 gfs2_jadd gfs2_grow gfs2_edit; do
-    if [[ -f /usr/sbin/\$bin ]]; then
-        sudo chmod 755 /usr/sbin/\$bin
+aws s3 cp '${S3_URL}' /tmp/${KERNEL_FILE} 2>/dev/null || \
+  curl -sLo '${KERNEL_FILE}' 'https://muhamad-tirocinio-bucket-861507897222-eu-west-1-an.s3.eu-west-1.amazonaws.com/${KERNEL_FILE}'
+ls -lh /tmp/${KERNEL_FILE}
+" || { log "ERROR: failed to download kernel on $ip"; exit 1; }
     fi
 done
-which mkfs.gfs2 2>/dev/null || echo '(mkfs.gfs2 not in archive — will be built by setup-compute.sh)'
 
-# Verify extracted files
-ls -la /boot/vmlinuz-*custom* 2>/dev/null || echo 'WARN: no custom vmlinuz'
-ls /lib/modules/*custom*/kernel/fs/gfs2/gfs2.ko 2>/dev/null || ls /lib/modules/*/kernel/fs/gfs2/gfs2.ko 2>/dev/null
+# ---- Extract, configure, and reboot each node ----
 
-# Set default kernel
-KVER=\$(ls -d /lib/modules/6.18.*/ 2>/dev/null | head -1 | xargs basename)
-if [[ -n \"\$KVER\" ]]; then
-    echo \"Found custom kernel: \$KVER\"
-    sudo grubby --set-default /boot/vmlinuz-\${KVER}-custom 2>/dev/null || \
-    sudo grubby --set-default /boot/vmlinuz-\${KVER} 2>/dev/null || true
+for ip in "${IPS[@]}"; do
+    log "--- Installing kernel on $ip ---"
+    $SSH_CMD "ec2-user@${ip}" "
+set -e
+cd /tmp
+
+echo 'Extracting kernel...'
+sudo tar xzf /tmp/${KERNEL_FILE} -C /
+rm -f /tmp/${KERNEL_FILE}
+
+echo 'Verifying extracted files...'
+ls -la /boot/vmlinuz-*custom* 2>/dev/null || { echo 'ERROR: no custom vmlinuz'; exit 1; }
+
+# Find the custom kernel vmlinuz (has -custom suffix)
+CUSTOM_VMLINUZ=\$(ls /boot/vmlinuz-*-custom 2>/dev/null | head -1)
+if [[ -z \"\$CUSTOM_VMLINUZ\" ]]; then
+    echo 'ERROR: no custom vmlinuz found'
+    exit 1
 fi
+echo \"Custom vmlinuz: \$CUSTOM_VMLINUZ\"
 
-echo 'Rebooting into custom kernel...'
+# Find matching initramfs
+CUSTOM_INITRD=\$(ls /boot/initramfs-*-custom.img 2>/dev/null | head -1)
+echo \"Custom initrd: \$CUSTOM_INITRD\"
+
+# Find the modules directory (custom kernel modules from the tarball)
+KVER=\$(ls -d /lib/modules/*/ 2>/dev/null | head -1 | xargs basename)
+echo \"Kernel modules: \$KVER\"
+
+# Set default kernel with grubby
+sudo grubby --info=\"\$CUSTOM_VMLINUZ\" >/dev/null 2>&1 || \
+    sudo grubby --add-kernel=\"\$CUSTOM_VMLINUZ\" --initrd=\"\$CUSTOM_INITRD\" --title=\"Custom \$KVER (lock_etcd)\" --copy-default
+sudo grubby --set-default=\"\$CUSTOM_VMLINUZ\"
+echo \"Default kernel set: \$CUSTOM_VMLINUZ\"
+
+echo 'Rebooting...'
 sudo reboot
-" 2>&1 | grep -v WARNING | grep -v "vulnerable\|decrypt\|server may\|Permanently" &
-
+" 2>/dev/null || true
 done
 
-wait
+# ---- Wait for all nodes to reboot and come back ----
 
-log "All nodes rebooting. Waiting 30s for them to come back..."
-sleep 30
+log "Waiting 15s for nodes to reboot..."
+sleep 15
 
-for IP in "$@"; do
-    log "Waiting for $IP to reboot..."
-    for i in $(seq 1 20); do
-        if $SSH -o ConnectTimeout=5 "ec2-user@$IP" "uname -r" 2>/dev/null | grep -q "6.18"; then
-            KVER=$($SSH "ec2-user@$IP" "uname -r")
-            log "  $IP is up: $KVER"
+for ip in "${IPS[@]}"; do
+    log "Waiting for $ip..."
+    for i in $(seq 1 40); do
+        if $SSH_CMD -o ConnectTimeout=5 "ec2-user@${ip}" "uname -r" 2>/dev/null | grep -q "6.18"; then
+            KVER=$($SSH_CMD "ec2-user@${ip}" "uname -r")
+            log "  $ip is up: $KVER"
             break
+        fi
+        if [[ $i -eq 40 ]]; then
+            log "ERROR: $ip did not come back after reboot"
+            exit 1
         fi
         sleep 5
     done
 done
+
+log "=== All nodes rebooted with custom kernel ==="

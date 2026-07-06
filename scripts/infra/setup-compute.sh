@@ -5,25 +5,19 @@
 # For each compute node:
 #   1. Install etcd binary + etcd systemd unit
 #   2. Generate mTLS certs (compute IPs as SANs)
-#   3. Install kernel headers + build tools + gfs2-utils
-#   4. Build and load lock_etcd kernel module
-#   5. Build and start cluster-agent (Go daemon) with colocation flags
-#   6. Format GFS2 (first node only)
-#   7. Mount GFS2 (all nodes)
+#   3. Install kernel headers + build tools
+#   4. Build and start cluster-agent (Go daemon) with colocation flags
+#   5. Load gfs2.ko (with lock_etcd) and restart agent
+#   6. Format GFS2 (first node only, if not already formatted)
+#   7. Mount GFS2 (all nodes, if not already mounted)
 #
-# Prerequisites: create-infra.sh must have run.
-#
-# The cluster-agent handles etcd bootstrap (new cluster or join existing)
-# via its --etcd-name, --peer-url, and --initial-cluster flags.
+# Idempotent: safe to re-run. Skips already-completed steps.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/state.sh"
-
-PEM="${PEM_PATH/#\~/$HOME}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
 
 mapfile -t COMPUTE_IPS < <(state_get compute_public_ips | jq -r '.[]')
 if [[ -z "${COMPUTE_IPS[*]}" || "${COMPUTE_IPS[0]}" == "null" ]]; then
@@ -53,61 +47,116 @@ log "Volume:      $VOL_ID"
 log "Cluster:     $CLUSTER"
 log ""
 
-# ---- Generate TLS certs (with compute IPs as SANs) ----
+# ---- Helper: detect EBS device on a node ----
 
-log "Generating TLS certificates for all nodes..."
+detect_ebs_dev() {
+    local ip="$1"
+    $SSH_CMD "ec2-user@${ip}" "
+VOL_SERIAL=${VOL_ID//-/}
+EBS_DEV=\$(lsblk -J -o NAME,SERIAL 2>/dev/null | python3 -c \"
+import sys, json
+data = json.load(sys.stdin)
+for dev in data.get('blockdevices', []):
+    if dev.get('serial','') == '\$VOL_SERIAL':
+        print('/dev/' + dev['name'])
+        break
+\" 2>/dev/null || true)
+if [[ -z \"\$EBS_DEV\" ]]; then
+    for dev in /dev/nvme1n1 /dev/sdf /dev/xvdf; do
+        [[ -b \$dev ]] && EBS_DEV=\$dev && break
+    done
+fi
+echo \"\$EBS_DEV\"
+"
+}
 
-rm -rf "$CERT_DIR" && mkdir -p "$CERT_DIR"
+# ---- Helper: check if GFS2 is mounted ----
 
-openssl genrsa -out "$CERT_DIR/ca.key" 2048 2>/dev/null
-openssl req -new -x509 -days 3650 -key "$CERT_DIR/ca.key" \
-    -out "$CERT_DIR/ca.crt" -subj "/CN=etcd-ca" 2>/dev/null
+is_gfs2_mounted() {
+    local ip="$1"
+    $SSH_CMD "ec2-user@${ip}" "mountpoint -q /mnt/shared 2>/dev/null" 2>/dev/null
+}
 
-# Build SAN string with all compute IPs + localhost.
-SAN_IPS=""
-for ip in "${COMPUTE_PRIV_IPS[@]}"; do
-    [[ -n "$SAN_IPS" ]] && SAN_IPS+=","
-    SAN_IPS+="IP:${ip}"
-done
-# Add localhost for bootstrap when etcd checks its own endpoint.
-SAN_IPS+=",IP:127.0.0.1"
+# ---- Helper: check if etcd is installed ----
 
-for i in "${!COMPUTE_PRIV_IPS[@]}"; do
-    name="etcd-${i}"
-    ip="${COMPUTE_PRIV_IPS[$i]}"
+is_etcd_installed() {
+    local ip="$1"
+    $SSH_CMD "ec2-user@${ip}" "test -f /usr/local/bin/etcd" 2>/dev/null
+}
 
-    cat > "$CERT_DIR/ext-${name}.cnf" <<EOF
+# ---- Helper: check if agent is installed ----
+
+is_agent_installed() {
+    local ip="$1"
+    $SSH_CMD "ec2-user@${ip}" "test -f /usr/local/bin/cluster-agent" 2>/dev/null
+}
+
+# ---- Generate TLS certs ----
+
+# Check if existing certs contain the current IPs
+CERTS_VALID=false
+if [[ -f "$CERT_DIR/ca.crt" ]]; then
+    CERTS_VALID=true
+    for ip in "${COMPUTE_PRIV_IPS[@]}"; do
+        if ! openssl x509 -in "$CERT_DIR/peer-etcd-0.crt" -noout -text 2>/dev/null | grep -q "IP Address: ${ip}"; then
+            CERTS_VALID=false
+            break
+        fi
+    done
+fi
+
+if [[ "$CERTS_VALID" != "true" ]]; then
+    log "Generating TLS certificates..."
+    rm -rf "$CERT_DIR" && mkdir -p "$CERT_DIR"
+
+    openssl genrsa -out "$CERT_DIR/ca.key" 2048 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "$CERT_DIR/ca.key" \
+        -out "$CERT_DIR/ca.crt" -subj "/CN=etcd-ca" 2>/dev/null
+
+    SAN_IPS=""
+    for ip in "${COMPUTE_PRIV_IPS[@]}"; do
+        [[ -n "$SAN_IPS" ]] && SAN_IPS+=","
+        SAN_IPS+="IP:${ip}"
+    done
+    SAN_IPS+=",IP:127.0.0.1"
+
+    for i in "${!COMPUTE_PRIV_IPS[@]}"; do
+        name="etcd-${i}"
+        ip="${COMPUTE_PRIV_IPS[$i]}"
+
+        cat > "$CERT_DIR/ext-${name}.cnf" <<EOF
 subjectAltName=${SAN_IPS},DNS:${name},DNS:localhost
 EOF
 
-    # Server cert
-    openssl genrsa -out "$CERT_DIR/server-${name}.key" 2048 2>/dev/null
-    openssl req -new -key "$CERT_DIR/server-${name}.key" \
-        -out "$CERT_DIR/server-${name}.csr" -subj "/CN=${name}" 2>/dev/null
-    openssl x509 -req -days 3650 -in "$CERT_DIR/server-${name}.csr" \
+        openssl genrsa -out "$CERT_DIR/server-${name}.key" 2048 2>/dev/null
+        openssl req -new -key "$CERT_DIR/server-${name}.key" \
+            -out "$CERT_DIR/server-${name}.csr" -subj "/CN=${name}" 2>/dev/null
+        openssl x509 -req -days 3650 -in "$CERT_DIR/server-${name}.csr" \
+            -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
+            -out "$CERT_DIR/server-${name}.crt" \
+            -extfile "$CERT_DIR/ext-${name}.cnf" 2>/dev/null
+
+        openssl genrsa -out "$CERT_DIR/peer-${name}.key" 2048 2>/dev/null
+        openssl req -new -key "$CERT_DIR/peer-${name}.key" \
+            -out "$CERT_DIR/peer-${name}.csr" -subj "/CN=${name}-peer" 2>/dev/null
+        openssl x509 -req -days 3650 -in "$CERT_DIR/peer-${name}.csr" \
+            -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
+            -out "$CERT_DIR/peer-${name}.crt" \
+            -extfile "$CERT_DIR/ext-${name}.cnf" 2>/dev/null
+    done
+
+    openssl genrsa -out "$CERT_DIR/client.key" 2048 2>/dev/null
+    openssl req -new -key "$CERT_DIR/client.key" \
+        -out "$CERT_DIR/client.csr" -subj "/CN=cluster-agent" 2>/dev/null
+    openssl x509 -req -days 3650 -in "$CERT_DIR/client.csr" \
         -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-        -out "$CERT_DIR/server-${name}.crt" \
-        -extfile "$CERT_DIR/ext-${name}.cnf" 2>/dev/null
+        -out "$CERT_DIR/client.crt" 2>/dev/null
 
-    # Peer cert
-    openssl genrsa -out "$CERT_DIR/peer-${name}.key" 2048 2>/dev/null
-    openssl req -new -key "$CERT_DIR/peer-${name}.key" \
-        -out "$CERT_DIR/peer-${name}.csr" -subj "/CN=${name}-peer" 2>/dev/null
-    openssl x509 -req -days 3650 -in "$CERT_DIR/peer-${name}.csr" \
-        -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-        -out "$CERT_DIR/peer-${name}.crt" \
-        -extfile "$CERT_DIR/ext-${name}.cnf" 2>/dev/null
-done
-
-# Client cert (for cluster-agent → etcd connection)
-openssl genrsa -out "$CERT_DIR/client.key" 2048 2>/dev/null
-openssl req -new -key "$CERT_DIR/client.key" \
-    -out "$CERT_DIR/client.csr" -subj "/CN=cluster-agent" 2>/dev/null
-openssl x509 -req -days 3650 -in "$CERT_DIR/client.csr" \
-    -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
-    -out "$CERT_DIR/client.crt" 2>/dev/null
-
-chmod 600 "$CERT_DIR"/*.key
+    chmod 600 "$CERT_DIR"/*.key
+    log "TLS certs generated"
+else
+    log "TLS certs already exist, skipping generation"
+fi
 
 # ---- Build initial-cluster string ----
 
@@ -119,7 +168,7 @@ for i in "${!COMPUTE_PRIV_IPS[@]}"; do
 done
 log "Initial cluster: $INITIAL_CLUSTER"
 
-# ---- Build cluster-agent locally, then push ----
+# ---- Build cluster-agent locally ----
 
 log "Building cluster-agent locally..."
 cd "$PROJECT_ROOT"
@@ -141,41 +190,36 @@ for i in "${!COMPUTE_IPS[@]}"; do
     log "Setting up $node_name ($ip, etcd=$etcd_name)"
     log "========================================="
 
-    # --- Install packages ---
-    log "Installing packages..."
-    ssh $SSH_OPTS "ec2-user@$ip" <<PACKAGES
+    # --- Install packages (idempotent) ---
+    if ! $SSH_CMD "ec2-user@$ip" "rpm -q gcc make flex bison openssl-devel elfutils-libelf-devel git &>/dev/null"; then
+        log "Installing packages..."
+        $SSH_CMD "ec2-user@$ip" <<'PACKAGES'
 set -e
-# kernel-devel may not be available for custom kernels — non-fatal if missing.
 sudo dnf install -y \
     gcc make flex bison openssl-devel elfutils-libelf-devel \
     git rsync 2>&1 | tail -5
 sudo dnf install -y kernel-headers 2>&1 | tail -3 || true
-
-# gfs2-utils from custom kernel archive (skip if already present)
-if [[ ! -f /usr/sbin/mkfs.gfs2 ]]; then
-    GFS2_RPM="gfs2-utils-3.5.1-3.el9.x86_64.rpm"
-    GFS2_URL="https://repo.almalinux.org/almalinux/9/ResilientStorage/x86_64/os/Packages/\${GFS2_RPM}"
-    curl -sLO "\$GFS2_URL"
-    sudo dnf --nogpgcheck install -y "./\${GFS2_RPM}" 2>&1 | tail -5
-    rm -f "\${GFS2_RPM}"
-    echo "gfs2-utils installed: \$(which mkfs.gfs2)"
-fi
 PACKAGES
+    else
+        log "Packages already installed"
+    fi
 
-    # --- Install etcd binary ---
-    log "Installing etcd $ETCD_VER..."
-    ssh $SSH_OPTS "ec2-user@$ip" <<ETCDINST
+    # --- Install etcd binary (idempotent) ---
+    if ! is_etcd_installed "$ip"; then
+        log "Installing etcd $ETCD_VER..."
+        $SSH_CMD "ec2-user@$ip" <<ETCDINST
 set -e
 sudo mkdir -p /etc/etcd/tls /var/lib/etcd
 sudo chown ec2-user:ec2-user /var/lib/etcd
-if [[ ! -f /usr/local/bin/etcd ]]; then
-    curl -sLo /tmp/etcd.tar.gz '$ETCD_URL'
-    tar xzf /tmp/etcd.tar.gz -C /tmp
-    sudo mv /tmp/etcd-${ETCD_VER}-linux-amd64/etcd /tmp/etcd-${ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/
-    sudo chmod 755 /usr/local/bin/etcd /usr/local/bin/etcdctl
-    rm -rf /tmp/etcd*
-fi
+curl -sLo /tmp/etcd.tar.gz '${ETCD_URL}'
+tar xzf /tmp/etcd.tar.gz -C /tmp
+sudo mv /tmp/etcd-${ETCD_VER}-linux-amd64/etcd /tmp/etcd-${ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/
+sudo chmod 755 /usr/local/bin/etcd /usr/local/bin/etcdctl
+rm -rf /tmp/etcd*
 ETCDINST
+    else
+        log "etcd already installed"
+    fi
 
     # --- Push etcd certs ---
     log "Pushing etcd TLS certs..."
@@ -185,7 +229,7 @@ ETCDINST
         "$CERT_DIR/peer-${etcd_name}.crt" "$CERT_DIR/peer-${etcd_name}.key" \
         "ec2-user@$ip:/tmp/"
 
-    ssh $SSH_OPTS "ec2-user@$ip" <<ETCDCERTS
+    $SSH_CMD "ec2-user@$ip" <<ETCDCERTS
 sudo mkdir -p /etc/etcd/tls
 sudo mv /tmp/ca.crt /tmp/server-${etcd_name}.crt /tmp/server-${etcd_name}.key \
     /tmp/peer-${etcd_name}.crt /tmp/peer-${etcd_name}.key /etc/etcd/tls/
@@ -193,9 +237,9 @@ sudo chown -R root:root /etc/etcd/tls
 sudo chmod 600 /etc/etcd/tls/*.key
 ETCDCERTS
 
-    # --- etcd systemd unit (drop-in written by agent during bootstrap) ---
+    # --- etcd systemd unit ---
     log "Creating etcd systemd unit..."
-    ssh $SSH_OPTS "ec2-user@$ip" "sudo tee /etc/systemd/system/etcd.service" <<'ETCDUNIT'
+    $SSH_CMD "ec2-user@$ip" "sudo tee /etc/systemd/system/etcd.service" <<'ETCDUNIT'
 [Unit]
 Description=etcd (colocated)
 After=network-online.target
@@ -204,7 +248,6 @@ Documentation=https://etcd.io
 
 [Service]
 Type=notify
-# ExecStart is overridden by a drop-in written by cluster-agent during bootstrap.
 ExecStart=/bin/true
 Restart=always
 RestartSec=5
@@ -213,70 +256,30 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 ETCDUNIT
-    ssh $SSH_OPTS "ec2-user@$ip" "sudo mkdir -p /etc/systemd/system/etcd.service.d"
+    $SSH_CMD "ec2-user@$ip" "sudo mkdir -p /etc/systemd/system/etcd.service.d"
 
-    # --- Push client certs for agent ---
+    # --- Push agent certs ---
     log "Pushing agent TLS certs..."
     scp $SSH_OPTS "$CERT_DIR/ca.crt" "ec2-user@$ip:/tmp/"
     scp $SSH_OPTS "$CERT_DIR/client.crt" "ec2-user@$ip:/tmp/"
     scp $SSH_OPTS "$CERT_DIR/client.key" "ec2-user@$ip:/tmp/"
-    ssh $SSH_OPTS "ec2-user@$ip" <<AGENTCERTS
+    $SSH_CMD "ec2-user@$ip" <<AGENTCERTS
 sudo mkdir -p /etc/cluster-agent
 sudo mv /tmp/ca.crt /tmp/client.crt /tmp/client.key /etc/cluster-agent/
 sudo chown -R root:root /etc/cluster-agent
 sudo chmod 600 /etc/cluster-agent/*.key
 AGENTCERTS
 
-    # --- Build and load kernel module ---
-    # For custom kernel (lock_etcd in-tree gfs2.ko): just modprobe gfs2.
-    # For stock kernel: build standalone lock_etcd.ko, then insmod.
-    if ssh $SSH_OPTS "ec2-user@$ip" "cat /proc/net/netlink 2>/dev/null | grep -qP '^31\b'" 2>/dev/null; then
-        log "lock_etcd already registered (gfs2.ko loaded)"
-    elif ssh $SSH_OPTS "ec2-user@$ip" "lsmod | grep -q gfs2" 2>/dev/null; then
-        log "gfs2.ko loaded (lock_etcd will register when agent connects)"
-    elif ls /lib/modules/$(ssh $SSH_OPTS "ec2-user@$ip" "uname -r" 2>/dev/null)/kernel/fs/gfs2/gfs2.ko 2>/dev/null; then
-        log "Loading gfs2.ko (in-tree lock_etcd)..."
-        ssh $SSH_OPTS "ec2-user@$ip" "sudo depmod -a 2>/dev/null; sudo modprobe gfs2" 2>&1 | tail -1
-    else
-        log "Building lock_etcd standalone kernel module..."
-        log "Syncing kernel source..."
-        cp "$PROJECT_ROOT/pkg/protocol/letcd_netlink.h" "$PROJECT_ROOT/kernel/letcd_netlink.h"
-        rsync -avz -e "ssh $SSH_OPTS" \
-            --exclude='*.o' --exclude='*.ko' --exclude='*.mod*' \
-            --exclude='.git' \
-            "$PROJECT_ROOT/kernel/" "ec2-user@$ip:/tmp/lock_etcd_kernel/"
-
-        ssh $SSH_OPTS "ec2-user@$ip" <<'BUILD_MOD'
-set -e
-cd /tmp/lock_etcd_kernel
-
-# Extract GFS2 internal headers from kernel source RPM.
-if [[ ! -f glock.h ]] || [[ ! -f incore.h ]]; then
-    KVER=$(uname -r)
-    if [[ ! -f "/tmp/kernel-${KVER}.src.rpm" ]]; then
-        sudo dnf download --source kernel --downloaddir /tmp/ 2>&1 | tail -2 || true
-    fi
-    if [[ -f "/tmp/kernel-${KVER}.src.rpm" ]]; then
-        cd /tmp
-        rpm2cpio "kernel-${KVER}.src.rpm" | cpio -idmv "linux-*.tar.xz" 2>&1 | tail -1
-        ls /tmp/linux-*.tar.xz 2>/dev/null | head -1 | xargs -r tar xf --wildcards "*/fs/gfs2/*.h" 2>&1 | tail -3
-        cp linux-*/fs/gfs2/*.h /tmp/lock_etcd_kernel/ 2>/dev/null || true
-        echo "GFS2 headers ready"
-        cd /tmp/lock_etcd_kernel
-    fi
+    # --- Clean stale etcd data if agent is crash-looping or has stale member data ---
+    $SSH_CMD "ec2-user@$ip" <<'CLEAN_STALE'
+# If etcd data exists but etcd isn't healthy, clean it so agent re-bootstraps
+if [ -d /var/lib/etcd/member ] && ! sudo timeout 3 etcdctl --endpoints=https://localhost:2379 --cacert=/etc/cluster-agent/ca.crt --cert=/etc/cluster-agent/client.crt --key=/etc/cluster-agent/client.key endpoint health 2>/dev/null; then
+    echo "Stale etcd data with unhealthy etcd — cleaning"
+    sudo systemctl stop cluster-agent etcd 2>/dev/null || true
+    sudo rm -rf /var/lib/etcd/member /etc/systemd/system/etcd.service.d/qattach.conf /etc/etcd/etcd.args
+    sudo systemctl daemon-reload
 fi
-
-if [[ -f /lib/modules/$(uname -r)/build/include/linux/version.h ]]; then
-    make -C /lib/modules/$(uname -r)/build M=$(pwd) modules 2>&1 | tail -5
-    if [[ -f lock_etcd.ko ]]; then
-        echo "Module built: $(ls -lh lock_etcd.ko)"
-        sudo insmod lock_etcd.ko 2>&1 || true
-    fi
-fi
-lsmod | grep lock_etcd || echo "Note: lock_etcd not loaded as standalone module"
-cat /proc/net/netlink | grep -P '^31\b' && echo "Netlink family 31 registered" || true
-BUILD_MOD
-    fi
+CLEAN_STALE
 
     # --- Push and start cluster-agent ---
     log "Installing cluster-agent..."
@@ -284,14 +287,11 @@ BUILD_MOD
 
     PEER_URL="https://${priv_ip}:2380"
 
-    ssh $SSH_OPTS "ec2-user@$ip" <<AGENT
+    $SSH_CMD "ec2-user@$ip" <<AGENT
 set -e
 sudo mv /tmp/cluster-agent /usr/local/bin/
 sudo chmod 755 /usr/local/bin/cluster-agent
 
-# Create systemd unit for cluster-agent (etcd colocated).
-# Agent boots first: on startup it bootstraps/joins etcd, then listens for kernel.
-# etcd.service starts as a dependency so systemd knows the relationship.
 sudo tee /etc/systemd/system/cluster-agent.service > /dev/null <<'EOF'
 [Unit]
 Description=GFS2 Cluster Agent (etcd-backed, colocated)
@@ -299,6 +299,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+ExecStartPre=/sbin/modprobe gfs2
 ExecStart=/usr/local/bin/cluster-agent \\
   --node-id=NODE_ID_PLACEHOLDER \\
   --etcd-endpoints=ETCD_ENDPOINTS_PLACEHOLDER \\
@@ -331,61 +332,158 @@ sudo systemctl daemon-reload
 sudo systemctl enable etcd
 sudo systemctl enable cluster-agent
 sudo systemctl restart cluster-agent
-sleep 5
-echo "--- cluster-agent status ---"
-sudo systemctl status cluster-agent --no-pager | head -15
 AGENT
+
+    # Wait for agent to become active
+    log "Waiting for cluster-agent..."
+    if ! wait_for_active "$ip" "cluster-agent" 12 5; then
+        log "WARNING: cluster-agent did not become active on $ip"
+    fi
 
     # --- Format GFS2 (first node only) ---
     if $FIRST_NODE; then
-        log "=== First node: formatting GFS2 ==="
+        log "=== First node: checking GFS2 ==="
 
-        # Wait for agent to bootstrap etcd and register in cluster
-        sleep 15
+        EBS_DEV=$(detect_ebs_dev "$ip")
+        log "EBS device: $EBS_DEV"
 
-        ssh $SSH_OPTS "ec2-user@$ip" <<FORMAT
-set -e
-
-# Find the EBS device (usually /dev/nvme1n1 or /dev/sdf)
-EBS_DEV=\$(lsblk -o NAME,SERIAL | grep vol${VOL_ID#vol-} | awk '{print "/dev/"\$1}' | head -1)
-if [[ -z "\$EBS_DEV" ]]; then
-    for dev in /dev/nvme1n1 /dev/sdf /dev/xvdf; do
-        [[ -b \$dev ]] && EBS_DEV=\$dev && break
-    done
+        # Check if already formatted
+        ALREADY_FORMATTED=$($SSH_CMD "ec2-user@$ip" "
+if sudo blkid -s TYPE -o value '$EBS_DEV' 2>/dev/null | grep -q gfs2; then
+    echo 'yes'
+else
+    echo 'no'
 fi
+" 2>/dev/null || echo "no")
 
-echo "EBS device: \$EBS_DEV"
+        if [[ "$ALREADY_FORMATTED" == "yes" ]]; then
+            log "GFS2 already formatted on $EBS_DEV"
+        else
+            log "Formatting GFS2..."
+            # Wait for agent to register in etcd
+            if ! wait_for_etcd "$ip" 15; then
+                log "ERROR: etcd not ready on first node"
+                exit 1
+            fi
 
-# mkfs.gfs2 doesn't know lock_etcd; format with lock_dlm, mount with lockproto=lock_etcd.
+            $SSH_CMD "ec2-user@$ip" <<FORMAT
+set -e
+EBS_DEV="${EBS_DEV}"
+echo "Formatting GFS2 on \$EBS_DEV..."
 yes | sudo mkfs.gfs2 -p lock_dlm -t ${CLUSTER}:sharedfs -j ${COMPUTE_COUNT} "\$EBS_DEV"
-echo "GFS2 formatted on \$EBS_DEV"
-
-# Mount
-sudo mkdir -p /mnt/shared
-sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs,noatime \
-    "\$EBS_DEV" /mnt/shared
-echo "GFS2 mounted at /mnt/shared"
-df -h /mnt/shared
+echo "GFS2 formatted"
 FORMAT
+        fi
+
+        # --- Load gfs2.ko and restart agent ---
+        log "Loading gfs2.ko..."
+        $SSH_CMD "ec2-user@$ip" "
+set -e
+if [[ -f /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko ]]; then
+    sudo depmod -a 2>/dev/null || true
+    sudo modprobe gfs2
+    echo 'gfs2.ko loaded'
+else
+    echo 'WARNING: gfs2.ko not found at /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko'
+    ls /lib/modules/ 2>/dev/null
+fi
+"
+
+        # Restart agent so it connects to netlink family 31
+        log "Restarting cluster-agent after gfs2 load..."
+        $SSH_CMD "ec2-user@$ip" "sudo systemctl restart cluster-agent"
+        if ! wait_for_active "$ip" "cluster-agent" 12 5; then
+            log "ERROR: cluster-agent failed to restart on $ip"
+            exit 1
+        fi
+
+        # Wait for agent to register with kernel netlink socket
+        log "Waiting for agent to register netlink socket..."
+        for attempt in $(seq 1 20); do
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+                log "cluster-agent reconnected (netlink registered)"
+                break
+            fi
+            if [[ $attempt -eq 20 ]]; then
+                log "ERROR: agent did not register netlink socket after 20s"
+                exit 1
+            fi
+            sleep 1
+        done
+
+        # --- Mount GFS2 ---
+        if ! is_gfs2_mounted "$ip"; then
+            log "Mounting GFS2..."
+            $SSH_CMD "ec2-user@$ip" "
+set -e
+EBS_DEV=\"${EBS_DEV}\"
+sudo mkdir -p /mnt/shared
+sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs,noatime \\
+    \"\$EBS_DEV\" /mnt/shared
+echo 'GFS2 mounted'
+df -h /mnt/shared
+"
+        else
+            log "GFS2 already mounted"
+        fi
+
         FIRST_NODE=false
     else
         # --- Mount GFS2 (other nodes) ---
         log "=== Mounting GFS2 ==="
 
-        # Wait for first node to finish formatting + etcd join to complete
-        sleep 20
+        EBS_DEV=$(detect_ebs_dev "$ip")
+        log "EBS device: $EBS_DEV"
 
-        ssh $SSH_OPTS "ec2-user@$ip" <<MOUNT
+        # Load gfs2.ko
+        log "Loading gfs2.ko..."
+        $SSH_CMD "ec2-user@$ip" "
 set -e
-EBS_DEV=\$(lsblk -o NAME,SERIAL | grep vol${VOL_ID#vol-} | awk '{print "/dev/"\$1}' | head -1)
-[[ -z "\$EBS_DEV" ]] && { for dev in /dev/nvme1n1 /dev/sdf /dev/xvdf; do [[ -b \$dev ]] && EBS_DEV=\$dev && break; done; }
+if [[ -f /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko ]]; then
+    sudo depmod -a 2>/dev/null || true
+    sudo modprobe gfs2
+    echo 'gfs2.ko loaded'
+else
+    echo 'WARNING: gfs2.ko not found'
+fi
+"
 
+        # Restart agent
+        log "Restarting cluster-agent..."
+        $SSH_CMD "ec2-user@$ip" "sudo systemctl restart cluster-agent"
+        if ! wait_for_active "$ip" "cluster-agent" 12 5; then
+            log "WARNING: cluster-agent did not become active on $ip"
+        fi
+
+        # Wait for agent to register with kernel netlink socket
+        log "Waiting for agent to register netlink socket..."
+        for attempt in $(seq 1 20); do
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+                log "cluster-agent reconnected (netlink registered)"
+                break
+            fi
+            if [[ $attempt -eq 20 ]]; then
+                log "ERROR: agent did not register netlink socket after 20s"
+                exit 1
+            fi
+            sleep 1
+        done
+
+        # Mount
+        if ! is_gfs2_mounted "$ip"; then
+            log "Mounting GFS2..."
+            $SSH_CMD "ec2-user@$ip" "
+set -e
+EBS_DEV=\"${EBS_DEV}\"
 sudo mkdir -p /mnt/shared
-sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs,noatime \
-    "\$EBS_DEV" /mnt/shared
-echo "GFS2 mounted at /mnt/shared"
+sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs,noatime \\
+    \"\$EBS_DEV\" /mnt/shared
+echo 'GFS2 mounted'
 df -h /mnt/shared
-MOUNT
+"
+        else
+            log "GFS2 already mounted"
+        fi
     fi
 
     log "$node_name setup complete."
