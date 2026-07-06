@@ -132,6 +132,16 @@ func firstHolderInfo(raw []byte) (string, string) {
 	return h[0].Mode, h[0].Node
 }
 
+// isHolder returns true if nodeID appears in the holders array.
+func isHolder(raw []byte, nodeID string) bool {
+	for _, h := range parseHolders(raw) {
+		if h.Node == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- lock operations ----
 
 // AcquireLock acquires a lock using a single-key holder-array model.
@@ -208,6 +218,16 @@ func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber ui
 		return false, 0, hm, hn, nil
 	}
 	return true, txnResp.Header.Revision, "", "", nil
+}
+
+// AmIHolder checks if nodeID is among the current holders of this lock.
+func (c *Client) AmIHolder(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) bool {
+	key := lockKey(lockType, lockNumber)
+	getResp, err := c.cli.Get(ctx, key)
+	if err != nil || len(getResp.Kvs) == 0 {
+		return false
+	}
+	return isHolder(getResp.Kvs[0].Value, nodeID)
 }
 
 // ReleaseLock removes this node's entry from the holders array.

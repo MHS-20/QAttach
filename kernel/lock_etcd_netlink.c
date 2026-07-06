@@ -37,7 +37,7 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 		grant->request_id, grant->granted_mode,
 		grant->etcd_revision);
 	letcd_revision_set(gl, grant->etcd_revision);
-	gfs2_glock_complete(gl, gl->gl_req);
+	gfs2_glock_complete(gl, grant->granted_mode);
 }
 
 static void dispatch_lock_deny(struct letcd_lock_deny *deny)

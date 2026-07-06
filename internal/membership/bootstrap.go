@@ -77,6 +77,9 @@ func (m *Manager) Bootstrap(ctx context.Context) error {
 	// just start etcd (restart after crash/reboot).
 	if m.hasExistingData() {
 		log.Printf("membership: found existing etcd data, restarting")
+		if err := m.writeEtcdConfig("existing", m.cfg.InitialCluster); err != nil {
+			return fmt.Errorf("write etcd config (restart): %w", err)
+		}
 		if err := m.StartEtcd(); err != nil {
 			return fmt.Errorf("start etcd (restart): %w", err)
 		}

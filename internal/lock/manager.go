@@ -101,7 +101,8 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		if granted {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
-		} else if holderNodeID == m.nodeID {
+		} else if holderNodeID == m.nodeID ||
+			m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
 			log.Printf("lock self-contention: type=%d num=%d holder=%s→%s",
 				req.GlockType, req.GlockNumber, holderMode, mode)
 			m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
@@ -294,7 +295,6 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 		for _, ev := range resp.Events {
 			if ev.Type == 1 || ev.Type == 0 {
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
-				orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 
 				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
@@ -304,9 +304,17 @@ func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
 					return
 				}
 				if granted {
+					orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 					m.sendGrant(req.RequestID, req.RequestedMode, rev)
 					m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
 					return
+				}
+				// If we hold this lock ourselves (e.g. PR from a previous
+				// request), release it so we can re-acquire as EX/CW.
+				if m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
+					log.Printf("watchAndRetry self-contention: type=%d num=%d — releasing and retrying",
+						req.GlockType, req.GlockNumber)
+					m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 				}
 				break
 			}
@@ -347,7 +355,6 @@ func (m *Manager) watchAndRetryYield(ctx context.Context,
 		for _, ev := range resp.Events {
 			if ev.Type == 1 || ev.Type == 0 {
 				mode := protocol.LockModeToEtcd(req.RequestedMode)
-				orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 
 				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 					req.GlockType, req.GlockNumber, m.nodeID, mode)
@@ -357,11 +364,17 @@ func (m *Manager) watchAndRetryYield(ctx context.Context,
 					return
 				}
 				if granted {
+					orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
 					m.sendYieldClear(req.GlockType, req.GlockNumber)
 					m.sendGrant(req.RequestID, req.RequestedMode, rev)
 					m.trackHeldLock(req.GlockType, req.GlockNumber,
 						mode, orderKey)
 					return
+				}
+				if m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
+					log.Printf("watchAndRetryYield self-contention: type=%d num=%d — releasing and retrying",
+						req.GlockType, req.GlockNumber)
+					m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 				}
 				break
 			}

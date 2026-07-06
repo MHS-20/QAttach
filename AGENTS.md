@@ -81,6 +81,23 @@ The custom kernel (6.18.35, NVMe built-in, lock_etcd in gfs2.ko) must be deploye
 | `docs/` | Architecture, epoch mechanism, known limitations |
 | `docs/operational/general_plan.md` | 842-line design doc covering all architectural decisions |
 
+## Known bugs (blocking e2e)
+
+### CRITICAL: Lock mode constants inverted
+GFS2 kernel `LM_ST_SHARED=1`, `LM_ST_EXCLUSIVE=3`. But `pkg/protocol/glock.go` defines `LockModeExclusive=1`, `LockModeShared=3` — **swapped**. The kernel's `letcd_lock` sends `req_state` directly from GFS2 (`req.requested_mode = req_state`), so the agent receives GFS2 standard values. But `LockModeToEtcd(1)` returns `"EX"` (should be `"PR"`), and `LockModeToEtcd(3)` returns `"PR"` (should be `"EX"`). Result: all SH locks are stored as exclusive in etcd, all EX locks as shared. Quotad SH polling works only because it's single-node; cross-node access would immediately break. Same bug in `kernel/letcd_netlink.h` defines (`LETCD_LM_ST_EXCLUSIVE=1`, `LETCD_LM_ST_SHARED=3`).
+
+**Fix**: Swap constants in `glock.go` and `letcd_netlink.h` to match GFS2: `SH=1, EX=3, DF=2`.
+
+### CRITICAL: Ordered list never cleaned on unmount
+`letcd_ordered_list` in `lock_etcd_lock.c` is a static global list. When mount fails mid-way (e.g. agent returns WAIT for journal RG demote), the ordered entry stays in the list with `completed=false`. Since the list is static, it persists across mount/unmount cycles. Every subsequent `ord=` completion prints `ORD-NEXT ord=0x020000000000c395` but the stuck entry never clears. This blocks any new lock request whose order key is higher than the orphaned entry's.
+
+**Fix**: Add `letcd_ordered_cleanup()` called from `lock_etcd_unmount()` to drain and wake all waiters, and `list_del_init` all entries.
+
+### BUG: Agent starts before gfs2 module after reboot
+After reboot, systemd starts cluster-agent before gfs2 module is loaded. Agent logs: `"netlink server unavailable (kernel module not loaded?): netlink socket: protocol not supported"`. Mount then fails with `"Transport endpoint is not connected"`. Restarting agent after `modprobe gfs2` fixes it.
+
+**Fix**: Add `ExecStartPre=/sbin/modprobe gfs2` to `cluster-agent.service`, or ensure `setup-compute.sh` adds a systemd dependency.
+
 ## Additional docs
 
 - `docs/epoch-mechanism.md` — cluster epoch for fencing rejection

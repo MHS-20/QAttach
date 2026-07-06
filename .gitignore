@@ -1,6 +1,8 @@
 *.csv
 *.out
 *.tar.gz
+dlm/
+gfs2/
 bin/
 certs/
 bin/cluster-agent
