@@ -21,29 +21,11 @@ void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
 		return;
 	e->request_id = request_id;
 	e->gl = gl;
-	INIT_LIST_HEAD(&e->ordered.list);
-	e->ordered.completed = false;
-	letcd_ordered_enqueue(&e->ordered, glock_type, glock_number);
 	spin_lock_bh(&letcd_pending_lock);
 	hash_add(letcd_pending_table, &e->node, request_id);
 	spin_unlock_bh(&letcd_pending_lock);
 }
 EXPORT_SYMBOL(letcd_pending_insert);
-
-struct letcd_pending_entry *letcd_pending_lookup(u64 request_id)
-{
-	struct letcd_pending_entry *e;
-	spin_lock_bh(&letcd_pending_lock);
-	hash_for_each_possible(letcd_pending_table, e, node, request_id) {
-		if (e->request_id == request_id) {
-			spin_unlock_bh(&letcd_pending_lock);
-			return e;
-		}
-	}
-	spin_unlock_bh(&letcd_pending_lock);
-	return NULL;
-}
-EXPORT_SYMBOL(letcd_pending_lookup);
 
 struct gfs2_glock *letcd_pending_remove(u64 request_id)
 {
@@ -56,7 +38,6 @@ struct gfs2_glock *letcd_pending_remove(u64 request_id)
 			gl = e->gl;
 			hash_del(&e->node);
 			spin_unlock_bh(&letcd_pending_lock);
-			letcd_ordered_complete(&e->ordered);
 			kfree(e);
 			return gl;
 		}

@@ -80,6 +80,7 @@ void letcd_unmount(struct gfs2_sbd *sdp)
 {
 	char dummy[4] = {0};
 	pr_info("unmount\n");
+	letcd_yield_cleanup();
 	letcd_nl_send_msg(LETCD_MSG_UNMOUNT, dummy, sizeof(dummy));
 }
 

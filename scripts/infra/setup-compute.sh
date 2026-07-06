@@ -145,13 +145,13 @@ for i in "${!COMPUTE_IPS[@]}"; do
     log "Installing packages..."
     ssh $SSH_OPTS "ec2-user@$ip" <<PACKAGES
 set -e
+# kernel-devel may not be available for custom kernels — non-fatal if missing.
 sudo dnf install -y \
-    kernel-devel-\$(uname -r) \
-    kernel-headers \
     gcc make flex bison openssl-devel elfutils-libelf-devel \
     git rsync 2>&1 | tail -5
+sudo dnf install -y kernel-headers 2>&1 | tail -3 || true
 
-# gfs2-utils is not in AL2023 repos — install from AlmaLinux 9 RPM.
+# gfs2-utils from custom kernel archive (skip if already present)
 if [[ ! -f /usr/sbin/mkfs.gfs2 ]]; then
     GFS2_RPM="gfs2-utils-3.5.1-3.el9.x86_64.rpm"
     GFS2_URL="https://repo.almalinux.org/almalinux/9/ResilientStorage/x86_64/os/Packages/\${GFS2_RPM}"
@@ -228,22 +228,25 @@ sudo chmod 600 /etc/cluster-agent/*.key
 AGENTCERTS
 
     # --- Build and load kernel module ---
-    log "Building lock_etcd kernel module..."
-    ssh $SSH_OPTS "ec2-user@$ip" <<KMOD
-set -e
-echo "Kernel: \$(uname -r)"
-echo "Headers: \$(ls /lib/modules/\$(uname -r)/build/include/linux/version.h 2>/dev/null && echo OK || echo MISSING)"
-KMOD
+    # For custom kernel (lock_etcd in-tree gfs2.ko): just modprobe gfs2.
+    # For stock kernel: build standalone lock_etcd.ko, then insmod.
+    if ssh $SSH_OPTS "ec2-user@$ip" "cat /proc/net/netlink 2>/dev/null | grep -qP '^31\b'" 2>/dev/null; then
+        log "lock_etcd already registered (gfs2.ko loaded)"
+    elif ssh $SSH_OPTS "ec2-user@$ip" "lsmod | grep -q gfs2" 2>/dev/null; then
+        log "gfs2.ko loaded (lock_etcd will register when agent connects)"
+    elif ls /lib/modules/$(ssh $SSH_OPTS "ec2-user@$ip" "uname -r" 2>/dev/null)/kernel/fs/gfs2/gfs2.ko 2>/dev/null; then
+        log "Loading gfs2.ko (in-tree lock_etcd)..."
+        ssh $SSH_OPTS "ec2-user@$ip" "sudo depmod -a 2>/dev/null; sudo modprobe gfs2" 2>&1 | tail -1
+    else
+        log "Building lock_etcd standalone kernel module..."
+        log "Syncing kernel source..."
+        cp "$PROJECT_ROOT/pkg/protocol/letcd_netlink.h" "$PROJECT_ROOT/kernel/letcd_netlink.h"
+        rsync -avz -e "ssh $SSH_OPTS" \
+            --exclude='*.o' --exclude='*.ko' --exclude='*.mod*' \
+            --exclude='.git' \
+            "$PROJECT_ROOT/kernel/" "ec2-user@$ip:/tmp/lock_etcd_kernel/"
 
-    log "Syncing kernel source..."
-    # Copy the shared header into kernel dir for the build.
-    cp "$PROJECT_ROOT/pkg/protocol/letcd_netlink.h" "$PROJECT_ROOT/kernel/letcd_netlink.h"
-    rsync -avz -e "ssh $SSH_OPTS" \
-        --exclude='*.o' --exclude='*.ko' --exclude='*.mod*' \
-        --exclude='.git' \
-        "$PROJECT_ROOT/kernel/" "ec2-user@$ip:/tmp/lock_etcd_kernel/"
-
-    ssh $SSH_OPTS "ec2-user@$ip" <<'BUILD_MOD'
+        ssh $SSH_OPTS "ec2-user@$ip" <<'BUILD_MOD'
 set -e
 cd /tmp/lock_etcd_kernel
 
@@ -251,27 +254,29 @@ cd /tmp/lock_etcd_kernel
 if [[ ! -f glock.h ]] || [[ ! -f incore.h ]]; then
     KVER=$(uname -r)
     if [[ ! -f "/tmp/kernel-${KVER}.src.rpm" ]]; then
-        sudo dnf download --source kernel --downloaddir /tmp/ 2>&1 | tail -2
+        sudo dnf download --source kernel --downloaddir /tmp/ 2>&1 | tail -2 || true
     fi
-    cd /tmp
-    rpm2cpio "kernel-${KVER}.src.rpm" | cpio -idmv "linux-6.1.175.tar.xz" 2>&1 | tail -1
-    tar xf linux-6.1.175.tar.xz --wildcards "linux-6.1.175/fs/gfs2/*.h" 2>&1 | tail -3
-    cp linux-6.1.175/fs/gfs2/*.h /tmp/lock_etcd_kernel/
-    echo "GFS2 headers ready"
-    cd /tmp/lock_etcd_kernel
+    if [[ -f "/tmp/kernel-${KVER}.src.rpm" ]]; then
+        cd /tmp
+        rpm2cpio "kernel-${KVER}.src.rpm" | cpio -idmv "linux-*.tar.xz" 2>&1 | tail -1
+        ls /tmp/linux-*.tar.xz 2>/dev/null | head -1 | xargs -r tar xf --wildcards "*/fs/gfs2/*.h" 2>&1 | tail -3
+        cp linux-*/fs/gfs2/*.h /tmp/lock_etcd_kernel/ 2>/dev/null || true
+        echo "GFS2 headers ready"
+        cd /tmp/lock_etcd_kernel
+    fi
 fi
 
-make -C /lib/modules/$(uname -r)/build M=$(pwd) modules 2>&1 | tail -5
-if [[ -f lock_etcd.ko ]]; then
-    echo "Module built: $(ls -lh lock_etcd.ko)"
-else
-    echo "ERROR: module build failed"
-    exit 1
+if [[ -f /lib/modules/$(uname -r)/build/include/linux/version.h ]]; then
+    make -C /lib/modules/$(uname -r)/build M=$(pwd) modules 2>&1 | tail -5
+    if [[ -f lock_etcd.ko ]]; then
+        echo "Module built: $(ls -lh lock_etcd.ko)"
+        sudo insmod lock_etcd.ko 2>&1 || true
+    fi
 fi
-sudo insmod lock_etcd.ko
-lsmod | grep lock_etcd || echo "WARNING: module not in lsmod"
+lsmod | grep lock_etcd || echo "Note: lock_etcd not loaded as standalone module"
 cat /proc/net/netlink | grep -P '^31\b' && echo "Netlink family 31 registered" || true
 BUILD_MOD
+    fi
 
     # --- Push and start cluster-agent ---
     log "Installing cluster-agent..."
@@ -351,8 +356,8 @@ fi
 
 echo "EBS device: \$EBS_DEV"
 
-# Format with lock_etcd protocol
-sudo mkfs.gfs2 -p lock_etcd -t ${CLUSTER}:sharedfs -j ${COMPUTE_COUNT} "\$EBS_DEV"
+# mkfs.gfs2 doesn't know lock_etcd; format with lock_dlm, mount with lockproto=lock_etcd.
+yes | sudo mkfs.gfs2 -p lock_dlm -t ${CLUSTER}:sharedfs -j ${COMPUTE_COUNT} "\$EBS_DEV"
 echo "GFS2 formatted on \$EBS_DEV"
 
 # Mount
