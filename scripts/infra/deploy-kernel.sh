@@ -25,8 +25,23 @@ if [[ $# -eq 0 ]]; then
 fi
 
 IPS=("$@")
-S3_URL="${S3_BUCKET}/kernel-6.18.35-custom.tar.gz"
-KERNEL_FILE="kernel-6.18.35-custom.tar.gz"
+
+# Auto-discover latest custom kernel tarball
+if [[ -z "$LOCAL_TARBALL" ]]; then
+    log "Discovering latest kernel from S3..."
+    KERNEL_FILE=$(aws s3 ls "${S3_BUCKET}/" --region "${REGION}" 2>/dev/null \
+        | grep 'kernel-.*-custom.tar.gz' \
+        | sort -r | head -1 | awk '{print $NF}')
+    if [[ -z "$KERNEL_FILE" ]]; then
+        die "No custom kernel tarball found in ${S3_BUCKET}. Run scripts/kernel/launch.sh first."
+    fi
+    log "  Found: ${KERNEL_FILE}"
+else
+    KERNEL_FILE=$(basename "$LOCAL_TARBALL")
+fi
+
+S3_URL="${S3_BUCKET}/${KERNEL_FILE}"
+S3_HTTP_URL="https://$(echo "${S3_BUCKET#s3://}" | sed 's|/.*||').s3.${REGION}.amazonaws.com/${KERNEL_FILE}"
 SSH_CMD="ssh $SSH_OPTS"
 
 log "=== Deploying custom kernel ==="
@@ -40,13 +55,29 @@ for ip in "${IPS[@]}"; do
     if [[ -n "$LOCAL_TARBALL" ]]; then
         log "Uploading tarball to $ip..."
         scp $SSH_OPTS "$LOCAL_TARBALL" "ec2-user@${ip}:/tmp/${KERNEL_FILE}"
+        # Verify upload with local checksum
+        LOCAL_SHA=$(sha256sum "$LOCAL_TARBALL" | awk '{print $1}')
+        REMOTE_SHA=$($SSH_CMD "ec2-user@${ip}" "sha256sum /tmp/${KERNEL_FILE}" 2>/dev/null | awk '{print $1}')
+        if [[ "$LOCAL_SHA" != "$REMOTE_SHA" ]]; then
+            die "Checksum mismatch on $ip (local=$LOCAL_SHA remote=$REMOTE_SHA)"
+        fi
+        log "  upload verified (sha256 ok)"
     else
         log "Downloading kernel from S3 on $ip..."
         $SSH_CMD "ec2-user@${ip}" "
 set -e
 cd /tmp
-aws s3 cp '${S3_URL}' /tmp/${KERNEL_FILE} 2>/dev/null || \
-  curl -sLo '${KERNEL_FILE}' 'https://muhamad-tirocinio-bucket-861507897222-eu-west-1-an.s3.eu-west-1.amazonaws.com/${KERNEL_FILE}'
+# Compute nodes have no IAM role, so aws s3 cp will fail.
+# The tarball must be uploaded via --local-tarball instead.
+if ! aws s3 cp '${S3_URL}' /tmp/${KERNEL_FILE} 2>/dev/null; then
+    if ! curl -sIf '${S3_HTTP_URL}' >/dev/null 2>&1; then
+        echo 'ERROR: S3 bucket is not publicly accessible.'
+        echo 'Use --local-tarball to deploy from a local file:'
+        echo '  ./deploy-kernel.sh --local-tarball /tmp/kernel-...-custom.tar.gz <ips>'
+        exit 1
+    fi
+    curl -sLo '${KERNEL_FILE}' '${S3_HTTP_URL}'
+fi
 ls -lh /tmp/${KERNEL_FILE}
 " || { log "ERROR: failed to download kernel on $ip"; exit 1; }
     fi
@@ -65,33 +96,37 @@ sudo tar xzf /tmp/${KERNEL_FILE} -C /
 rm -f /tmp/${KERNEL_FILE}
 
 echo 'Verifying extracted files...'
-ls -la /boot/vmlinuz-*custom* 2>/dev/null || { echo 'ERROR: no custom vmlinuz'; exit 1; }
-
-# Find the custom kernel vmlinuz (has -custom suffix)
 CUSTOM_VMLINUZ=\$(ls /boot/vmlinuz-*-custom 2>/dev/null | head -1)
 if [[ -z \"\$CUSTOM_VMLINUZ\" ]]; then
     echo 'ERROR: no custom vmlinuz found'
     exit 1
 fi
-echo \"Custom vmlinuz: \$CUSTOM_VMLINUZ\"
 
-# Find matching initramfs
+# Verify kernel DOS magic (MZ)
+VMLINUZ_MAGIC=\$(hexdump -n 2 -e '2/1 \"%c\"' \"\$CUSTOM_VMLINUZ\" 2>/dev/null)
+if [[ \"\$VMLINUZ_MAGIC\" != 'MZ' ]]; then
+    echo \"ERROR: vmlinuz magic is '\$VMLINUZ_MAGIC' (expected 'MZ') — file is corrupt\"
+    ls -la \"\$CUSTOM_VMLINUZ\"
+    exit 1
+fi
+echo \"Custom vmlinuz: \$CUSTOM_VMLINUZ (\$(du -h \"\$CUSTOM_VMLINUZ\" | cut -f1)) magic OK\"
+
 CUSTOM_INITRD=\$(ls /boot/initramfs-*-custom.img 2>/dev/null | head -1)
-echo \"Custom initrd: \$CUSTOM_INITRD\"
-
-# Find the modules directory (custom kernel modules from the tarball)
-KVER=\$(ls -d /lib/modules/*/ 2>/dev/null | head -1 | xargs basename)
-echo \"Kernel modules: \$KVER\"
+if [[ -z \"\$CUSTOM_INITRD\" ]]; then
+    echo 'ERROR: no custom initrd found'
+    exit 1
+fi
+echo \"Custom initrd: \$CUSTOM_INITRD (\$(du -h \"\$CUSTOM_INITRD\" | cut -f1))\"
 
 # Set default kernel with grubby
 sudo grubby --info=\"\$CUSTOM_VMLINUZ\" >/dev/null 2>&1 || \
-    sudo grubby --add-kernel=\"\$CUSTOM_VMLINUZ\" --initrd=\"\$CUSTOM_INITRD\" --title=\"Custom \$KVER (lock_etcd)\" --copy-default
+    sudo grubby --add-kernel=\"\$CUSTOM_VMLINUZ\" --initrd=\"\$CUSTOM_INITRD\" --title='Custom lock_etcd kernel' --copy-default
 sudo grubby --set-default=\"\$CUSTOM_VMLINUZ\"
-echo \"Default kernel set: \$CUSTOM_VMLINUZ\"
+echo 'Default kernel set'
 
 echo 'Rebooting...'
 sudo reboot
-" 2>/dev/null || true
+" 2>/dev/null || true   # reboot kills SSH — exit code is meaningless
 done
 
 # ---- Wait for all nodes to reboot and come back ----
