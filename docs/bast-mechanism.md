@@ -42,12 +42,14 @@ Without step 1, node A never knows to release, and node B waits forever.
 ## BAST Request Keys
 
 Path: `/locks/bast/{type}/{number}`
-Value: target mode (integer: 0=UNLOCK, 1=EX, 2=DF, 3=SH)
+Value: `"targetMode,waiterID"` (comma-separated string, e.g. `"0,i-0f620a6db190e05ce"`)
 
-The waiter writes this key.  The holder watches it.  The holder deletes it after
-processing (typically in `releaseHeldLock` when the lock is actually released).
+The waiter writes this key via `RequestBast()`.  The holder watches it via
+`WatchLockBast()`.  The key has a short lease (15s) so stale BAST requests
+auto-expire if the waiter crashes.
 
-The waiter uses a short lease (15s) so stale bast requests auto-expire.
+The target mode is currently always 0 (UNLOCK), matching DLM's behavior for
+EX lock requests — the holder must release entirely.
 
 ## The Livelock Problem
 
@@ -114,13 +116,13 @@ immediately — no need to wait for self-contention.
 ### 2. Persistent yield flag in the kernel
 
 When the agent detects a BAST, it sends:
-- `BAST(UNLOCK)` to the kernel → triggers `gfs2_glock_cb` to demote the lock
-- `LOCK_YIELD` to the kernel → sets a persistent yield flag for this lock
-- `ReleaseLock` to etcd → removes the holder from the etcd array
+- `BAST(UNLOCK)` to the kernel → triggers `gfs2_glock_cb` to delock the lock
+- `LOCK_YIELD` to the kernel → sets yield flag for this lock
+- Then waits for the kernel to process the BAST (via `<-ctx.Done()`)
 
-The kernel's `letcd_lock()` checks the yield flag on every reacquire attempt
-and suppresses it. The flag is **not** auto-cleared — it persists until the
-agent sends `YIELD_CLEAR`.
+The kernel's `letcd_lock()` checks the yield flag on reacquire attempts when
+`gl_state == LM_ST_UNLOCKED` — conversions (EX→SH) pass through. The flag is
+not auto-cleared — it persists until the agent sends `YIELD_CLEAR`.
 
 ### 3. Handoff completion watch
 
@@ -135,7 +137,9 @@ Holder agent (node A):                   Waiter agent (node B):
   bast watch fires                         send LOCK_WAIT to kernel
   → sendBast(UNLOCK) to kernel             watch lock key
   → sendLockYield to kernel
-  → releaseLock from etcd
+  → wait for ctx.Done() (kernel processes BAST)
+                                           ctx cancelled by releaseHeldLock
+  lock key released via self-contention    (from self-contention or release)
   → watch lock key for handoff complete
                                            lock key changes → retry → succeeds
                                            does I/O → releases

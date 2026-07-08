@@ -105,9 +105,9 @@ GFS2 mount(2)
 ```
 GFS2 needs glock
   → letcd_lock(gl, mode)
-    → yield check: if yielded → suppress, complete(gl, 0), return
-    → pending_insert + ordered_enqueue (global sort by type≪56 | number)
-    → ordered_drain (wait until head of list — prevents AB/BA deadlock)
+    → yield check: if yielded AND gl_state == LM_ST_UNLOCKED →
+      suppress reacquire, complete(gl, 0), return
+      (conversions EX→SH pass through normally)
     → letcd_nl_send_msg(LETCD_MSG_LOCK_REQ, ...)
     → returns 0 (async — completion callback later)
     → [agent processes: etcd CAS → grant/deny/wait]
@@ -135,15 +135,16 @@ Node B agent: lock CAS fails → lock contended
 
 Node A agent: bast watch fires on /locks/bast/... (watchBastAndYield goroutine)
   → sends BAST(UNLOCK) to kernel → gfs2_glock_cb demotes lock
-  → sends LOCK_YIELD to kernel → sets persistent yield flag
-  → releases lock from etcd
+  → sends LOCK_YIELD to kernel → sets yield flag (persists until YIELD_CLEAR)
+  → waits for ctx.Done() — kernel processes BAST and release/convert
+  → ctx cancelled by releaseHeldLock (from self-contention handler or HandleLockRelease)
   → watches lock key for handoff completion (delete = waiter done)
   → on completion: sends YIELD_CLEAR to kernel
 ```
 
-The yield flag is persistent — not auto-cleared on reacquire attempts.
-The kernel suppresses all lock reacquisitions until the agent explicitly
-clears it after the waiter finishes I/O.
+The yield flag is conditional — conversions (EX→SH, SH→UN) pass through normally.
+Reacquisitions (gl_state == LM_ST_UNLOCKED) are suppressed until the agent sends
+YIELD_CLEAR after the waiter finishes I/O.
 
 ### Epoch Validation
 
@@ -197,10 +198,9 @@ cluster auto-removes the dead member via etcd's built-in failure detection.
   prevent stale lock usage after a crash.
 - **Cluster epoch** — incremented on fence, validated on mount and every lock grant.
   A fenced node with a stale epoch is rejected before any lock I/O.
-- **Kernel ordered queue** — `letcd_ordered_drain` serialises lock acquisition per-node
-  by `(type ≪ 56 | number)` to prevent AB/BA deadlocks.
-- **Persistent yield flag** — agent sends LOCK_YIELD to kernel, which suppresses all
-  reacquire attempts until YIELD_CLEAR. Not auto-cleared.
+- **Conditional yield flag** — agent sends LOCK_YIELD to kernel; kernel suppresses
+  reacquire attempts only when the glock is in UNLOCKED state (conversions pass through).
+  Cleared by YIELD_CLEAR after handoff completes. Not auto-cleared.
 - **BAST watch per held lock** — `trackHeldLock` spawns a goroutine that watches
   `/locks/bast/{type}/{num}` and triggers yield on contention.
 - **etcd colocated** — etcd runs on compute nodes, managed by the agent's membership

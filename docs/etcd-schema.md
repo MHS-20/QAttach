@@ -52,17 +52,17 @@ locks/
 
   bast/{type}/{number}
     Purpose:  BAST request signal from waiter to holder
-    Value:    target mode (integer: 1=EX, 2=DF, 3=SH, 0=UNLOCK)
+    Value:    "targetMode,waiterID" (e.g. "0,i-0f620a6db190e05ce")
     Lease:    Short lease (15s)
     Writers:  Agent that failed to CAS (waiter)
     Readers:  Holder's agent (WatchLockBast)
 
   glock/{type}/{number}/next
-    Purpose:  Atomic handoff reservation
+    Purpose:  Atomic handoff reservation (experimental — currently unused)
     Value:    waiter node_id
-    Lease:    Very short (5s) — prevents permanent reservation
-    Writers:  Holder (in release transaction)
-    Readers:  Waiter (watch for priority)
+    Lease:    Very short (5s)
+    Writers:  Holder (via HandoffRelease)
+    Readers:  Waiter (CheckHandoff)
 ```
 
 ## Lock Mode Semantics

@@ -45,8 +45,8 @@ manager:
 
 The etcd mode names differ from GFS2 names for historical DLM reasons:
 - EX → "EX" in etcd (one holder, CAS on a single key)
-- SH → "PR" in etcd (protected read; uses per-holder sub-keys so multiple
-  nodes can hold simultaneously)
+- SH → "PR" in etcd (protected read; multiple nodes can hold simultaneously
+  via a JSON holder array in the same key)
 - DF → "CW" in etcd (concurrent write)
 
 ## Lock Compatibility Matrix

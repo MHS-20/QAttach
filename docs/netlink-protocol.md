@@ -75,7 +75,7 @@ Response to MOUNT_REQ with the assigned journal ID.
 Payload: struct letcd_mount_resp {
     u64  request_id
     s32  jid          // negative on error
-    u8   pad[4]       // C struct padding — must match exactly
+    s64  epoch        // cluster epoch at mount time
 }
 ```
 
@@ -91,10 +91,13 @@ Payload: struct letcd_lock_req {
     u64  glock_number
     u32  glock_type
     u32  requested_mode  // 0=UNLOCK, 1=EX, 2=DF, 3=SH
+    s64  node_epoch      // kernel's last-known cluster epoch
 }
 ```
 
 Mode 0 (UNLOCK) means release the lock.  All other modes are acquire requests.
+`node_epoch` is validated by the agent against the current cluster epoch to
+detect fenced nodes.
 
 ### LOCK_GRANT (2) — agent → kernel
 
@@ -188,8 +191,9 @@ Payload: 4 zero bytes
 
 ### LOCK_YIELD (12) — agent → kernel
 
-Sets a persistent yield flag for a specific lock. The kernel suppresses all
-reacquire attempts until YIELD_CLEAR arrives. Used during BAST handoff.
+Sets a yield flag for a specific lock. The kernel suppresses reacquire attempts
+(gl_state == LM_ST_UNLOCKED) until YIELD_CLEAR arrives. Conversions (EX→SH)
+pass through normally. Used during BAST handoff.
 
 ```
 Payload: struct letcd_lock_yield {
@@ -199,8 +203,8 @@ Payload: struct letcd_lock_yield {
 ```
 
 The yield flag is tested in `letcd_lock()` before every lock request.
-If set, the request is suppressed with `gfs2_glock_complete(gl, 0)`.
-The flag is NOT auto-cleared.
+If set and the glock is in UNLOCKED state, the request is suppressed with
+`gfs2_glock_complete(gl, 0)`. The flag is NOT auto-cleared.
 
 ### YIELD_CLEAR (13) — agent → kernel
 
