@@ -73,10 +73,13 @@ log "=== Test 3: Concurrent file write ==="
 
 TESTFILE="/mnt/shared/.e2e_test_$$"
 
-$SSH_CMD "ec2-user@$IP0" "sudo tee $TESTFILE <<< \"node0-\$(date +%s)\" > /dev/null" 2>/dev/null
+$SSH_CMD "ec2-user@$IP0" "sudo bash -c 'echo \"node0-\$(date +%s)\" > $TESTFILE'" 2>/dev/null &
+PID0=$!
 sync
 sleep 1
-$SSH_CMD "ec2-user@$IP1" "sudo tee $TESTFILE <<< \"node1-\$(date +%s)\" > /dev/null" 2>/dev/null
+$SSH_CMD "ec2-user@$IP1" "sudo bash -c 'echo \"node1-\$(date +%s)\" > $TESTFILE'" 2>/dev/null &
+PID1=$!
+wait $PID0 $PID1 2>/dev/null
 sync
 sleep 1
 CONTENT0=$($SSH_CMD "ec2-user@$IP0" "sudo cat $TESTFILE" 2>/dev/null || echo "MISSING")
