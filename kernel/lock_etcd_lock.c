@@ -41,11 +41,13 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		req.glock_type, req.glock_number,
 		req.requested_mode, req.request_id);
 
-	/* Yield check: if this lock was yielded (by agent BAST watch),
-	 * suppress reacquire.  The flag persists until the agent sends
-	 * YIELD_CLEAR after the waiter finishes I/O. */
-	if (letcd_yield_test(req.glock_type, req.glock_number)) {
-		pr_info("  YIELD-SUPPRESS t=%u n=%llu\n",
+	/* Yield check: suppress re-acquisitions (glock is UNLOCKED) so the
+	 * agent can hand off the lock to a waiter.  Conversions (EX→SH etc.)
+	 * are NOT suppressed — they must reach the agent so it knows the
+	 * kernel is giving up the lock. */
+	if (letcd_yield_test(req.glock_type, req.glock_number) &&
+	    gl->gl_state == LM_ST_UNLOCKED) {
+		pr_info("  YIELD-SUPPRESS t=%u n=%llu (glst=UN)\n",
 			req.glock_type, req.glock_number);
 		gfs2_glock_complete(gl, 0);
 		return 0;

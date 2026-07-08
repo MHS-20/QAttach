@@ -5,6 +5,7 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 
@@ -113,10 +114,9 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			if hasWaiter && waiterID != "" && waiterID != m.nodeID {
 				log.Printf("self-contention yielding: type=%d num=%d waiter=%s",
 					req.GlockType, req.GlockNumber, waiterID)
-				// Tell kernel to suppress reacquire.
-				m.sendLockYield(req.GlockType, req.GlockNumber)
 				m.etcdCli.DeleteBastRequest(ctx,
 					req.GlockType, req.GlockNumber)
+				m.sendLockYield(req.GlockType, req.GlockNumber)
 				m.sendWait(req.RequestID)
 				go m.watchAndRetryYield(ctx, req)
 				return
@@ -128,13 +128,13 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 				m.sendDeny(req.RequestID, protocol.DenyReasonError)
 				return
 			}
-			if g2 {
-				m.sendGrant(req.RequestID, req.RequestedMode, r2)
-				m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
-			} else {
-				m.sendWait(req.RequestID)
-				go m.watchAndRetry(ctx, req)
-			}
+		if g2 {
+			m.sendGrant(req.RequestID, req.RequestedMode, r2)
+			m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
+		} else {
+			m.sendWait(req.RequestID)
+			go m.watchAndRetry(ctx, req)
+		}
 		} else {
 			// Contended by another node.  Write a handoff token
 			// so the holder yields on its next self-contention.
@@ -171,8 +171,15 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string,
 // The yield flag persists until the waiter completes its I/O cycle
 // or the BAST key expires (waiter crashed).
 func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNumber uint64) {
+	// Pre-check: handle any BAST key that already exists before our
+	// Watch starts.  The etcd Watch only delivers events from "now"
+	// forward, so a BAST key written between lock acquisition and
+	// Watch start is silently missed without this check.
+	hasWaiter, _ := m.etcdCli.HasWaiter(context.Background(), lockType, lockNumber)
+
 	bastCh := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
-	for range bastCh {
+
+	processBast := func() bool {
 		log.Printf("bast received: type=%d num=%d — yielding",
 			lockType, lockNumber)
 
@@ -180,53 +187,91 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 			m.nlSrv.SendBast(protocol.BastNotification{
 				GlockType:   lockType,
 				GlockNumber: lockNumber,
-				TargetMode:  0,
+				TargetMode:  0, // LM_ST_UNLOCKED — release
 			})
 		}
+
 		m.sendLockYield(lockType, lockNumber)
+		m.releaseHeldLock(context.Background(), lockType, lockNumber)
 
-		// Wait for kernel to process BAST and release the glock.
-		// HandleLockRelease -> releaseHeldLock -> hl.cancel() -> ctx.Done().
-		// Do NOT call releaseHeldLock here — that deletes the etcd key
-		// before the kernel has flushed the journal, letting the waiter
-		// read stale metadata.
-		<-ctx.Done()
-
-		// Now watch for handoff with a fresh context (old one was cancelled
-		// by releaseHeldLock).  The lock key was already deleted by
-		// releaseHeldLock; wait for the waiter to complete its I/O by
-		// detecting the next acquire->release cycle.
 		bg := context.Background()
 		lockCh := m.etcdCli.WatchLockKey(bg, lockType, lockNumber)
 		bastCh2 := m.etcdCli.WatchLockBast(bg, lockType, lockNumber)
 
+		handoffAcquired := false
+		holdoff := time.After(5 * time.Second)
+
+		handoffLoop:
 		for {
 			select {
+			case <-holdoff:
+				break handoffLoop
 			case resp, ok := <-lockCh:
 				if !ok {
-					return
+					return false
 				}
 				for _, ev := range resp.Events {
-					if ev.Type == mvccpb.DELETE {
-						log.Printf("yield handoff done: type=%d num=%d",
+					if ev.Type == mvccpb.PUT && !handoffAcquired {
+						log.Printf("yield waiter acquired: type=%d num=%d",
 							lockType, lockNumber)
-						m.sendYieldClear(lockType, lockNumber)
-						return
+						handoffAcquired = true
+					} else if ev.Type == mvccpb.DELETE && handoffAcquired {
+						handoffAcquired = false
+						holdoff = time.After(5 * time.Second)
 					}
 				}
 			case resp, ok := <-bastCh2:
 				if !ok {
-					return
+					return false
 				}
 				for _, ev := range resp.Events {
 					if ev.Type == mvccpb.DELETE {
 						log.Printf("yield bast expired: type=%d num=%d",
 							lockType, lockNumber)
-						m.sendYieldClear(lockType, lockNumber)
-						return
+						break handoffLoop
 					}
 				}
 			}
+		}
+
+		// After holdoff: try to reacquire so this glock becomes
+		// operational again.  If another node still holds it,
+		// write a fresh bast and let the next BAST cycle handle it.
+		mode := protocol.LockModeToEtcd(protocol.LockModeShared)
+		granted, _, _, _, err := m.etcdCli.AcquireLock(bg,
+			lockType, lockNumber, m.nodeID, mode)
+		if err != nil {
+			log.Printf("yield reacquire error: type=%d num=%d: %v",
+				lockType, lockNumber, err)
+		}
+		if granted {
+			log.Printf("yield reacquired: type=%d num=%d",
+				lockType, lockNumber)
+			m.sendYieldClear(lockType, lockNumber)
+			orderKey := lockOrderKey(lockType, lockNumber)
+			m.trackHeldLock(lockType, lockNumber, mode, orderKey)
+		} else {
+			log.Printf("yield reacquire contended: type=%d num=%d",
+				lockType, lockNumber)
+			m.sendYieldClear(lockType, lockNumber)
+		}
+		return true
+	}
+
+	if hasWaiter {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if !processBast() {
+			return
+		}
+	}
+
+	for range bastCh {
+		if !processBast() {
+			return
 		}
 	}
 }
@@ -290,36 +335,51 @@ func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 }
 
 func (m *Manager) watchAndRetry(ctx context.Context, req protocol.LockRequest) {
+	// Pre-check: the etcd key may have been deleted before our Watch
+	// started.  If so, the DELETE event is invisible and we'd wait
+	// forever.  Try acquiring immediately first.
+	if m.retryAcquire(ctx, req) {
+		return
+	}
+
 	watchCh := m.etcdCli.WatchLockKey(ctx, req.GlockType, req.GlockNumber)
 	for resp := range watchCh {
 		for _, ev := range resp.Events {
 			if ev.Type == 1 || ev.Type == 0 {
-				mode := protocol.LockModeToEtcd(req.RequestedMode)
-
-				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
-					req.GlockType, req.GlockNumber, m.nodeID, mode)
-				if err != nil {
-					log.Printf("retry lock acquire error: %v", err)
-					m.sendDeny(req.RequestID, protocol.DenyReasonError)
+				if m.retryAcquire(ctx, req) {
 					return
-				}
-				if granted {
-					orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
-					m.sendGrant(req.RequestID, req.RequestedMode, rev)
-					m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
-					return
-				}
-				// If we hold this lock ourselves (e.g. PR from a previous
-				// request), release it so we can re-acquire as EX/CW.
-				if m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
-					log.Printf("watchAndRetry self-contention: type=%d num=%d — releasing and retrying",
-						req.GlockType, req.GlockNumber)
-					m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 				}
 				break
 			}
 		}
 	}
+}
+
+func (m *Manager) retryAcquire(ctx context.Context, req protocol.LockRequest) bool {
+	mode := protocol.LockModeToEtcd(req.RequestedMode)
+
+	granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
+		req.GlockType, req.GlockNumber, m.nodeID, mode)
+	if err != nil {
+		log.Printf("retry lock acquire error: %v", err)
+		m.sendDeny(req.RequestID, protocol.DenyReasonError)
+		return true
+	}
+	if granted {
+		orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
+		m.sendGrant(req.RequestID, req.RequestedMode, rev)
+		m.trackHeldLock(req.GlockType, req.GlockNumber, mode, orderKey)
+		return true
+	}
+	if m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
+		log.Printf("watchAndRetry self-contention: type=%d num=%d — releasing and retrying",
+			req.GlockType, req.GlockNumber)
+		m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
+	} else {
+		m.etcdCli.RequestBast(ctx,
+			req.GlockType, req.GlockNumber, 0, m.nodeID)
+	}
+	return false
 }
 
 func (m *Manager) sendLockYield(lockType uint32, lockNumber uint64) {
@@ -349,37 +409,52 @@ func (m *Manager) sendYieldClear(lockType uint32, lockNumber uint64) {
 // flag when the lock is finally acquired.
 func (m *Manager) watchAndRetryYield(ctx context.Context,
 	req protocol.LockRequest) {
+	// Pre-check: same TOCTOU race as watchAndRetry.
+	if m.retryAcquireYield(ctx, req) {
+		return
+	}
+
 	watchCh := m.etcdCli.WatchLockKey(ctx,
 		req.GlockType, req.GlockNumber)
 	for resp := range watchCh {
 		for _, ev := range resp.Events {
 			if ev.Type == 1 || ev.Type == 0 {
-				mode := protocol.LockModeToEtcd(req.RequestedMode)
-
-				granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
-					req.GlockType, req.GlockNumber, m.nodeID, mode)
-				if err != nil {
-					log.Printf("retry lock acquire error: %v", err)
-					m.sendDeny(req.RequestID, protocol.DenyReasonError)
+				if m.retryAcquireYield(ctx, req) {
 					return
-				}
-				if granted {
-					orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
-					m.sendYieldClear(req.GlockType, req.GlockNumber)
-					m.sendGrant(req.RequestID, req.RequestedMode, rev)
-					m.trackHeldLock(req.GlockType, req.GlockNumber,
-						mode, orderKey)
-					return
-				}
-				if m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
-					log.Printf("watchAndRetryYield self-contention: type=%d num=%d — releasing and retrying",
-						req.GlockType, req.GlockNumber)
-					m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
 				}
 				break
 			}
 		}
 	}
+}
+
+func (m *Manager) retryAcquireYield(ctx context.Context, req protocol.LockRequest) bool {
+	mode := protocol.LockModeToEtcd(req.RequestedMode)
+
+	granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
+		req.GlockType, req.GlockNumber, m.nodeID, mode)
+	if err != nil {
+		log.Printf("retry lock acquire error: %v", err)
+		m.sendDeny(req.RequestID, protocol.DenyReasonError)
+		return true
+	}
+	if granted {
+		orderKey := lockOrderKey(req.GlockType, req.GlockNumber)
+		m.sendYieldClear(req.GlockType, req.GlockNumber)
+		m.sendGrant(req.RequestID, req.RequestedMode, rev)
+		m.trackHeldLock(req.GlockType, req.GlockNumber,
+			mode, orderKey)
+		return true
+	}
+	if m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
+		log.Printf("watchAndRetryYield self-contention: type=%d num=%d — releasing and retrying",
+			req.GlockType, req.GlockNumber)
+		m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
+	} else {
+		m.etcdCli.RequestBast(ctx,
+			req.GlockType, req.GlockNumber, 0, m.nodeID)
+	}
+	return false
 }
 
 // ---- netlink helpers ----
