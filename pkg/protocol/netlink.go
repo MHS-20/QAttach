@@ -8,19 +8,17 @@ const (
 
 // Message types — kernel↔agent.
 const (
-	MsgLockReq    = 1 // kernel → agent: request glock
-	MsgLockGrant  = 2 // agent → kernel: granted + fencing token
-	MsgLockDeny   = 3 // agent → kernel: denied (contended or stale)
-	MsgLockWait   = 4 // agent → kernel: queued, will notify on release
-	MsgBast       = 5 // agent → kernel: demote callback (blocking AST)
-	MsgLockRel    = 6 // kernel → agent: release glock
-	MsgRecoveryOk = 7 // agent → kernel: node fenced, journal replay safe
-	MsgUnmount    = 8 // kernel → agent: filesystem unmounting
+	MsgLockReq    = 1  // kernel → agent: request glock
+	MsgLockGrant  = 2  // agent → kernel: granted + fencing token
+	MsgLockDeny   = 3  // agent → kernel: denied (contended or stale)
+	MsgLockWait   = 4  // agent → kernel: queued, will notify on release
+	MsgBast       = 5  // agent → kernel: demote callback (blocking AST)
+	MsgLockRel    = 6  // kernel → agent: release glock
+	MsgRecoveryOk = 7  // agent → kernel: node fenced, journal replay safe
+	MsgUnmount    = 8  // kernel → agent: filesystem unmounting
 	MsgMountReq   = 9  // kernel → agent: mount request (needs jid)
 	MsgMountResp  = 10 // agent → kernel: mount response with jid
 	MsgRegister   = 11 // agent → kernel: register PID for unicast replies
-	MsgLockYield  = 12 // agent → kernel: yield lock to waiter
-	MsgYieldClear = 13 // agent → kernel: clear yield flag
 )
 
 // LockRequest sent from kernel to agent requesting a glock.
@@ -87,14 +85,6 @@ type MountResponse struct {
 	JID       int32 // negative on error
 	PadMnt    [4]byte
 	Epoch     int64 // cluster/epoch revision at mount time
-}
-
-// LockYield sent from agent to kernel to prevent lock reacquire.
-// Pad matches C struct letcd_lock_yield trailing padding.
-type LockYield struct {
-	GlockType   uint32
-	GlockNumber uint64
-	Pad         [4]byte
 }
 
 // Deny reasons.

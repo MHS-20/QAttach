@@ -124,6 +124,12 @@ sudo grubby --info=\"\$CUSTOM_VMLINUZ\" >/dev/null 2>&1 || \
 sudo grubby --set-default=\"\$CUSTOM_VMLINUZ\"
 echo 'Default kernel set'
 
+# Prevent stale etcd from auto-starting after reboot with old certs/config.
+sudo systemctl stop etcd 2>/dev/null || true
+sudo systemctl disable etcd 2>/dev/null || true
+sudo rm -rf /var/lib/etcd /etc/systemd/system/etcd.service.d
+echo 'Stale etcd cleaned'
+
 echo 'Rebooting...'
 sudo reboot
 " 2>/dev/null || true   # reboot kills SSH — exit code is meaningless
@@ -149,5 +155,11 @@ for ip in "${IPS[@]}"; do
         sleep 5
     done
 done
+
+# After all nodes are up, run depmod on custom kernel so modprobe works
+for ip in "${IPS[@]}"; do
+    $SSH_CMD "ec2-user@${ip}" "sudo depmod -a \$(uname -r) 2>/dev/null || sudo depmod -a" 2>/dev/null || true
+done
+log "depmod run on all nodes"
 
 log "=== All nodes rebooted with custom kernel ==="

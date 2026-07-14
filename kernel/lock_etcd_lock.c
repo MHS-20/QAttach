@@ -31,6 +31,22 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		return 0;
 	}
 
+	/* Fast-path: grant SH inline for locally-tracked lock types.
+	 * IOPEN (5), NONDISK (1), and QUOTA (8) are per-node metadata
+	 * that DLM also grants without remote coordination.  Bypassing
+	 * the netlink round-trip eliminates the async window where
+	 * zombie holders can form.  EX and UN for these types still
+	 * go through the agent for cross-node coordination. */
+	if (req_state == LM_ST_SHARED &&
+	    (gl->gl_name.ln_type == LM_TYPE_NONDISK ||
+	     gl->gl_name.ln_type == LM_TYPE_IOPEN ||
+	     gl->gl_name.ln_type == LM_TYPE_QUOTA)) {
+		pr_info("  INLINE-SH t=%u n=%llu\n",
+			gl->gl_name.ln_type, gl->gl_name.ln_number);
+		gfs2_glock_complete(gl, req_state);
+		return 0;
+	}
+
 	req.request_id     = atomic64_inc_return(&letcd_req_counter);
 	req.glock_number   = gl->gl_name.ln_number;
 	req.glock_type     = gl->gl_name.ln_type;
@@ -40,18 +56,6 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
 		req.glock_type, req.glock_number,
 		req.requested_mode, req.request_id);
-
-	/* Yield check: suppress re-acquisitions (glock is UNLOCKED) so the
-	 * agent can hand off the lock to a waiter.  Conversions (EX→SH etc.)
-	 * are NOT suppressed — they must reach the agent so it knows the
-	 * kernel is giving up the lock. */
-	if (letcd_yield_test(req.glock_type, req.glock_number) &&
-	    gl->gl_state == LM_ST_UNLOCKED) {
-		pr_info("  YIELD-SUPPRESS t=%u n=%llu (glst=UN)\n",
-			req.glock_type, req.glock_number);
-		gfs2_glock_complete(gl, 0);
-		return 0;
-	}
 
 	letcd_bast_insert(req.glock_type, req.glock_number, gl);
 	letcd_pending_insert(req.request_id, gl,

@@ -220,6 +220,100 @@ func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber ui
 	return true, txnResp.Header.Revision, "", "", nil
 }
 
+// modesConflict returns true if two lock modes conflict.
+func modesConflict(a, b string) bool {
+	if a == b {
+		return false
+	}
+	if a == "EX" || b == "EX" {
+		return true
+	}
+	return false
+}
+
+// ConvertLock converts an already-held lock to a new mode without releasing.
+// Updates our entry in the holders array. If no conflicting holders remain
+// after the update, returns granted=true. Otherwise returns granted=false
+// (caller must watch for other holders to release).
+// Returns an error if another node already holds EX (caller should release
+// and retry as a new request).
+func (c *Client) ConvertLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, newMode string) (granted bool, rev int64, err error) {
+	key := lockKey(lockType, lockNumber)
+
+	for {
+		getResp, err := c.cli.Get(ctx, key)
+		if err != nil {
+			return false, 0, fmt.Errorf("convert get: %w", err)
+		}
+		if len(getResp.Kvs) == 0 {
+			return false, 0, fmt.Errorf("convert: lock not held")
+		}
+
+		ver := getResp.Kvs[0].Version
+		holders := parseHolders(getResp.Kvs[0].Value)
+
+		ourIdx := -1
+		for i, h := range holders {
+			if h.Node == nodeID {
+				ourIdx = i
+				break
+			}
+		}
+		if ourIdx < 0 {
+			return false, 0, fmt.Errorf("convert: self not in holders")
+		}
+
+		if holders[ourIdx].Mode == newMode {
+			for i, h := range holders {
+				if i == ourIdx {
+					continue
+				}
+				if modesConflict(newMode, h.Mode) {
+					return false, 0, nil
+				}
+			}
+			return true, getResp.Kvs[0].ModRevision, nil
+		}
+
+		if newMode == "EX" {
+			for i, h := range holders {
+				if i == ourIdx {
+					continue
+				}
+				if h.Mode == "EX" {
+					return false, 0, fmt.Errorf("convert: another node holds EX")
+				}
+			}
+		}
+
+		newHolders := make([]lockEntry, len(holders))
+		copy(newHolders, holders)
+		newHolders[ourIdx].Mode = newMode
+
+		txnResp, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+			Then(clientv3.OpPut(key, marshalHolders(newHolders),
+				clientv3.WithLease(c.sess.Lease()))).
+			Commit()
+		if err != nil {
+			return false, 0, fmt.Errorf("convert txn: %w", err)
+		}
+		if !txnResp.Succeeded {
+			continue
+		}
+
+		for i, h := range newHolders {
+			if i == ourIdx {
+				continue
+			}
+			if modesConflict(newMode, h.Mode) {
+				return false, 0, nil
+			}
+		}
+		return true, txnResp.Header.Revision, nil
+	}
+}
+
 // AmIHolder checks if nodeID is among the current holders of this lock.
 func (c *Client) AmIHolder(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) bool {
 	key := lockKey(lockType, lockNumber)
@@ -232,37 +326,52 @@ func (c *Client) AmIHolder(ctx context.Context, lockType uint32, lockNumber uint
 
 // ReleaseLock removes this node's entry from the holders array.
 // If the array becomes empty, the key is deleted.
+// Retries on CAS version mismatch (concurrent multi-holder release).
 func (c *Client) ReleaseLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) error {
 	key := lockKey(lockType, lockNumber)
-	getResp, err := c.cli.Get(ctx, key)
-	if err != nil {
-		return err
-	}
-	if len(getResp.Kvs) == 0 {
-		return nil
-	}
 
-	ver := getResp.Kvs[0].Version
-	holders := parseHolders(getResp.Kvs[0].Value)
+	for {
+		getResp, err := c.cli.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if len(getResp.Kvs) == 0 {
+			return nil
+		}
 
-	filtered := make([]lockEntry, 0, len(holders))
-	for _, h := range holders {
-		if h.Node != nodeID {
-			filtered = append(filtered, h)
+		ver := getResp.Kvs[0].Version
+		holders := parseHolders(getResp.Kvs[0].Value)
+		if len(holders) == 0 {
+			return nil
+		}
+
+		filtered := make([]lockEntry, 0, len(holders))
+		for _, h := range holders {
+			if h.Node != nodeID {
+				filtered = append(filtered, h)
+			}
+		}
+
+		var txnResp *clientv3.TxnResponse
+		if len(filtered) == 0 {
+			txnResp, err = c.cli.Txn(ctx).
+				If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+				Then(clientv3.OpDelete(key)).
+				Commit()
+		} else {
+			txnResp, err = c.cli.Txn(ctx).
+				If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+				Then(clientv3.OpPut(key, marshalHolders(filtered),
+					clientv3.WithLease(c.sess.Lease()))).
+				Commit()
+		}
+		if err != nil {
+			return err
+		}
+		if txnResp.Succeeded {
+			return nil
 		}
 	}
-
-	if len(filtered) == 0 {
-		c.cli.Delete(ctx, key)
-		return nil
-	}
-
-	_, err = c.cli.Txn(ctx).
-		If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-		Then(clientv3.OpPut(key, marshalHolders(filtered),
-			clientv3.WithLease(c.sess.Lease()))).
-		Commit()
-	return err
 }
 
 // ---- watches ----
@@ -279,10 +388,60 @@ func (c *Client) WatchLockKey(ctx context.Context, lockType uint32, lockNumber u
 	return c.cli.Watch(ctx, lockKey(lockType, lockNumber))
 }
 
+// ---- wait queue ----
+
+// AddWaiter registers this node as a waiter for a lock.
+func (c *Client) AddWaiter(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) error {
+	key := waitKey(lockType, lockNumber, nodeID)
+	_, err := c.cli.Put(ctx, key, nodeID, clientv3.WithLease(c.sess.Lease()))
+	return err
+}
+
+// RemoveWaiter removes this node's waiter registration.
+func (c *Client) RemoveWaiter(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) error {
+	_, err := c.cli.Delete(ctx, waitKey(lockType, lockNumber, nodeID))
+	return err
+}
+
+// GetWaiters returns waiter node IDs sorted by CreateRevision (FIFO order).
+func (c *Client) GetWaiters(ctx context.Context, lockType uint32, lockNumber uint64) ([]string, error) {
+	resp, err := c.cli.Get(ctx, waitPrefix(lockType, lockNumber),
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByCreateRevision, clientv3.SortAscend))
+	if err != nil {
+		return nil, err
+	}
+	waiters := make([]string, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		waiters = append(waiters, string(kv.Value))
+	}
+	return waiters, nil
+}
+
+// IsFirstWaiter returns true if this node is the oldest waiter.
+func (c *Client) IsFirstWaiter(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
+	waiters, err := c.GetWaiters(ctx, lockType, lockNumber)
+	if err != nil {
+		return false, err
+	}
+	if len(waiters) == 0 {
+		return false, nil
+	}
+	return waiters[0] == nodeID, nil
+}
+
 // ---- bast / handoff ----
 
 func bastKey(lockType uint32, lockNumber uint64) string {
 	return fmt.Sprintf("%s%d/%d", protocol.PrefixBast, lockType, lockNumber)
+}
+
+func waitKey(lockType uint32, lockNumber uint64, nodeID string) string {
+	return fmt.Sprintf("%s%d/%d/wait/%s", protocol.PrefixWait, lockType, lockNumber, nodeID)
+}
+
+func waitPrefix(lockType uint32, lockNumber uint64) string {
+	return fmt.Sprintf("%s%d/%d/wait/", protocol.PrefixWait, lockType, lockNumber)
 }
 
 func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32, waiterID string) error {
@@ -294,37 +453,6 @@ func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber ui
 	}
 	_, err = c.cli.Put(ctx, key, val, clientv3.WithLease(lease.ID))
 	return err
-}
-
-func handoffKey(lockType uint32, lockNumber uint64) string {
-	return fmt.Sprintf("%s%d/%d/next", protocol.PrefixHandoff, lockType, lockNumber)
-}
-
-// HandoffRelease atomically deletes the lock key and writes a handoff
-// reservation for the waiter.
-func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber uint64, waiterID string) error {
-	lk := lockKey(lockType, lockNumber)
-	hk := handoffKey(lockType, lockNumber)
-	lease, err := c.cli.Grant(ctx, int64(protocol.HandoffTTL))
-	if err != nil {
-		return fmt.Errorf("handoff lease: %w", err)
-	}
-	_, err = c.cli.Txn(ctx).
-		If(clientv3.Compare(clientv3.Version(lk), ">", 0)).
-		Then(clientv3.OpDelete(lk), clientv3.OpPut(hk, waiterID, clientv3.WithLease(lease.ID))).
-		Commit()
-	return err
-}
-
-func (c *Client) CheckHandoff(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
-	resp, err := c.cli.Get(ctx, handoffKey(lockType, lockNumber))
-	if err != nil {
-		return false, err
-	}
-	if len(resp.Kvs) == 0 {
-		return false, nil
-	}
-	return string(resp.Kvs[0].Value) == nodeID, nil
 }
 
 // HasWaiter returns true and the waiter's nodeID if a bast key exists.
@@ -339,11 +467,6 @@ func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint
 		return true, parts[1]
 	}
 	return false, ""
-}
-
-func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {
-	_, err := c.cli.Delete(ctx, handoffKey(lockType, lockNumber))
-	return err
 }
 
 func (c *Client) DeleteBastRequest(ctx context.Context, lockType uint32, lockNumber uint64) error {
@@ -416,6 +539,19 @@ func (c *Client) GetLockRevision(ctx context.Context, lockType uint32, lockNumbe
 		return 0, nil
 	}
 	return resp.Kvs[0].ModRevision, nil
+}
+
+// GetLockRaw returns the raw value of a lock key for diagnostics.
+func (c *Client) GetLockRaw(ctx context.Context, lockType uint32, lockNumber uint64) (string, bool, error) {
+	key := lockKey(lockType, lockNumber)
+	resp, err := c.cli.Get(ctx, key)
+	if err != nil {
+		return "", false, err
+	}
+	if resp.Count == 0 {
+		return "", false, nil
+	}
+	return string(resp.Kvs[0].Value), true, nil
 }
 
 func (c *Client) WatchPrefix(ctx context.Context, prefix string) clientv3.WatchChan {

@@ -8,9 +8,8 @@ const (
 	PrefixLocks   = "locks/glock/"       // /locks/glock/{type}/{number}
 	PrefixBast    = "locks/bast/"        // /locks/bast/{type}/{number}  — BAST request signal
 	PrefixJournal = "cluster/journals/"  // /cluster/journals/{jid} — journal slot assignment
-	PrefixHandoff = "locks/glock/"       // /locks/glock/{type}/{number}/next — handoff reservation
+	PrefixWait    = "locks/glock/"       // /locks/glock/{type}/{number}/wait/{node_id} — FIFO wait queue
 	MaxJournals   = 16                   // max journals to try during mount
-	HandoffTTL    = 5                    // seconds, short TTL for handoff token
 )
 
 // MemberInfo stored in /cluster/members/{node_id}.

@@ -22,8 +22,6 @@
 #define LETCD_MSG_MOUNT_REQ   9   /* kernel → agent: mount request */
 #define LETCD_MSG_MOUNT_RESP  10  /* agent → kernel: mount response with jid */
 #define LETCD_MSG_REGISTER    11  /* agent → kernel: register PID for unicast */
-#define LETCD_MSG_LOCK_YIELD  12  /* agent → kernel: yield lock to waiter */
-#define LETCD_MSG_YIELD_CLEAR 13  /* agent → kernel: clear yield flag */
 
 /* Lock modes — must match GFS2 LM_ST_* exactly */
 #define LETCD_LM_ST_UNLOCKED  0
@@ -85,11 +83,6 @@ struct letcd_mount_resp {
 	__u64 request_id;
 	__s32 jid;              /* negative on error */
 	__s64 epoch;            /* cluster/epoch revision at mount time */
-};
-
-struct letcd_lock_yield {
-	__u32 glock_type;
-	__u64 glock_number;
 };
 
 #endif /* _LETCD_NETLINK_H */

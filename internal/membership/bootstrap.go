@@ -284,6 +284,8 @@ func (m *Manager) bootstrapNew(ctx context.Context) error {
 }
 
 func (m *Manager) joinExisting(ctx context.Context, seedEndpoint string) error {
+	log.Printf("membership: joinExisting seed=%s node=%s peer=%s", seedEndpoint, m.nodeName, m.peerURL)
+
 	// Connect to the seed node.
 	bootstrapCli, err := m.connect(ctx, []string{seedEndpoint})
 	if err != nil {
@@ -296,6 +298,7 @@ func (m *Manager) joinExisting(ctx context.Context, seedEndpoint string) error {
 	if err != nil {
 		return fmt.Errorf("join: member list: %w", err)
 	}
+	log.Printf("membership: member list returned %d members", len(membersResp.Members))
 
 	// Build the initial-cluster for the joining node.
 	// Use the existing members + self.
@@ -337,9 +340,12 @@ func (m *Manager) joinExisting(ctx context.Context, seedEndpoint string) error {
 				parts = append(parts, fmt.Sprintf("%s=%s", name, peerURL))
 			}
 		}
+	} else {
+		log.Printf("membership: self (%s) already in member list, skipping MemberAdd", m.nodeName)
 	}
 
 	initialCluster := strings.Join(parts, ",")
+	log.Printf("membership: initial cluster: %s", initialCluster)
 
 	// Always clean stale data from a previous failed join.
 	os.RemoveAll(m.etcdDataDir)
@@ -357,7 +363,7 @@ func (m *Manager) joinExisting(ctx context.Context, seedEndpoint string) error {
 		return fmt.Errorf("local etcd did not become healthy within %v", healthTimeout)
 	}
 
-	log.Printf("membership: joined existing cluster as %s", m.nodeName)
+	log.Printf("membership: joined existing cluster as %s (members=%d)", m.nodeName, strings.Count(initialCluster, "="))
 	return nil
 }
 
