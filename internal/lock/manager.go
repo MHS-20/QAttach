@@ -23,8 +23,6 @@ type Manager struct {
 	nodeID  string
 
 	mu        sync.Mutex
-	mountReqs map[uint64]chan int32
-	mountJID  int32
 	heldLocks map[string]*heldLock
 	epoch     int64
 }
@@ -33,8 +31,6 @@ func NewManager(ec *etcd.Client, nodeID string) *Manager {
 	return &Manager{
 		etcdCli:   ec,
 		nodeID:    nodeID,
-		mountReqs: make(map[uint64]chan int32),
-		mountJID:  -1,
 		heldLocks: make(map[string]*heldLock),
 	}
 }
@@ -216,8 +212,6 @@ func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockReque
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	diagNext := time.Now()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -236,30 +230,10 @@ func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockReque
 				m.sendGrant(req.RequestID, req.RequestedMode, rev)
 				return
 			}
-			if time.Now().After(diagNext) {
-				raw, exists, _ := m.etcdCli.GetLockRaw(ctx,
-					req.GlockType, req.GlockNumber)
-				log.Printf("watchForConversion: still waiting type=%d num=%d node=%s mode=%s exists=%v raw=%s",
-					req.GlockType, req.GlockNumber, m.nodeID, mode, exists, raw)
-				diagNext = time.Now().Add(10 * time.Second)
 
-				// BAST other PR holders so they release.
-				m.etcdCli.RequestBast(ctx,
-					req.GlockType, req.GlockNumber, 0, m.nodeID)
-
-				// Fallback: if the lock key vanished (deleted by
-				// session expiry or the other node), just acquire.
-				if !exists {
-					granted, rev, _, _, aerr := m.etcdCli.AcquireLock(ctx,
-						req.GlockType, req.GlockNumber, m.nodeID, mode)
-					if aerr == nil && granted {
-						log.Printf("watchForConversion: fallback acquired type=%d num=%d",
-							req.GlockType, req.GlockNumber)
-						m.sendGrant(req.RequestID, req.RequestedMode, rev)
-						return
-					}
-				}
-			}
+			// BAST other PR holders so they release.
+			m.etcdCli.RequestBast(ctx,
+				req.GlockType, req.GlockNumber, 0, m.nodeID)
 		}
 	}
 }
@@ -361,7 +335,6 @@ func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 		}
 
 		m.mu.Lock()
-		m.mountJID = jid
 		m.epoch = epoch
 		m.mu.Unlock()
 

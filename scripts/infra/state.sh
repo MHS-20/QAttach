@@ -35,7 +35,7 @@ export AWS_DEFAULT_REGION="$REGION"
 
 # Expand ~ in PEM_PATH
 PEM="${PEM_PATH/#\~/$HOME}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i $PEM"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=30 -i $PEM"
 SSH_CMD="ssh $SSH_OPTS"
 
 log()  { echo "[$(date +%T)] $*"; }

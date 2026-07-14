@@ -384,9 +384,6 @@ func (c *Client) WatchMemberDeletions(ctx context.Context) clientv3.WatchChan {
 	)
 }
 
-func (c *Client) WatchLockKey(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
-	return c.cli.Watch(ctx, lockKey(lockType, lockNumber))
-}
 
 // ---- wait queue ----
 
@@ -529,34 +526,8 @@ func (c *Client) InitEpoch(ctx context.Context) (int64, error) {
 	return txnResp.Header.Revision, nil
 }
 
-func (c *Client) GetLockRevision(ctx context.Context, lockType uint32, lockNumber uint64) (int64, error) {
-	key := lockKey(lockType, lockNumber)
-	resp, err := c.cli.Get(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-	if resp.Count == 0 {
-		return 0, nil
-	}
-	return resp.Kvs[0].ModRevision, nil
-}
 
-// GetLockRaw returns the raw value of a lock key for diagnostics.
-func (c *Client) GetLockRaw(ctx context.Context, lockType uint32, lockNumber uint64) (string, bool, error) {
-	key := lockKey(lockType, lockNumber)
-	resp, err := c.cli.Get(ctx, key)
-	if err != nil {
-		return "", false, err
-	}
-	if resp.Count == 0 {
-		return "", false, nil
-	}
-	return string(resp.Kvs[0].Value), true, nil
-}
 
-func (c *Client) WatchPrefix(ctx context.Context, prefix string) clientv3.WatchChan {
-	return c.cli.Watch(ctx, prefix, clientv3.WithPrefix())
-}
 
 func (c *Client) MarkFencingComplete(ctx context.Context, failedNodeID, result string) error {
 	key := protocol.PrefixFencing + failedNodeID
@@ -564,10 +535,6 @@ func (c *Client) MarkFencingComplete(ctx context.Context, failedNodeID, result s
 	return err
 }
 
-func (c *Client) WatchFencingKey(ctx context.Context, failedNodeID string) clientv3.WatchChan {
-	key := protocol.PrefixFencing + failedNodeID
-	return c.cli.Watch(ctx, key)
-}
 
 func (c *Client) Close() error {
 	if c.sess != nil {

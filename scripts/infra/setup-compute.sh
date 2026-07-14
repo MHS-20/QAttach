@@ -405,7 +405,7 @@ fi
         # take 30+ seconds on the first node.
         log "Waiting for agent to register netlink socket..."
         for attempt in $(seq 1 60); do
-            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg --since '120 seconds ago' 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
                 log "cluster-agent reconnected (netlink registered)"
                 break
             fi
@@ -465,7 +465,7 @@ fi
         # take 30+ seconds on the first node.
         log "Waiting for agent to register netlink socket..."
         for attempt in $(seq 1 60); do
-            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg --since '120 seconds ago' 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
                 log "cluster-agent reconnected (netlink registered)"
                 break
             fi
