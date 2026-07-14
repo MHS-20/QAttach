@@ -220,8 +220,15 @@ func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockReque
 			converted, rev, err := m.etcdCli.ConvertLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
 			if err != nil {
-				log.Printf("watchForConversion: convert error type=%d num=%d: %v",
+				log.Printf("watchForConversion: convert error type=%d num=%d: %v — trying fallback",
 					req.GlockType, req.GlockNumber, err)
+				granted, rev, _, _, aerr := m.etcdCli.AcquireLock(ctx,
+					req.GlockType, req.GlockNumber, m.nodeID, mode)
+				if aerr == nil && granted {
+					log.Printf("watchForConversion: fallback acquired type=%d num=%d",
+						req.GlockType, req.GlockNumber)
+					m.sendGrant(req.RequestID, req.RequestedMode, rev)
+				}
 				return
 			}
 			if converted {
@@ -239,45 +246,19 @@ func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockReque
 }
 
 func (m *Manager) tryAcquireAsFirstWaiter(ctx context.Context, req protocol.LockRequest) bool {
-	isFirst, err := m.etcdCli.IsFirstWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-	if err != nil {
-		log.Printf("IsFirstWaiter error type=%d num=%d: %v",
-			req.GlockType, req.GlockNumber, err)
-		return false
-	}
-
 	mode := protocol.LockModeToEtcd(req.RequestedMode)
-	if isFirst {
-		granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID, mode)
-		if err != nil {
-			log.Printf("first-waiter acquire error type=%d num=%d: %v",
-				req.GlockType, req.GlockNumber, err)
-			return false
-		}
-		if granted {
-			log.Printf("first-waiter acquired: type=%d num=%d rev=%d",
-				req.GlockType, req.GlockNumber, rev)
-			m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-			m.sendGrant(req.RequestID, req.RequestedMode, rev)
-			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
-			return true
-		}
-		log.Printf("first-waiter but acquire failed type=%d num=%d",
-			req.GlockType, req.GlockNumber)
-		return false
-	}
 
-	// No waiters exist (our wait key may have been lost). If the lock
-	// key is free, acquire it anyway — we may have missed the handoff.
+	// Try direct acquisition first — handles the common case where
+	// the lock is free regardless of waiter queue state.
 	granted, rev, _, _, err := m.etcdCli.AcquireLock(ctx,
 		req.GlockType, req.GlockNumber, m.nodeID, mode)
 	if err != nil {
 		return false
 	}
 	if granted {
-		log.Printf("orphan-waiter acquired: type=%d num=%d rev=%d",
+		log.Printf("acquired: type=%d num=%d rev=%d",
 			req.GlockType, req.GlockNumber, rev)
+		m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
 		m.sendGrant(req.RequestID, req.RequestedMode, rev)
 		m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
 		return true

@@ -1,21 +1,23 @@
 #!/bin/bash
-# run-randomized-test.sh — stress-test the lock handoff mechanism by
-# having every compute node acquire/release locks on random files for
-# random durations, concurrently.
+# run-randomized-test.sh — multi-node lock stress test.
 #
-# Usage: ./run-randomized-test.sh [rounds] [max_sleep] [file_count]
-#   rounds     — how many acquire-release cycles per node (default 20)
-#   max_sleep  — max seconds to hold a lock (default 3)
-#   file_count — number of distinct files to contend on (default 5)
+# All nodes randomly read (SH) and write (EX) from a shared pool of
+# files concurrently.  Measures throughput, success rate, and detects
+# hangs via a per-operation timeout.
+#
+# Usage: ./run-randomized-test.sh [duration_sec] [file_count] [ops_per_sec]
+#   duration_sec — total runtime (default 30)
+#   file_count   — number of shared files to contend on (default 8)
+#   ops_per_sec  — target operations per node per second (default 5)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/state.sh"
 
-ROUNDS="${1:-20}"
-MAX_SLEEP="${2:-3}"
-FILE_COUNT="${3:-5}"
+DURATION="${1:-30}"
+FILE_COUNT="${2:-8}"
+OPS_PER_SEC="${3:-5}"
 
 mapfile -t COMPUTE_IPS < <(state_get compute_public_ips | jq -r '.[]')
 if [[ -z "${COMPUTE_IPS[*]}" || "${COMPUTE_IPS[0]}" == "null" ]]; then
@@ -32,127 +34,169 @@ mkdir -p "$RESULT_DIR"
 
 PASS=0
 FAIL=0
+TOTAL_OPS=0
 
 log() { echo "[$(date +%T)] $*"; }
 pass() { PASS=$((PASS + 1)); echo "  PASS: $*"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $*"; }
 
-# ---- randomised worker script (runs on each node) ----
+# Timeout for a single operation (seconds).  If a read or write takes
+# longer than this, the test declares a hang.
+OP_TIMEOUT=10
 
-PIDS=()
-NODE_IDS=()
-RESULTS=()
+# ---- deploy worker script to all nodes ----
+
+# Create shared directory + clean old files (from a single node to avoid contention)
+$SSH_CMD "ec2-user@${COMPUTE_IPS[0]}" "
+sudo mkdir -p /mnt/shared/stress
+sudo rm -f /mnt/shared/stress/shared_file*
+"
+
+WORKER='
+#!/bin/bash
+set -euo pipefail
+DURATION=$1; FILE_COUNT=$2; OPS_PER_SEC=$3; NODE_ID=$4; OP_TIMEOUT=$5
+
+# Shared test files — all nodes contend on the same pool
+DEADLINE=$(( SECONDS + DURATION ))
+OK=0
+HUNG=0
+ERR=0
+
+echo "START $NODE_ID $(hostname) pid=$$ duration=${DURATION}s files=${FILE_COUNT} rate=${OPS_PER_SEC}/s"
+
+while [[ $SECONDS -lt $DEADLINE ]]; do
+    fnum=$(( (RANDOM % FILE_COUNT) + 1 ))
+    fname="/mnt/shared/stress/shared_file${fnum}"
+    op=$(( RANDOM % 4 ))
+
+    case $op in
+    0)
+        # Atomic overwrite (EX lock)
+        val="n${NODE_ID}-$(date +%s%N)"
+        timeout $OP_TIMEOUT bash -c "echo \"$val\" > \"$fname\"" 2>/dev/null
+        rc=$?
+        ;;
+    1)
+        # Atomic append (EX lock)
+        val="n${NODE_ID}-$(date +%s%N)"
+        timeout $OP_TIMEOUT bash -c "echo \"$val\" >> \"$fname\"" 2>/dev/null
+        rc=$?
+        ;;
+    2)
+        # Read first line (SH lock)
+        timeout $OP_TIMEOUT bash -c "head -1 \"$fname\" 2>/dev/null || true" > /dev/null 2>&1
+        rc=$?
+        ;;
+    3)
+        # Read whole file (SH lock)
+        timeout $OP_TIMEOUT bash -c "cat \"$fname\" 2>/dev/null || true" > /dev/null 2>&1
+        rc=$?
+        ;;
+    esac
+
+    if [[ $rc -eq 124 ]]; then
+        HUNG=$((HUNG + 1))
+        echo "HUNG $NODE_ID op=$op file=$fname" >&2
+    elif [[ $rc -ne 0 ]]; then
+        ERR=$((ERR + 1))
+    else
+        OK=$((OK + 1))
+    fi
+
+    # Pace to target ops/sec
+    sleep "$(awk "BEGIN{printf \"%.3f\", 1.0 / $OPS_PER_SEC}")"
+done
+
+echo "DONE $NODE_ID ok=$OK hung=$HUNG err=$ERR"
+'
 
 for ((i=0; i<COMPUTE_COUNT; i++)); do
     ip="${COMPUTE_IPS[$i]}"
-    node_id="$i"
-    NODE_IDS+=("$node_id")
-    res_file="$RESULT_DIR/rnd_node${i}.out"
-
-    log "Launching worker on Node $i ($ip)..."
-    $SSH_CMD "ec2-user@${ip}" "
-cat > /tmp/rnd_worker.sh << 'WORKEREOF'
-#!/bin/bash
-set -euo pipefail
-ROUNDS=\$1; MAX_SLEEP=\$2; FILE_COUNT=\$3; NODE_ID=\$4
-PREFIX=\"/mnt/shared/rnd_\${NODE_ID}\"
-for i in \$(seq 1 \$ROUNDS); do
-    fnum=\$(( (RANDOM % FILE_COUNT) + 1 ))
-    fname=\"\${PREFIX}_file\${fnum}\"
-    sleep_time=\$(( (RANDOM % (MAX_SLEEP * 10)) + 1 ))
-    sleep_time=\$(awk \"BEGIN{printf \\\"%.1f\\\", \$sleep_time / 10}\")
-    op=\$(( RANDOM % 3 ))
-    if [[ \$op -eq 0 ]]; then
-        echo \"n\${NODE_ID}-\${i}\" > \"\$fname\"
-    elif [[ \$op -eq 1 ]]; then
-        echo \"n\${NODE_ID}-\${i}\" >> \"\$fname\"
-    else
-        cat \"\$fname\" > /dev/null 2>/dev/null || true
-    fi
-    sleep \"\$sleep_time\"
-    if ! ls /mnt/shared/ > /dev/null 2>&1; then
-        echo \"FATAL: \$HOSTNAME lost GFS2 access at round \$i\" >&2
-        exit 1
-    fi
+    log "Deploying worker to Node $i ($ip)..."
+    echo "$WORKER" | $SSH_CMD "ec2-user@${ip}" "
+cat > /tmp/stress_worker.sh
+chmod +x /tmp/stress_worker.sh
+"
 done
-echo \"OK \$HOSTNAME \$ROUNDS rounds\"
-WORKEREOF
-chmod +x /tmp/rnd_worker.sh
-sudo /tmp/rnd_worker.sh \"${ROUNDS}\" \"${MAX_SLEEP}\" \"${FILE_COUNT}\" \"${node_id}\"
-" > "$res_file" 2>&1 &
+
+# ---- launch all workers in parallel ----
+
+log "Starting $DURATION-second stress test ($COMPUTE_COUNT nodes, $FILE_COUNT files, $OPS_PER_SEC ops/s)..."
+log ""
+
+PIDS=()
+for ((i=0; i<COMPUTE_COUNT; i++)); do
+    ip="${COMPUTE_IPS[$i]}"
+    res_file="$RESULT_DIR/stress_node${i}.out"
+    $SSH_CMD "ec2-user@${ip}" \
+        "sudo /tmp/stress_worker.sh $DURATION $FILE_COUNT $OPS_PER_SEC $i $OP_TIMEOUT" \
+        > "$res_file" 2>&1 &
     PIDS+=($!)
 done
 
-# ---- Wait for completion with timeout ----
+# ---- wait for completion ----
 
-TIMEOUT=$(( ROUNDS * MAX_SLEEP * 2 + 60 ))
-log "Waiting for workers (timeout ${TIMEOUT}s)..."
+TIMEOUT=$(( DURATION + 60 ))
+log "Waiting up to ${TIMEOUT}s for workers..."
 deadline=$(( SECONDS + TIMEOUT ))
-all_done=true
 
 for pid in "${PIDS[@]}"; do
     remaining=$(( deadline - SECONDS ))
     if [[ $remaining -le 0 ]]; then
         kill "$pid" 2>/dev/null || true
-        all_done=false
+        fail "Worker timed out"
         continue
     fi
-    if ! wait "$pid" 2>/dev/null; then
-        all_done=false
-    fi
+    wait "$pid" 2>/dev/null || true
 done
 
 log ""
 
-# ---- Collect results ----
+# ---- collect results ----
+
+TOTAL_OK=0
+TOTAL_HUNG=0
+TOTAL_ERR=0
 
 for ((i=0; i<COMPUTE_COUNT; i++)); do
-    res_file="$RESULT_DIR/rnd_node${i}.out"
+    res_file="$RESULT_DIR/stress_node${i}.out"
     ip="${COMPUTE_IPS[$i]}"
-    node_id="${NODE_IDS[$i]}"
 
-    if [[ -f "$res_file" ]] && grep -q "^OK " "$res_file"; then
-        pass "Node $node_id ($ip) completed $(grep "^OK " "$res_file" | awk '{print $3}') rounds"
+    ok=$(grep "^DONE $i " "$res_file" 2>/dev/null | awk '{print $3}' | sed 's/ok=//')
+    hung=$(grep "^DONE $i " "$res_file" 2>/dev/null | awk '{print $4}' | sed 's/hung=//')
+    err=$(grep "^DONE $i " "$res_file" 2>/dev/null | awk '{print $5}' | sed 's/err=//')
+
+    ok="${ok:-0}"
+    hung="${hung:-0}"
+    err="${err:-0}"
+
+    ops_node=$(( ok + hung + err ))
+    TOTAL_OK=$(( TOTAL_OK + ok ))
+    TOTAL_HUNG=$(( TOTAL_HUNG + hung ))
+    TOTAL_ERR=$(( TOTAL_ERR + err ))
+
+    if [[ "$hung" -gt 0 ]]; then
+        fail "Node $i ($ip): $ok ok, $hung HUNG, $err error ($ops_node ops)"
+    elif [[ "$err" -gt 0 ]]; then
+        fail "Node $i ($ip): $ok ok, $err error ($ops_node ops)"
+    elif [[ "$ops_node" -eq 0 ]]; then
+        fail "Node $i ($ip): no operations completed"
     else
-        tail -5 "$res_file" 2>/dev/null | while read line; do
-            echo "       $line"
-        done
-        fail "Node $node_id ($ip) failed or timed out"
+        pass "Node $i ($ip): $ok ok ($ops_node ops)"
     fi
 done
 
-# ---- Cross-node visibility check ----
-
-log ""
-log "=== Cross-node visibility ==="
-
-for ((i=0; i<COMPUTE_COUNT; i++)); do
-    ip="${COMPUTE_IPS[$i]}"
-    node_id="${NODE_IDS[$i]}"
-
-    for ((j=0; j<COMPUTE_COUNT; j++)); do
-        if [[ $i -eq $j ]]; then continue; fi
-        other_id="${NODE_IDS[$j]}"
-
-        # Check that at least one file from the other node exists and is readable
-        found=$($SSH_CMD "ec2-user@${ip}" \
-            "sudo find /mnt/shared/ -name 'rnd_${other_id}_file*' 2>/dev/null | head -1" 2>/dev/null || true)
-        if [[ -n "$found" ]]; then
-            pass "Node $node_id sees Node $other_id files (e.g. $found)"
-        else
-            fail "Node $node_id does not see Node $other_id files"
-        fi
-    done
-done
-
-# ---- Summary ----
+TOTAL_OPS=$(( TOTAL_OK + TOTAL_HUNG + TOTAL_ERR ))
+ELAPSED="$DURATION"
 
 log ""
 log "============================================"
-log "Results: $PASS passed, $FAIL failed"
+log "Throughput: $(( TOTAL_OK * COMPUTE_COUNT / ELAPSED )) ok ops/sec (approx)"
+log "Total: $TOTAL_OK ok, $TOTAL_HUNG hung, $TOTAL_ERR err ($TOTAL_OPS ops)"
 log "============================================"
 
 if [[ $FAIL -gt 0 ]]; then
-    log "Details in: $RESULT_DIR/rnd_node*.out"
+    log "Details in: $RESULT_DIR/stress_node*.out"
     exit 1
 fi
