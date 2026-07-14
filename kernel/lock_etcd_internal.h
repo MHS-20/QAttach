@@ -20,6 +20,7 @@ struct letcd_pending_entry {
 	u64 request_id;
 	struct gfs2_glock *gl;
 	struct hlist_node node;
+	struct completion done;
 };
 
 extern spinlock_t letcd_pending_lock;
@@ -32,6 +33,7 @@ extern const struct lm_lockops letcd_ops;
 void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
 			  u32 glock_type, u64 glock_number);
 struct gfs2_glock *letcd_pending_remove(u64 request_id);
+struct completion *letcd_pending_done(u64 request_id);
 void letcd_bast_insert(u32 glock_type, u64 glock_number, struct gfs2_glock *gl);
 void letcd_bast_remove(u32 glock_type, u64 glock_number);
 struct gfs2_glock *letcd_bast_lookup(u32 glock_type, u64 glock_number);

@@ -21,6 +21,7 @@ void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
 		return;
 	e->request_id = request_id;
 	e->gl = gl;
+	init_completion(&e->done);
 	spin_lock_bh(&letcd_pending_lock);
 	hash_add(letcd_pending_table, &e->node, request_id);
 	spin_unlock_bh(&letcd_pending_lock);
@@ -46,6 +47,22 @@ struct gfs2_glock *letcd_pending_remove(u64 request_id)
 	return gl;
 }
 EXPORT_SYMBOL(letcd_pending_remove);
+
+struct completion *letcd_pending_done(u64 request_id)
+{
+	struct letcd_pending_entry *e;
+
+	spin_lock_bh(&letcd_pending_lock);
+	hash_for_each_possible(letcd_pending_table, e, node, request_id) {
+		if (e->request_id == request_id) {
+			spin_unlock_bh(&letcd_pending_lock);
+			return &e->done;
+		}
+	}
+	spin_unlock_bh(&letcd_pending_lock);
+	return NULL;
+}
+EXPORT_SYMBOL(letcd_pending_done);
 
 /* ---- BAST lookup ---- */
 

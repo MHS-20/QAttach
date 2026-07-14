@@ -27,7 +27,14 @@ static void dispatch_mount_resp(struct letcd_mount_resp *resp)
 
 static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 {
-	struct gfs2_glock *gl = letcd_pending_remove(grant->request_id);
+	struct completion *done;
+	struct gfs2_glock *gl;
+
+	done = letcd_pending_done(grant->request_id);
+	if (done)
+		complete(done);
+
+	gl = letcd_pending_remove(grant->request_id);
 	if (!gl) {
 		pr_info("  GRANT-DROPPED reqid=%lld (no pending entry)\n",
 			grant->request_id);
@@ -42,9 +49,15 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 
 static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 {
-	struct gfs2_glock *gl = letcd_pending_remove(deny->request_id);
+	struct completion *done;
+	struct gfs2_glock *gl;
 	int ret = -EIO;
 
+	done = letcd_pending_done(deny->request_id);
+	if (done)
+		complete(done);
+
+	gl = letcd_pending_remove(deny->request_id);
 	if (!gl) {
 		pr_info("  DENY-DROPPED reqid=%lld\n", deny->request_id);
 		return;
@@ -61,7 +74,14 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 
 static void dispatch_lock_wait(struct letcd_lock_wait *wait)
 {
-	struct gfs2_glock *gl = letcd_pending_remove(wait->request_id);
+	struct completion *done;
+	struct gfs2_glock *gl;
+
+	done = letcd_pending_done(wait->request_id);
+	if (done)
+		complete(done);
+
+	gl = letcd_pending_remove(wait->request_id);
 	if (!gl) {
 		pr_info("  WAIT-DROPPED reqid=%lld\n", wait->request_id);
 		return;

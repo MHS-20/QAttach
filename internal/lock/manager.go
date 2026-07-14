@@ -208,8 +208,10 @@ func (m *Manager) watchForLock(ctx context.Context, req protocol.LockRequest) {
 }
 
 // watchForConversion polls the lock key until the conversion can proceed.
+
+// watchForConversion polls the lock key until the conversion can proceed.
 func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockRequest, mode string) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {

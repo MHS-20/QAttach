@@ -79,6 +79,24 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		return ret;
 	}
 
+	/* Synchronous SH: block until the agent responds.  This eliminates
+	 * the async grant window that creates zombie holders.  The kernel
+	 * workqueue thread blocks for ~10ms (etcd round-trip).  EX and
+	 * conversions remain asynchronous. */
+	if (req_state == LM_ST_SHARED) {
+		unsigned long timeout;
+
+		pr_info("  SYNC-WAIT t=%u n=%llu reqid=%lld\n",
+			req.glock_type, req.glock_number, req.request_id);
+		timeout = wait_for_completion_timeout(
+			letcd_pending_done(req.request_id), 5 * HZ);
+		if (!timeout) {
+			pr_warn("  SYNC-TIMEOUT t=%u n=%llu reqid=%lld — granting anyway\n",
+				req.glock_type, req.glock_number,
+				req.request_id);
+		}
+	}
+
 	return 0;
 }
 
