@@ -154,7 +154,7 @@ echo
 
 # ---- Summary ----
 PASS_COUNT=$(grep -c "^  PASS:" "$RESULTS/summary.txt" 2>/dev/null || echo 0)
-FAIL_COUNT=$(grep -c "^  FAIL:" "$RESULTS/summary.txt" 2>/dev/null | tr -d "\n" || echo 0)
+FAIL_COUNT=$(grep -c "^  FAIL:" "$RESULTS/summary.txt" 2>/dev/null || echo 0)
 
 log "============================================"
 log "Results: $PASS_COUNT passed, $FAIL_COUNT failed"

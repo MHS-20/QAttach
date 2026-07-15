@@ -134,10 +134,20 @@ func (m *Manager) Deregister(ctx context.Context) error {
 		return nil
 	}
 
+	// Don't block on removal if we're the last member — the cluster
+	// won't have quorum and the removal will hang indefinitely.
+	if len(resp.Members) <= 1 {
+		log.Printf("membership: sole member, skipping removal (would break quorum)")
+		return nil
+	}
+
+	rmCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	log.Printf("membership: removing self (ID=%x) from etcd cluster", selfID)
-	_, err = cli.MemberRemove(ctx, selfID)
+	_, err = cli.MemberRemove(rmCtx, selfID)
 	if err != nil {
-		return fmt.Errorf("member remove: %w", err)
+		log.Printf("membership: deregister warning: member remove: %v", err)
+		return nil
 	}
 
 	log.Printf("membership: self removed from etcd cluster")

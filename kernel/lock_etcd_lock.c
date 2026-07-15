@@ -31,6 +31,25 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		return 0;
 	}
 
+	req.request_id     = atomic64_inc_return(&letcd_req_counter);
+	req.glock_number   = gl->gl_name.ln_number;
+	req.glock_type     = gl->gl_name.ln_type;
+	req.requested_mode = req_state;
+	req.node_epoch     = letcd_mount_ctx.mount_epoch;
+
+	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
+		req.glock_type, req.glock_number,
+		req.requested_mode, req.request_id);
+
+	/* Yield check: suppress re-acquisitions (glock is UNLOCKED) so the
+	 * agent can hand off the lock to a waiter.  Conversions (EX→SH etc.)
+	 * are NOT suppressed — they must reach the agent so it knows the
+	 * kernel is giving up the lock. */
+	if (letcd_yield_test(req.glock_type, req.glock_number) &&
+	    gl->gl_state == LM_ST_UNLOCKED) {
+		pr_info("  YIELD-SUPPRESS t=%u n=%llu (glst=UN)\n",
+			req.glock_type, req.glock_number);
+
 	/* Fast-path: grant SH inline for locally-tracked lock types.
 	 * IOPEN (5), NONDISK (1), and QUOTA (8) are per-node metadata
 	 * that DLM also grants without remote coordination.  Bypassing
@@ -47,15 +66,9 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		return 0;
 	}
 
-	req.request_id     = atomic64_inc_return(&letcd_req_counter);
-	req.glock_number   = gl->gl_name.ln_number;
-	req.glock_type     = gl->gl_name.ln_type;
-	req.requested_mode = req_state;
-	req.node_epoch     = letcd_mount_ctx.mount_epoch;
-
-	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
-		req.glock_type, req.glock_number,
-		req.requested_mode, req.request_id);
+		gfs2_glock_complete(gl, 0);
+		return 0;
+	}
 
 	letcd_bast_insert(req.glock_type, req.glock_number, gl);
 	letcd_pending_insert(req.request_id, gl,
@@ -72,34 +85,11 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		req.glock_type, req.glock_number, req.request_id, ret);
 
 	if (ret < 0) {
-		pr_warn("  NL-FAIL t=%u n=%llu reqid=%lld ret=%d - cleaning up\n",
+		pr_warn("  NL-FAIL t=%u n=%llu reqid=%lld ret=%d — cleaning up\n",
 			req.glock_type, req.glock_number, req.request_id, ret);
 		letcd_pending_remove(req.request_id);
 		letcd_bast_remove(req.glock_type, req.glock_number);
 		return ret;
-	}
-
-	/* Synchronous wait: block until the agent responds (WAIT or GRANT).
-	 * This eliminates the async grant window that creates zombie holders
-	 * and prevents the kernel from entering D-state when the agent is
-	 * processing a conversion.  The agent signals the completion on any
-	 * response (WAIT, GRANT, DENY). */
-	{
-		unsigned long timeout;
-
-		timeout = wait_for_completion_timeout(
-			letcd_pending_done(req.request_id), 5 * HZ);
-		if (!timeout) {
-			pr_warn("  SYNC-TIMEOUT t=%u n=%llu reqid=%lld\n",
-				req.glock_type, req.glock_number,
-				req.request_id);
-		}
-
-		/* If the agent already completed the grant (gfs2_glock_complete
-		 * was called by dispatch_lock_grant), clear GLF_BLOCKING so
-		 * run_queue does not set GLF_LOCK unnecessarily. */
-		if (test_bit(GLF_BLOCKING, &gl->gl_flags) && gl->gl_reply)
-			clear_bit(GLF_BLOCKING, &gl->gl_flags);
 	}
 
 	return 0;

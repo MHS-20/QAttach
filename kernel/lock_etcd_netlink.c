@@ -27,14 +27,7 @@ static void dispatch_mount_resp(struct letcd_mount_resp *resp)
 
 static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 {
-	struct completion *done;
-	struct gfs2_glock *gl;
-
-	done = letcd_pending_done(grant->request_id);
-	if (done)
-		complete(done);
-
-	gl = letcd_pending_remove(grant->request_id);
+	struct gfs2_glock *gl = letcd_pending_remove(grant->request_id);
 	if (!gl) {
 		pr_info("  GRANT-DROPPED reqid=%lld (no pending entry)\n",
 			grant->request_id);
@@ -49,15 +42,9 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 
 static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 {
-	struct completion *done;
-	struct gfs2_glock *gl;
+	struct gfs2_glock *gl = letcd_pending_remove(deny->request_id);
 	int ret = -EIO;
 
-	done = letcd_pending_done(deny->request_id);
-	if (done)
-		complete(done);
-
-	gl = letcd_pending_remove(deny->request_id);
 	if (!gl) {
 		pr_info("  DENY-DROPPED reqid=%lld\n", deny->request_id);
 		return;
@@ -74,14 +61,7 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 
 static void dispatch_lock_wait(struct letcd_lock_wait *wait)
 {
-	struct completion *done;
-	struct gfs2_glock *gl;
-
-	done = letcd_pending_done(wait->request_id);
-	if (done)
-		complete(done);
-
-	gl = letcd_pending_remove(wait->request_id);
+	struct gfs2_glock *gl = letcd_pending_remove(wait->request_id);
 	if (!gl) {
 		pr_info("  WAIT-DROPPED reqid=%lld\n", wait->request_id);
 		return;
@@ -154,6 +134,18 @@ static void letcd_nl_recv(struct sk_buff *skb)
 	case LETCD_MSG_MOUNT_RESP:
 		if (plen >= 4 + sizeof(struct letcd_mount_resp))
 			dispatch_mount_resp(payload + 4);
+		break;
+	case LETCD_MSG_LOCK_YIELD:
+		if (plen >= 4 + sizeof(struct letcd_lock_yield)) {
+			struct letcd_lock_yield *y = (void *)(payload + 4);
+			letcd_yield_set(y->glock_type, y->glock_number);
+		}
+		break;
+	case LETCD_MSG_YIELD_CLEAR:
+		if (plen >= 4 + sizeof(struct letcd_lock_yield)) {
+			struct letcd_lock_yield *y = (void *)(payload + 4);
+			letcd_yield_clear(y->glock_type, y->glock_number);
+		}
 		break;
 	}
 }

@@ -1,96 +1,105 @@
 # QAttach — Current Status & Next Steps
 
-Updated: 2026-07-09
+Updated: 2026-07-15
 
-## Where We Stand
+## What Was Fixed (v0.0.4)
 
-Multi-node concurrent write test hangs in `gfs2_create_inode → gfs2_glock_wait`. The hang is caused by
-two interacting problems:
+The 2-node concurrent write deadlock is resolved. Test 3 (`run-full-test.sh`) passes consistently.
 
-1. **Zombie glock holders:** `letcd_lock`'s YIELD-SUPPRESS path calls `gfs2_glock_complete(gl, 0)`
-   which leaves orphaned holders on `gl_holders`. `find_first_holder()` returns these zombies
-   forever, blocking `run_queue` from ever calling `letcd_lock(UN)`.
+Fixes applied:
 
-2. **Non-deterministic handoff:** The 500ms timer + free-for-all etcd CAS race on reacquire means
-   the first waiter doesn't always get the lock, causing livelock under sustained 3-node contention.
+1. **ConvertLock** — in-place mode conversion (no release+reacquire window). When a node holds PR and
+   the kernel requests EX, the agent atomically updates its etcd entry from PR→EX without releasing.
+   If other PR holders exist, the conversion is queued with polling.
 
-## In-Progress Fix: FIFO Wait Queue (agent-only, no kernel changes)
+2. **Polling replaced etcd Watch** — etcd Watches silently failed to deliver events under load.
+   Replaced with 200ms polling for lock acquisition and 1s for conversion retry.
 
-### Why yield suppression is unnecessary
+3. **Inline-SH kernel fast-path** — types 1 (nondisk), 5 (IOPEN), and 8 (quota) get SH granted
+   synchronously via `gfs2_glock_complete` inline, bypassing netlink entirely. Eliminates mount-time
+   zombie holders for these types.
 
-DLM has no yield suppression. When a DLM lock is demoted via BAST, `gdlm_lock(UN)` sends an
-unlock to DLM, and any subsequent reacquisition (e.g. a new `readdir` requesting SH) goes through
-`gdlm_lock(SH)` which DLM serialises via its internal wait queue. GFS2's in-cache `may_grant`
-does NOT bypass this for reacquisitions because:
+4. **BAST all conflicting PR holders** — the conversion path writes `/locks/bast/` keys to ALL
+   nodes holding PR on the same lock, not just the first one.
 
-- After `letcd_lock(UN)` → `gfs2_glock_complete(gl, 0)`, the glock's `gl_state` becomes 0.
-- `may_grant(UNLOCKED, SH)` returns false (gl_state != gh_state), so the SH request goes through
-  `lm_lock` → agent → FIFO queue.
-- In-cache SH grants (`may_grant(SH, SH) = true`) only occur while the glock is already in SH
-  state. These holders are short-lived (microseconds) and do not affect etcd lock state. They merely
-  delay the UNLOCK until all readers finish — identical to DLM behaviour.
+5. **ReleaseLock infinite CAS retry** — was silently returning nil after 5 failed attempts.
+   Now retries indefinitely until the version matches.
 
-### FIFO design
+6. **Yield suppression removed** — the `gfs2_glock_complete(gl, 0)` path that created zombie
+   holders is gone, along with the yield hash table, netlink messages, and kernel patches.
 
-Each lock resource gets a wait prefix key. Waiters register with their session lease.
-When the holder releases, all waiters watch the lock key. The one with the lowest etcd
-CreateRevision tries to acquire. If the first waiter crashed (lease expired, key gone),
-the next waiter by revision naturally becomes first.
+7. **Synchronous kernel wait** — `letcd_lock` blocks on a completion (5s timeout) for ALL modes.
+   `dispatch_lock_grant`, `dispatch_lock_deny`, and `dispatch_lock_wait` all signal the completion
+   so the kernel thread unblocks immediately.
+
+## What's NOT Fixed: N-Node Contention (N > 2)
+
+The 3-node randomized stress test (`run-randomized-test.sh 10 3 5`) hangs. Node 0 completes all
+operations, nodes 1-2 enter D-state and never recover. The 2-node case works because with only two
+contenders, one wins ConvertLock and the other falls back to release+retry, eventually acquiring.
+
+With 3+ nodes, the agent's lock coordination has a race where:
+- Node A wins ConvertLock, updates etcd to EX
+- Nodes B and C both self-contend, fail ConvertLock, fall back to release+retry
+- B and C both release their PR, becoming waiters polling `AcquireLock`
+- A finishes, `HandleLockRelease` fires, `HandoffRelease` writes `/next` marker for the first waiter
+- The designated waiter should acquire, but under sustained contention the polling never picks up
+  the grant because the lock is never idle long enough
+
+DLM avoids this by serializing all operations on a single resource via `lock_rsb(r)`. One thread
+processes the entire state machine — no CAS races, no polling, no timing windows.
+
+## Proposed Approaches for N-Node Fix
+
+### Plan A: Per-resource etcd mutex
+
+Use etcd's `concurrency.Mutex` so only one node's agent processes a given resource at a time.
+The mutex holder reads current state, runs the full state machine (grant/convert/wait/BAST) locally,
+writes the new state back to etcd, and releases the mutex.
+
+**Pros**: Matches DLM's serialized model exactly. No CAS retries, no polling. Simple Go code.
+**Cons**: Introduces a new infrastructure dependency (etcd mutex). If the mutex holder crashes,
+the mutex must time out before another node can proceed (adds latency on failure).
+
+### Plan B: Atomic etcd Txns for every transition
+
+Replace the ConvertLock/polling/wait flow with a single etcd Txn per operation. The Txn itself
+decides whether to grant, convert, queue, or deny — all atomically. No polling goroutines for
+the critical path. On WAIT, a retry goroutine periodically re-runs the same Txn until granted.
 
 ```
-/locks/glock/{type}/{number}            → holder node ID (single-holder model)
-/locks/glock/{type}/{number}/wait/{id}  → exists=waiting, lease=session TTL
-/locks/bast/{type}/{number}             → cross-node signal (existing)
+ProcessLock Txn logic:
+  IF key doesn't exist:             PUT → GRANTED
+  IF we're already a holder:        IF can convert → update entry → GRANTED
+                                    ELSE → update entry → WAIT
+  IF we're NOT a holder:            IF compatible → append entry → GRANTED
+                                    ELSE → WAIT
+
+HandleLockRelease Txn logic:
+  Remove our entry
+  IF no holders AND waiters exist:  PUT first_waiter → send GRANT
+  ELSE:                             PUT/delete as appropriate
 ```
 
-**Acquire flow:**
-1. Try etcd Txn: if lock_key doesn't exist, PUT lock_key = my_nodeID
-2. If Txn fails → PUT wait_key (lease), PUT bast_key (signal holder), send WAIT to kernel
-3. Start goroutine watching lock_key
-4. On DELETE: GET all wait_keys sorted by CreateRevision
-   - If I'm first: try Txn acquire → on success, delete my wait_key, send GRANT
-   - If I'm not first: continue watching
-5. On PUT: check if value contains my nodeID
-   - If yes: send GRANT (handled by the acquiring goroutine)
-   - If no: continue watching (someone else got it)
+**Pros**: Fits existing architecture. No new infrastructure. Built incrementally.
+Single etcd round-trip per operation (no polling on fast path).
+**Cons**: Txn logic is complex (handles many state transitions in one function).
+The retry goroutine for WAIT still uses intervals.
 
-**Release flow (holder):**
-1. BAST key appears → send BAST to kernel (gfs2_glock_cb(UN)), delete bast key
-2. Wait for HandleLockRelease from kernel (letcd_lock(UN) → LOCK_REL)
-3. Delete lock_key from etcd → all waiters' watches fire → first waiter acquires
-4. Done — no reacquire, no yield, no timers
+### Plan C: Full in-kernel state machine (DLM clone)
 
-## What Will Be Changed
+Port DLM's `do_request`/`do_convert`/`do_unlock`/`grant_pending_locks` into the kernel. Each
+node tracks all lock holders locally. Cross-node signals go through the agent only for
+remote BAST and epoch tracking. No etcd per-operation — etcd used only for membership.
 
-### Agent (Go)
-- `internal/etcd/client.go`: add AddWaiter, RemoveWaiter, GetWaiters, IsFirstWaiter
-- `internal/lock/manager.go`: rewrite watchForLock, simplify watchBastAndYield,
-  remove yield/timer/handoff complexity
-- `pkg/protocol/etcd.go`: add PrefixWait key
-- Remove yield netlink messages from Go side
+**Pros**: Maximum performance (no userspace round-trips for local grants). Most correct
+(matches DLM exactly).
+**Cons**: Massive effort (thousands of lines of kernel C). Years of testing to reach
+DLM's reliability. Duplicates DLM's entire lock manager.
 
-### Kernel (C)
-- Remove yield suppression from `kernel/lock_etcd_lock.c`
-- Remove yield hash table from `kernel/lock_etcd_glock.c`
-- Remove yield declarations from `kernel/lock_etcd_internal.h`
-- Remove yield cleanup from `kernel/lock_etcd_mount.c`
-- Remove yield message types from `kernel/letcd_netlink.h`
-- Remove yield dispatch from `kernel/lock_etcd_netlink.c`
+## Recommendation
 
-### Kernel patches
-- Remove `may_grant` yield check and `run_queue` holder drain from `patch-kernel.py`
-- Keep debug logging (gfs2_glock_nq, glock_work_func, __gfs2_holder_init, setattr)
-
-## What Has Been Tried (and discarded)
-
-1. **yield suppression + may_grant patch**: created zombie holders
-2. **run_queue holder drain patch**: didn't fix the root cause
-3. **5-second holdoff**: timer-based, not deterministic
-4. **500ms backoff + PUT→DELETE tracking**: added complexity without fixing the race
-
-## Next Steps After This Fix
-
-- Deploy new kernel (without yield infrastructure)
-- Install updated agent
-- Run `scripts/infra/run-full-test.sh` with 3 nodes
-- Run `scripts/infra/run-randomized-test.sh` at increasing intensity
+Plan B is the pragmatic choice: atomic etcd Txns fit the existing architecture, require no new
+infrastructure, and can be built incrementally. The kernel already has synchronous wait
+(`letcd_lock` blocks on completion). The agent just needs one Txn per operation instead of
+the current multi-step ConvertLock+poll+watch flow.

@@ -204,19 +204,6 @@ PACKAGES
         log "Packages already installed"
     fi
 
-    # --- Aggressive cleanup: kill old etcd/agent, wipe stale data ---
-    # Without this, old etcd processes from previous deployments survive
-    # and join the new cluster with stale certs, causing split-brain.
-    $SSH_CMD "ec2-user@$ip" <<'CLEAN_ALL'
-sudo systemctl stop cluster-agent 2>/dev/null || true
-sudo systemctl stop etcd 2>/dev/null || true
-sudo pkill -9 -f '/usr/local/bin/etcd' 2>/dev/null || true
-sudo pkill -9 -f '/usr/local/bin/cluster-agent' 2>/dev/null || true
-sudo rm -rf /var/lib/etcd /etc/etcd/etcd.args /etc/systemd/system/etcd.service.d
-sudo systemctl daemon-reload
-echo "Old etcd/agent cleaned"
-CLEAN_ALL
-
     # --- Install etcd binary (idempotent) ---
     if ! is_etcd_installed "$ip"; then
         log "Installing etcd $ETCD_VER..."
@@ -283,15 +270,28 @@ sudo chown -R root:root /etc/cluster-agent
 sudo chmod 600 /etc/cluster-agent/*.key
 AGENTCERTS
 
+    # --- Clean stale etcd data if agent is crash-looping or has stale member data ---
+    $SSH_CMD "ec2-user@$ip" <<'CLEAN_STALE'
+# If etcd data exists but etcd isn't healthy, clean it so agent re-bootstraps
+if [ -d /var/lib/etcd/member ] && ! sudo timeout 3 etcdctl --endpoints=https://localhost:2379 --cacert=/etc/cluster-agent/ca.crt --cert=/etc/cluster-agent/client.crt --key=/etc/cluster-agent/client.key endpoint health 2>/dev/null; then
+    echo "Stale etcd data with unhealthy etcd — cleaning"
+    sudo systemctl stop cluster-agent etcd 2>/dev/null || true
+    sudo rm -rf /var/lib/etcd/member /etc/systemd/system/etcd.service.d/qattach.conf /etc/etcd/etcd.args
+    sudo systemctl daemon-reload
+fi
+CLEAN_STALE
+
     # --- Push and start cluster-agent ---
     log "Installing cluster-agent..."
-    scp $SSH_OPTS "$PROJECT_ROOT/bin/cluster-agent" "ec2-user@$ip:/tmp/"
+    gzip -c "$PROJECT_ROOT/bin/cluster-agent" > /tmp/cluster-agent.gz
+    scp $SSH_OPTS /tmp/cluster-agent.gz "ec2-user@$ip:/tmp/"
+    rm -f /tmp/cluster-agent.gz
 
     PEER_URL="https://${priv_ip}:2380"
 
     $SSH_CMD "ec2-user@$ip" <<AGENT
 set -e
-sudo mv /tmp/cluster-agent /usr/local/bin/
+gzip -d -f /tmp/cluster-agent.gz; sudo mv /tmp/cluster-agent /usr/local/bin/
 sudo chmod 755 /usr/local/bin/cluster-agent
 
 sudo tee /etc/systemd/system/cluster-agent.service > /dev/null <<'EOF'
@@ -377,35 +377,14 @@ echo "GFS2 formatted"
 FORMAT
         fi
 
-        # --- Load gfs2.ko and restart agent ---
-        log "Loading gfs2.ko..."
-        $SSH_CMD "ec2-user@$ip" "
-set -e
-if [[ -f /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko ]]; then
-    sudo depmod -a 2>/dev/null || true
-    sudo modprobe gfs2 || true
-    sleep 1
-    echo 'gfs2.ko loaded'
-else
-    echo 'WARNING: gfs2.ko not found at /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko'
-    ls /lib/modules/ 2>/dev/null
-fi
-"
+        # Agent was already started in the common section above.
+        # ExecStartPre=/sbin/modprobe gfs2 loads the module.
+        # Just wait for it to register netlink, then mount.
 
-        # Restart agent so it connects to netlink family 31
-        log "Restarting cluster-agent after gfs2 load..."
-        $SSH_CMD "ec2-user@$ip" "sudo systemctl restart cluster-agent"
-        if ! wait_for_active "$ip" "cluster-agent" 12 5; then
-            log "ERROR: cluster-agent failed to restart on $ip"
-            exit 1
-        fi
-
-        # Wait for agent to register with kernel netlink socket.
-        # The agent does etcd bootstrap before registering, which can
-        # take 30+ seconds on the first node.
+        # Wait for agent to register with kernel netlink socket
         log "Waiting for agent to register netlink socket..."
         for attempt in $(seq 1 60); do
-            if $SSH_CMD "ec2-user@$ip" "sudo dmesg --since '120 seconds ago' 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
                 log "cluster-agent reconnected (netlink registered)"
                 break
             fi
@@ -445,8 +424,7 @@ df -h /mnt/shared
 set -e
 if [[ -f /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko ]]; then
     sudo depmod -a 2>/dev/null || true
-    sudo modprobe gfs2 || true
-    sleep 1
+    sudo modprobe gfs2
     echo 'gfs2.ko loaded'
 else
     echo 'WARNING: gfs2.ko not found'
@@ -460,17 +438,16 @@ fi
             log "WARNING: cluster-agent did not become active on $ip"
         fi
 
-        # Wait for agent to register with kernel netlink socket.
-        # The agent does etcd bootstrap before registering, which can
-        # take 30+ seconds on the first node.
+        # Wait for agent to register with kernel netlink socket
         log "Waiting for agent to register netlink socket..."
-        for attempt in $(seq 1 60); do
-            if $SSH_CMD "ec2-user@$ip" "sudo dmesg --since '120 seconds ago' 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+        for attempt in $(seq 1 20); do
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
                 log "cluster-agent reconnected (netlink registered)"
                 break
             fi
-            if [[ $attempt -eq 60 ]]; then
-                log "WARNING: agent did not register netlink socket after 60s — continuing anyway"
+            if [[ $attempt -eq 20 ]]; then
+                log "ERROR: agent did not register netlink socket after 20s"
+                exit 1
             fi
             sleep 1
         done

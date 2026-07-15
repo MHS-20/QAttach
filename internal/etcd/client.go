@@ -314,6 +314,158 @@ func (c *Client) ConvertLock(ctx context.Context, lockType uint32, lockNumber ui
 	}
 }
 
+// ProcessLock handles a lock request atomically in a single etcd Txn.
+// Replaces the previous multi-step ConvertLock+AcquireLock+watch flow.
+//
+// The Txn inspects the current key state and decides:
+//   - GRANTED: appended/updated our entry, no conflicts remain
+//   - WAIT:    conflicts exist, we're queued as a waiter
+//   - ERROR:   something went wrong
+//
+// The caller must:
+//   - On GRANTED: send GRANT to kernel, track the held lock
+//   - On WAIT:    send WAIT to kernel, start retry goroutine
+func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber uint64,
+	nodeID, mode string) (granted bool, rev int64, err error) {
+	key := lockKey(lockType, lockNumber)
+
+	for {
+		getResp, err := c.cli.Get(ctx, key)
+		if err != nil {
+			return false, 0, fmt.Errorf("process get: %w", err)
+		}
+
+		// Key doesn't exist — straightforward grant.
+		if len(getResp.Kvs) == 0 {
+			val := marshalHolders([]lockEntry{{Node: nodeID, Mode: mode}})
+			txnResp, err := c.cli.Txn(ctx).
+				If(clientv3.Compare(clientv3.Version(key), "=", 0)).
+				Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
+				Commit()
+			if err != nil {
+				return false, 0, fmt.Errorf("process empty txn: %w", err)
+			}
+			if !txnResp.Succeeded {
+				continue // key was created between Get and Txn — retry
+			}
+			return true, txnResp.Header.Revision, nil
+		}
+
+		ver := getResp.Kvs[0].Version
+		holders := parseHolders(getResp.Kvs[0].Value)
+
+		ourIdx := -1
+		for i, h := range holders {
+			if h.Node == nodeID {
+				ourIdx = i
+				break
+			}
+		}
+
+		if ourIdx >= 0 {
+			// ---- Self-contention: we're already a holder ----
+			if holders[ourIdx].Mode == mode {
+				// Already at target mode — just check conflicts.
+				for i, h := range holders {
+					if i == ourIdx {
+						continue
+					}
+					if modesConflict(mode, h.Mode) {
+						return false, 0, nil
+					}
+				}
+				return true, getResp.Kvs[0].ModRevision, nil
+			}
+
+			// Mode change.
+			if mode == "EX" {
+				for i, h := range holders {
+					if i == ourIdx {
+						continue
+					}
+					if h.Mode == "EX" {
+						// Another node already has EX — remove
+						// our entry and become a waiter.
+						newH := make([]lockEntry, 0, len(holders)-1)
+						for j, h2 := range holders {
+							if j != ourIdx {
+								newH = append(newH, h2)
+							}
+						}
+						txnResp, err := c.cli.Txn(ctx).
+							If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+							Then(clientv3.OpPut(key, marshalHolders(newH),
+								clientv3.WithLease(c.sess.Lease()))).
+							Commit()
+						if err != nil {
+							return false, 0, fmt.Errorf("process remove-self txn: %w", err)
+						}
+						if !txnResp.Succeeded {
+							continue
+						}
+						return false, 0, nil
+					}
+				}
+			}
+
+			// Update our mode.
+			newHolders := make([]lockEntry, len(holders))
+			copy(newHolders, holders)
+			newHolders[ourIdx].Mode = mode
+
+			txnResp, err := c.cli.Txn(ctx).
+				If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+				Then(clientv3.OpPut(key, marshalHolders(newHolders),
+					clientv3.WithLease(c.sess.Lease()))).
+				Commit()
+			if err != nil {
+				return false, 0, fmt.Errorf("process update txn: %w", err)
+			}
+			if !txnResp.Succeeded {
+				continue
+			}
+
+			for i, h := range newHolders {
+				if i == ourIdx {
+					continue
+				}
+				if modesConflict(mode, h.Mode) {
+					return false, 0, nil
+				}
+			}
+			return true, txnResp.Header.Revision, nil
+		}
+
+		// ---- Fresh acquisition: we're not a holder ----
+		if mode == "EX" {
+			// Key exists with holders — can't get EX.
+			return false, 0, nil
+		}
+
+		// PR mode — check for EX holder.
+		for _, h := range holders {
+			if h.Mode == "EX" {
+				return false, 0, nil
+			}
+		}
+
+		// Append our PR entry.
+		newHolders := append(holders, lockEntry{Node: nodeID, Mode: mode})
+		txnResp, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+			Then(clientv3.OpPut(key, marshalHolders(newHolders),
+				clientv3.WithLease(c.sess.Lease()))).
+			Commit()
+		if err != nil {
+			return false, 0, fmt.Errorf("process append txn: %w", err)
+		}
+		if !txnResp.Succeeded {
+			continue
+		}
+		return true, txnResp.Header.Revision, nil
+	}
+}
+
 // AmIHolder checks if nodeID is among the current holders of this lock.
 func (c *Client) AmIHolder(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) bool {
 	key := lockKey(lockType, lockNumber)

@@ -69,11 +69,13 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
-		granted, rev, holderMode, holderNodeID, err :=
-			m.etcdCli.AcquireLock(ctx,
-				req.GlockType, req.GlockNumber, m.nodeID, mode)
+		wasHolder := m.etcdCli.AmIHolder(ctx,
+			req.GlockType, req.GlockNumber, m.nodeID)
+
+		granted, rev, err := m.etcdCli.ProcessLock(ctx,
+			req.GlockType, req.GlockNumber, m.nodeID, mode)
 		if err != nil {
-			log.Printf("lock acquire error type=%d num=%d: %v",
+			log.Printf("process lock error type=%d num=%d: %v",
 				req.GlockType, req.GlockNumber, err)
 			m.sendDeny(req.RequestID, protocol.DenyReasonError)
 			return
@@ -82,43 +84,17 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		if granted {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
-		} else if holderNodeID == m.nodeID ||
-			m.etcdCli.AmIHolder(ctx, req.GlockType, req.GlockNumber, m.nodeID) {
-			log.Printf("lock self-contention: type=%d num=%d mode=%s→%s — converting",
-				req.GlockType, req.GlockNumber, holderMode, mode)
+			return
+		}
 
-			converted, rev, err := m.etcdCli.ConvertLock(ctx,
-				req.GlockType, req.GlockNumber, m.nodeID, mode)
-			if err != nil {
-				log.Printf("convert failed type=%d num=%d: %v — falling back to release+retry",
-					req.GlockType, req.GlockNumber, err)
-				m.releaseHeldLock(ctx, req.GlockType, req.GlockNumber)
-				m.etcdCli.AddWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-				m.sendWait(req.RequestID)
-				go m.watchForLock(ctx, req)
-				return
-			}
-
-			if converted {
-				log.Printf("convert immediate: type=%d num=%d to %s",
-					req.GlockType, req.GlockNumber, mode)
-				m.sendGrant(req.RequestID, req.RequestedMode, rev)
-				return
-			}
-
-			log.Printf("convert queued: type=%d num=%d to %s — waiting for other holders",
-				req.GlockType, req.GlockNumber, mode)
-			m.etcdCli.RequestBast(ctx, req.GlockType, req.GlockNumber, 0, m.nodeID)
-			m.sendWait(req.RequestID)
-			go m.watchForConversion(ctx, req, mode)
-		} else {
-			log.Printf("lock contended by %s, waiting", holderNodeID)
+		// WAIT — conflicts exist.  Start the retry goroutine.
+		if !wasHolder {
 			m.etcdCli.AddWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
 			m.etcdCli.RequestBast(ctx,
 				req.GlockType, req.GlockNumber, 0, m.nodeID)
-			m.sendWait(req.RequestID)
-			go m.watchForLock(ctx, req)
 		}
+		m.sendWait(req.RequestID)
+		go m.retryProcessLock(ctx, req, mode)
 	}()
 }
 
@@ -243,6 +219,52 @@ func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockReque
 			// BAST other PR holders so they release.
 			m.etcdCli.RequestBast(ctx,
 				req.GlockType, req.GlockNumber, 0, m.nodeID)
+		}
+	}
+}
+
+// retryProcessLock periodically retries ProcessLock until the lock is granted.
+func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Check handoff marker first — if the previous holder
+			// designated us, delete the marker and acquire immediately.
+			isHandoff, err := m.etcdCli.CheckHandoff(ctx,
+				req.GlockType, req.GlockNumber, m.nodeID)
+			if err == nil && isHandoff {
+				granted, rev, _, _, aerr := m.etcdCli.AcquireLock(ctx,
+					req.GlockType, req.GlockNumber, m.nodeID, mode)
+				if aerr == nil && granted {
+					log.Printf("retry handoff acquired: type=%d num=%d rev=%d",
+						req.GlockType, req.GlockNumber, rev)
+					m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
+					m.sendGrant(req.RequestID, req.RequestedMode, rev)
+					m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+					return
+				}
+			}
+
+			granted, rev, err := m.etcdCli.ProcessLock(ctx,
+				req.GlockType, req.GlockNumber, m.nodeID, mode)
+			if err != nil {
+				log.Printf("retryProcessLock error type=%d num=%d: %v",
+					req.GlockType, req.GlockNumber, err)
+				return
+			}
+			if granted {
+				log.Printf("retryProcessLock acquired: type=%d num=%d rev=%d",
+					req.GlockType, req.GlockNumber, rev)
+				m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
+				m.sendGrant(req.RequestID, req.RequestedMode, rev)
+				m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+				return
+			}
 		}
 	}
 }
