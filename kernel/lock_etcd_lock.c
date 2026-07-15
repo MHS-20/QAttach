@@ -72,29 +72,34 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		req.glock_type, req.glock_number, req.request_id, ret);
 
 	if (ret < 0) {
-		pr_warn("  NL-FAIL t=%u n=%llu reqid=%lld ret=%d — cleaning up\n",
+		pr_warn("  NL-FAIL t=%u n=%llu reqid=%lld ret=%d - cleaning up\n",
 			req.glock_type, req.glock_number, req.request_id, ret);
 		letcd_pending_remove(req.request_id);
 		letcd_bast_remove(req.glock_type, req.glock_number);
 		return ret;
 	}
 
-	/* Synchronous SH: block until the agent responds.  This eliminates
-	 * the async grant window that creates zombie holders.  The kernel
-	 * workqueue thread blocks for ~10ms (etcd round-trip).  EX and
-	 * conversions remain asynchronous. */
-	if (req_state == LM_ST_SHARED) {
+	/* Synchronous wait: block until the agent responds (WAIT or GRANT).
+	 * This eliminates the async grant window that creates zombie holders
+	 * and prevents the kernel from entering D-state when the agent is
+	 * processing a conversion.  The agent signals the completion on any
+	 * response (WAIT, GRANT, DENY). */
+	{
 		unsigned long timeout;
 
-		pr_info("  SYNC-WAIT t=%u n=%llu reqid=%lld\n",
-			req.glock_type, req.glock_number, req.request_id);
 		timeout = wait_for_completion_timeout(
 			letcd_pending_done(req.request_id), 5 * HZ);
 		if (!timeout) {
-			pr_warn("  SYNC-TIMEOUT t=%u n=%llu reqid=%lld — granting anyway\n",
+			pr_warn("  SYNC-TIMEOUT t=%u n=%llu reqid=%lld\n",
 				req.glock_type, req.glock_number,
 				req.request_id);
 		}
+
+		/* If the agent already completed the grant (gfs2_glock_complete
+		 * was called by dispatch_lock_grant), clear GLF_BLOCKING so
+		 * run_queue does not set GLF_LOCK unnecessarily. */
+		if (test_bit(GLF_BLOCKING, &gl->gl_flags) && gl->gl_reply)
+			clear_bit(GLF_BLOCKING, &gl->gl_flags);
 	}
 
 	return 0;

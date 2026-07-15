@@ -415,6 +415,37 @@ func (c *Client) GetWaiters(ctx context.Context, lockType uint32, lockNumber uin
 	return waiters, nil
 }
 
+func handoffKey(lockType uint32, lockNumber uint64) string {
+	return fmt.Sprintf("%s%d/%d/next", protocol.PrefixWait, lockType, lockNumber)
+}
+
+// HandoffRelease atomically deletes the lock key and writes a handoff
+// reservation for the next waiter.  Returns the handoff target nodeID.
+func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (string, error) {
+	waiters, err := c.GetWaiters(ctx, lockType, lockNumber)
+	if err != nil || len(waiters) == 0 {
+		return "", err
+	}
+	lk := lockKey(lockType, lockNumber)
+	hk := handoffKey(lockType, lockNumber)
+	target := waiters[0]
+	_, err = c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Version(lk), ">", 0)).
+		Then(clientv3.OpDelete(lk),
+			clientv3.OpPut(hk, target, clientv3.WithLease(c.sess.Lease()))).
+		Commit()
+	return target, err
+}
+
+// CheckHandoff returns true if there's a handoff marker for this node.
+func (c *Client) CheckHandoff(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
+	resp, err := c.cli.Get(ctx, handoffKey(lockType, lockNumber))
+	if err != nil || len(resp.Kvs) == 0 {
+		return false, err
+	}
+	return string(resp.Kvs[0].Value) == nodeID, nil
+}
+
 // IsFirstWaiter returns true if this node is the oldest waiter.
 func (c *Client) IsFirstWaiter(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
 	waiters, err := c.GetWaiters(ctx, lockType, lockNumber)
