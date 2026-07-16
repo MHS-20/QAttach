@@ -75,6 +75,18 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
+		// Journal lock (type=1, num>=1) held by another live node:
+		// the holder won't release (GFS2 ignores BAST on journal locks).
+		// Deny immediately so the kernel's mount skips this journal.
+		if req.GlockType == protocol.LockTypeNondisk &&
+			req.GlockNumber >= 1 &&
+			req.RequestedMode == protocol.LockModeExclusive {
+			log.Printf("journal lock denied: type=%d num=%d — held by live node, skipping",
+				req.GlockType, req.GlockNumber)
+			m.sendDeny(req.RequestID, protocol.DenyReasonContended)
+			return
+		}
+
 		// WAIT — conflicts exist.  Start the retry goroutine.
 		if !wasHolder {
 			m.etcdCli.AddWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
@@ -211,14 +223,24 @@ func (m *Manager) watchForConversion(ctx context.Context, req protocol.LockReque
 	}
 }
 
-// retryProcessLock periodically retries ProcessLock until the lock is granted.
+// retryProcessLock periodically retries ProcessLock until the lock is granted
+// or the retry times out (120s). On timeout, the waiter entry is cleaned up
+// and a DENY is sent to the kernel so GFS2 can move on.
 func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("retryProcessLock timeout type=%d num=%d — denying",
+				req.GlockType, req.GlockNumber)
+			m.etcdCli.RemoveWaiter(context.Background(),
+				req.GlockType, req.GlockNumber, m.nodeID)
+			m.sendDeny(req.RequestID, protocol.DenyReasonContended)
 			return
 		case <-ticker.C:
 			// Check handoff marker first — if the previous holder

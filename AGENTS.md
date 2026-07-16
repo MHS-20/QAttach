@@ -83,20 +83,52 @@ The custom kernel (6.18.35, NVMe built-in, lock_etcd in gfs2.ko) must be deploye
 
 ## Known bugs (blocking e2e)
 
-### CRITICAL: Lock mode constants inverted
-GFS2 kernel `LM_ST_SHARED=1`, `LM_ST_EXCLUSIVE=3`. But `pkg/protocol/glock.go` defines `LockModeExclusive=1`, `LockModeShared=3` — **swapped**. The kernel's `letcd_lock` sends `req_state` directly from GFS2 (`req.requested_mode = req_state`), so the agent receives GFS2 standard values. But `LockModeToEtcd(1)` returns `"EX"` (should be `"PR"`), and `LockModeToEtcd(3)` returns `"PR"` (should be `"EX"`). Result: all SH locks are stored as exclusive in etcd, all EX locks as shared. Quotad SH polling works only because it's single-node; cross-node access would immediately break. Same bug in `kernel/letcd_netlink.h` defines (`LETCD_LM_ST_EXCLUSIVE=1`, `LETCD_LM_ST_SHARED=3`).
+### FIXED: Lock mode constants inverted
+GFS2 kernel `LM_ST_SHARED=1`, `LM_ST_EXCLUSIVE=3`. `pkg/protocol/glock.go` and both copies of `letcd_netlink.h` now define `LockModeShared=1`, `LockModeExclusive=3` matching GFS2 exactly. `LockModeToEtcd(1)` returns `"PR"`, `LockModeToEtcd(3)` returns `"EX"`. Fixed in commit `6ebbd16`.
 
-**Fix**: Swap constants in `glock.go` and `letcd_netlink.h` to match GFS2: `SH=1, EX=3, DF=2`.
+### FIXED: LockRequest struct size mismatch
+The kernel binary (built July 3) has `sizeof(letcd_lock_req)=24` (no `node_epoch` field). The Go `LockRequest` struct had `NodeEpoch int64` making it 32 bytes, causing `binary.Read` to fail silently and all lock requests to be dropped by the agent. Removed `NodeEpoch` from Go and both headers. Fixed in commit `f26c189`.
 
-### CRITICAL: Ordered list never cleaned on unmount
+### CRITICAL: Multi-node mount blocked by journal lock contention
+When node 0 mounts, it acquires `type=1 num=1` (journal for jid=0) in EX mode via `ProcessLock` and holds it permanently (GFS2 journal lock is held while filesystem is mounted). When node 1 mounts, GFS2 requests `type=1 num=1 mode=3` (EX) to check journal recovery. Agent sees contention → sends WAIT → `retryProcessLock` polls `ProcessLock` every 200ms forever with `context.Background()` (no timeout). BAST is sent to node 0's kernel (`gfs2_glock_cb`), but GFS2 ignores BAST on journal locks because the glock has active holders. The mount process on node 1 is stuck in D-state (uninterruptible) until node 0 unmounts.
+
+**Fix**: Agent must detect journal lock requests (`type=1, num>=1, mode=EX`) held by live nodes and send DENY immediately instead of WAIT. No retry goroutine, no waiter added. The kernel receives DENY → `gfs2_glock_complete(gl, -EAGAIN)` → GFS2 skips journal recovery for that journal. Additionally, `retryProcessLock` must use a context with timeout (120s) to prevent infinite polling for other lock types.
+
+### BUG: Ordered list never cleaned on unmount
 `letcd_ordered_list` in `lock_etcd_lock.c` is a static global list. When mount fails mid-way (e.g. agent returns WAIT for journal RG demote), the ordered entry stays in the list with `completed=false`. Since the list is static, it persists across mount/unmount cycles. Every subsequent `ord=` completion prints `ORD-NEXT ord=0x020000000000c395` but the stuck entry never clears. This blocks any new lock request whose order key is higher than the orphaned entry's.
 
-**Fix**: Add `letcd_ordered_cleanup()` called from `lock_etcd_unmount()` to drain and wake all waiters, and `list_del_init` all entries.
+**Fix**: Add `letcd_ordered_cleanup()` called from `lock_etcd_unmount()` to drain and wake all waiters, and `list_del_init` all entries. Requires kernel rebuild.
 
 ### BUG: Agent starts before gfs2 module after reboot
-After reboot, systemd starts cluster-agent before gfs2 module is loaded. Agent logs: `"netlink server unavailable (kernel module not loaded?): netlink socket: protocol not supported"`. Mount then fails with `"Transport endpoint is not connected"`. Restarting agent after `modprobe gfs2` fixes it.
+After reboot, systemd starts cluster-agent before gfs2 module is loaded. Agent logs: `"netlink server unavailable (kernel module not loaded?): netlink socket: protocol not supported"`. Mount then fails with `"Transport endpoint is not connected"`.
 
-**Fix**: Add `ExecStartPre=/sbin/modprobe gfs2` to `cluster-agent.service`, or ensure `setup-compute.sh` adds a systemd dependency.
+**Fix**: Already applied — `ExecStartPre=/sbin/modprobe gfs2` is in the systemd unit. Verify it works on all nodes.
+
+## Todo plan
+
+### Priority 1 — Multi-node mount
+- [ ] Agent: detect journal lock contention (type=1, num>=1, EX mode, held by live node) → send DENY, skip waiter
+- [ ] Agent: add 120s timeout to `retryProcessLock` context — on expiry, send DENY and clean up wait entries
+- [ ] Test: 3-node mount + concurrent I/O stress
+
+### Priority 2 — Kernel correctness (requires kernel rebuild)
+- [ ] Fix `gfs2_glock_complete(gl, grant->granted_mode)` → pass `ret=0` on success
+- [ ] Move inline-SH fast-path outside yield-suppress block (currently only activates during yield)
+- [ ] Add `letcd_ordered_cleanup()` for ordered list drain on unmount
+
+### Priority 3 — Agent robustness (no kernel changes)
+- [ ] Fix `isEndpointHealthy` client leak: each health check creates new `clientv3.New(DialTimeout:10s)` while ticker fires every 2s
+- [ ] Fix `hasExistingData` restart: writes `initial-cluster` with all 3 members even for single-node clusters, causing etcd to await nonexistent quorum
+- [ ] Remove debug `netlink recv/dispatch` log lines in `server.go`
+- [ ] Revert unnecessary `nlh.Pid` and `nlh.Type` changes in `sendMsg` (or document properly)
+
+### Priority 4 — Script determinism
+- [ ] deploy-kernel.sh: verify custom kernel boots after reboot (check `uname -r`)
+- [ ] setup-compute.sh: ensure idempotent re-runs on partially configured nodes
+
+### Priority 5 — Documentation
+- [ ] Update `docs/` to reflect removed `NodeEpoch` and fixed lock mode constants
+- [ ] Remove stale known-bug entries from docs referencing inverted lock modes
 
 ## Additional docs
 
