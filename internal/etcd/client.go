@@ -476,6 +476,40 @@ func (c *Client) AmIHolder(ctx context.Context, lockType uint32, lockNumber uint
 	return isHolder(getResp.Kvs[0].Value, nodeID)
 }
 
+// ForceGrant appends this node to the holders array unconditionally,
+// skipping conflict checks. Used for superblock EX→EX convergence
+// during multi-node mount (both nodes need brief EX access).
+func (c *Client) ForceGrant(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (int64, error) {
+	key := lockKey(lockType, lockNumber)
+
+	for {
+		getResp, err := c.cli.Get(ctx, key)
+		if err != nil {
+			return 0, err
+		}
+
+		ver := int64(0)
+		holders := []lockEntry{}
+		if len(getResp.Kvs) > 0 {
+			ver = getResp.Kvs[0].Version
+			holders = parseHolders(getResp.Kvs[0].Value)
+		}
+
+		holders = append(holders, lockEntry{Node: nodeID, Mode: mode})
+		val := marshalHolders(holders)
+		txnResp, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+			Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
+			Commit()
+		if err != nil {
+			return 0, err
+		}
+		if txnResp.Succeeded {
+			return txnResp.Header.Revision, nil
+		}
+	}
+}
+
 // ReleaseLock removes this node's entry from the holders array.
 // If the array becomes empty, the key is deleted.
 // Retries on CAS version mismatch (concurrent multi-holder release).

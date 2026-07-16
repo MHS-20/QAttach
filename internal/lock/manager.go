@@ -75,6 +75,30 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
+		// Superblock (type=1 num=0) EX contention: GFS2 needs EX
+		// only during mount init (reading metadata). Both nodes
+		// can share — force-grant as PR in etcd. After mount,
+		// GFS2 releases EX and reacquires SH, converging
+		// naturally. This bypasses the find_first_holder()
+		// blocker that prevents BAST-driven demotion.
+		if req.GlockType == protocol.LockTypeNondisk &&
+			req.GlockNumber == 0 &&
+			req.RequestedMode == protocol.LockModeExclusive &&
+			!wasHolder {
+			rev2, err := m.etcdCli.ForceGrant(ctx,
+				req.GlockType, req.GlockNumber,
+				m.nodeID, protocol.EtcdModePR)
+			if err == nil {
+				log.Printf("superblock force-grant: type=%d num=%d as PR",
+					req.GlockType, req.GlockNumber)
+				m.sendGrant(req.RequestID,
+					req.RequestedMode, rev2)
+				m.trackHeldLock(req.GlockType,
+					req.GlockNumber, protocol.EtcdModePR)
+				return
+			}
+		}
+
 		// Journal lock (type=1, num>=1) held by another live node:
 		// the holder won't release (GFS2 ignores BAST on journal locks).
 		// Deny immediately so the kernel's mount skips this journal.
