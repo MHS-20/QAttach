@@ -214,5 +214,51 @@ wait_for_etcd() {
     return 1
 }
 
+# wait_for_agent_ready <ip> [max_retries] [delay_secs]
+# Waits for the cluster-agent to be fully ready:
+#   1. systemd unit is active (process running)
+#   2. local etcd is healthy (cluster bootstrapped/joined)
+#   3. agent has registered with the kernel netlink socket (dmesg check)
+wait_for_agent_ready() {
+    local ip="$1"
+    local max_retries="${2:-60}"
+    local delay="${3:-2}"
+    local i=0
+    while [[ $i -lt $max_retries ]]; do
+        local active
+        active=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active cluster-agent 2>/dev/null || true" 2>/dev/null)
+        if [[ "$active" != "active" ]]; then
+            i=$((i + 1))
+            sleep "$delay"
+            continue
+        fi
+
+        local etcd_ok
+        etcd_ok=$(ssh $SSH_OPTS "ec2-user@${ip}" \
+            "sudo ETCDCTL_API=3 etcdctl \
+              --endpoints=https://localhost:2379 \
+              --cacert=/etc/cluster-agent/ca.crt \
+              --cert=/etc/cluster-agent/client.crt \
+              --key=/etc/cluster-agent/client.key \
+              endpoint health 2>&1 | grep -c 'is healthy'" 2>/dev/null || true)
+        if [[ "$etcd_ok" != "1" ]]; then
+            i=$((i + 1))
+            sleep "$delay"
+            continue
+        fi
+
+        local reg
+        reg=$(ssh $SSH_OPTS "ec2-user@${ip}" "sudo dmesg 2>/dev/null | grep -c 'agent registered'" 2>/dev/null || true)
+        if [[ "$reg" -lt 1 ]]; then
+            i=$((i + 1))
+            sleep "$delay"
+            continue
+        fi
+
+        return 0
+    done
+    return 1
+}
+
 # init state on source
 state_init
