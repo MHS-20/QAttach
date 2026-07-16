@@ -240,7 +240,7 @@ wait_for_agent_ready() {
               --cacert=/etc/cluster-agent/ca.crt \
               --cert=/etc/cluster-agent/client.crt \
               --key=/etc/cluster-agent/client.key \
-              endpoint health 2>&1 | grep -c 'is healthy'" 2>/dev/null || true)
+              endpoint health 2>&1 | grep -c 'is healthy' | tr -d '[:space:]'" 2>/dev/null || echo 0)
         if [[ "$etcd_ok" != "1" ]]; then
             i=$((i + 1))
             sleep "$delay"
@@ -248,8 +248,8 @@ wait_for_agent_ready() {
         fi
 
         local reg
-        reg=$(ssh $SSH_OPTS "ec2-user@${ip}" "sudo dmesg 2>/dev/null | grep -c 'agent registered'" 2>/dev/null || true)
-        if [[ "$reg" -lt 1 ]]; then
+        reg=$(ssh $SSH_OPTS "ec2-user@${ip}" "sudo dmesg 2>/dev/null | grep -c 'agent registered' | tr -d '[:space:]'" 2>/dev/null || echo 0)
+        if [[ "$reg" != "0" ]]; then
             i=$((i + 1))
             sleep "$delay"
             continue
