@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -67,8 +68,9 @@ func (s *Server) Serve() error {
 		default:
 		}
 
-		n, _, err := syscall.Recvfrom(s.fd, buf, 0)
+		n, from, err := syscall.Recvfrom(s.fd, buf, 0)
 		if err != nil {
+			log.Printf("netlink recv error: %v", err)
 			select {
 			case <-s.done:
 				return nil
@@ -76,6 +78,8 @@ func (s *Server) Serve() error {
 				return fmt.Errorf("netlink recv: %w", err)
 			}
 		}
+
+		log.Printf("netlink recv: n=%d from=%v", n, from)
 
 		if n < syscall.NLMSG_HDRLEN {
 			continue
@@ -105,8 +109,11 @@ func (s *Server) Stop() {
 
 func (s *Server) dispatch(msgType uint16, payload []byte) {
 	if s.handler == nil {
+		log.Printf("netlink dispatch: no handler set, msgType=%d len=%d", msgType, len(payload))
 		return
 	}
+
+	log.Printf("netlink dispatch: msgType=%d len=%d", msgType, len(payload))
 
 	switch uint32(msgType) {
 	case protocol.MsgLockReq:
@@ -184,13 +191,14 @@ func (s *Server) sendMsg(msgType uint32, v interface{}) error {
 
 	payload := body.Bytes()
 
-	// Build netlink message
+	// Build netlink message — the kernel reads nlmsg_pid as the sender.
+	// We must set it to our own PID so the kernel can unicast replies back.
 	nlh := syscall.NlMsghdr{
 		Len:   uint32(syscall.NLMSG_HDRLEN + len(payload)),
-		Type:  uint16(protocol.LetcdNetlinkFamily),
+		Type:  uint16(msgType),
 		Flags: 0,
 		Seq:   0,
-		Pid:   0, // to kernel
+		Pid:   uint32(os.Getpid()),
 	}
 
 	buf := make([]byte, nlh.Len)
@@ -203,7 +211,7 @@ func (s *Server) sendMsg(msgType uint32, v interface{}) error {
 
 	sa := &syscall.SockaddrNetlink{
 		Family: syscall.AF_NETLINK,
-		Pid:    0, // kernel
+		Pid:    0, // to kernel
 	}
 
 	err := syscall.Sendto(s.fd, buf, 0, sa)

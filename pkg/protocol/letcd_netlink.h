@@ -27,9 +27,9 @@
 
 /* Lock modes — must match GFS2 LM_ST_* exactly */
 #define LETCD_LM_ST_UNLOCKED  0
-#define LETCD_LM_ST_EXCLUSIVE 1
+#define LETCD_LM_ST_SHARED    1
 #define LETCD_LM_ST_DEFERRED  2
-#define LETCD_LM_ST_SHARED    3
+#define LETCD_LM_ST_EXCLUSIVE 3
 
 /* Deny reasons */
 #define LETCD_DENY_CONTENDED   1
@@ -42,7 +42,6 @@ struct letcd_lock_req {
 	__u64 glock_number;
 	__u32 glock_type;
 	__u32 requested_mode;
-	__s64 node_epoch;       /* kernel's last-known epoch (0 = pre-epoch) */
 };
 
 struct letcd_lock_grant {

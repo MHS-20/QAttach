@@ -20,12 +20,12 @@ const (
 )
 
 // Lock modes — must match GFS2 LM_ST_* constants exactly.
-// GFS2 glock.h: LM_ST_UNLOCKED=0, LM_ST_EXCLUSIVE=1, LM_ST_DEFERRED=2, LM_ST_SHARED=3
+// GFS2 glock.h: LM_ST_UNLOCKED=0, LM_ST_SHARED=1, LM_ST_DEFERRED=2, LM_ST_EXCLUSIVE=3
 const (
 	LockModeUnlocked  = 0
-	LockModeExclusive = 1
+	LockModeShared    = 1
 	LockModeDeferred  = 2
-	LockModeShared    = 3
+	LockModeExclusive = 3
 )
 
 // etcd lock mode representation.

@@ -382,7 +382,7 @@ FORMAT
 set -e
 EBS_DEV=\"${EBS_DEV}\"
 sudo mkdir -p /mnt/shared
-sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs,noatime \\
+sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs \\
     \"\$EBS_DEV\" /mnt/shared
 echo 'GFS2 mounted'
 df -h /mnt/shared
@@ -420,7 +420,7 @@ df -h /mnt/shared
 set -e
 EBS_DEV=\"${EBS_DEV}\"
 sudo mkdir -p /mnt/shared
-sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs,noatime \\
+sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs \\
     \"\$EBS_DEV\" /mnt/shared
 echo 'GFS2 mounted'
 df -h /mnt/shared

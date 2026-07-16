@@ -48,20 +48,8 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 	go func() {
 		ctx := context.Background()
 
-		log.Printf("lock request: id=%d type=%d num=%d mode=%d epoch=%d",
-			req.RequestID, req.GlockType, req.GlockNumber, req.RequestedMode, req.NodeEpoch)
-
-		if req.NodeEpoch > 0 {
-			m.mu.Lock()
-			curEpoch := m.epoch
-			m.mu.Unlock()
-			if curEpoch > req.NodeEpoch {
-				log.Printf("lock deny: stale epoch node=%d cluster=%d type=%d num=%d",
-					req.NodeEpoch, curEpoch, req.GlockType, req.GlockNumber)
-				m.sendDeny(req.RequestID, protocol.DenyReasonStaleEpoch)
-				return
-			}
-		}
+		log.Printf("lock request: id=%d type=%d num=%d mode=%d",
+			req.RequestID, req.GlockType, req.GlockNumber, req.RequestedMode)
 
 		mode := protocol.LockModeToEtcd(req.RequestedMode)
 		if mode == "" {

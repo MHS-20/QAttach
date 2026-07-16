@@ -27,7 +27,6 @@ type LockRequest struct {
 	GlockNumber   uint64
 	GlockType     uint32
 	RequestedMode uint32
-	NodeEpoch     int64 // node's last-known cluster epoch (0 = pre-epoch kernel)
 }
 
 // LockGrant sent from agent to kernel on successful acquisition.
