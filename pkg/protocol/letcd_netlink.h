@@ -27,9 +27,9 @@
 
 /* Lock modes — must match GFS2 LM_ST_* exactly */
 #define LETCD_LM_ST_UNLOCKED  0
-#define LETCD_LM_ST_SHARED    1
+#define LETCD_LM_ST_EXCLUSIVE 1
 #define LETCD_LM_ST_DEFERRED  2
-#define LETCD_LM_ST_EXCLUSIVE 3
+#define LETCD_LM_ST_SHARED    3
 
 /* Deny reasons */
 #define LETCD_DENY_CONTENDED   1

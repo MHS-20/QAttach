@@ -31,11 +31,23 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		return 0;
 	}
 
+	/* TRY/TRY_1CB: caller does not want to block.  Complete
+	 * synchronously with LM_OUT_TRY_AGAIN (0x20) — GFS2's
+	 * finish_xmote treats this as a non-fatal "try again" error
+	 * and skips the lock without aborting the mount.  Used for
+	 * mount-time journal recovery checks on other nodes' journals. */
+	if (flags & (LM_FLAG_TRY | LM_FLAG_TRY_1CB)) {
+		pr_info("  TRY-DENY t=%u n=%llu mode=%u fl=0x%x\n",
+			gl->gl_name.ln_type, gl->gl_name.ln_number,
+			req_state, flags);
+		gfs2_glock_complete(gl, LM_OUT_TRY_AGAIN);
+		return 0;
+	}
+
 	req.request_id     = atomic64_inc_return(&letcd_req_counter);
 	req.glock_number   = gl->gl_name.ln_number;
 	req.glock_type     = gl->gl_name.ln_type;
 	req.requested_mode = req_state;
-	req.node_epoch     = letcd_mount_ctx.mount_epoch;
 
 	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
 		req.glock_type, req.glock_number,
