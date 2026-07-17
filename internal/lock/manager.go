@@ -75,35 +75,10 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
-		// Superblock (type=1 num=0) EX contention: GFS2 needs EX
-		// only during mount init (reading metadata). Both nodes
-		// can share — force-grant as PR in etcd. After mount,
-		// GFS2 releases EX and reacquires SH, converging
-		// naturally. This bypasses the find_first_holder()
-		// blocker that prevents BAST-driven demotion.
-		if req.GlockType == protocol.LockTypeNondisk &&
-			req.GlockNumber == 0 &&
-			req.RequestedMode == protocol.LockModeExclusive &&
-			!wasHolder {
-			rev2, err := m.etcdCli.ForceGrant(ctx,
-				req.GlockType, req.GlockNumber,
-				m.nodeID, protocol.EtcdModePR)
-			if err == nil {
-				log.Printf("superblock force-grant: type=%d num=%d as PR",
-					req.GlockType, req.GlockNumber)
-				m.sendGrant(req.RequestID,
-					req.RequestedMode, rev2)
-				m.trackHeldLock(req.GlockType,
-					req.GlockNumber, protocol.EtcdModePR)
-				return
-			}
-		}
-
-		// Journal lock (type=1, num>=1) held by another live node:
-		// the holder won't release (GFS2 ignores BAST on journal locks).
+		// Journal lock (type=9) held by another live node:
+		// the holder won't release (GFS2 holds journal EX while mounted).
 		// Deny immediately so the kernel's mount skips this journal.
-		if req.GlockType == protocol.LockTypeNondisk &&
-			req.GlockNumber >= 1 &&
+		if req.GlockType == protocol.LockTypeJournal &&
 			req.RequestedMode == protocol.LockModeExclusive {
 			log.Printf("journal lock denied: type=%d num=%d — held by live node, skipping",
 				req.GlockType, req.GlockNumber)
@@ -347,16 +322,23 @@ func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumb
 		delete(m.heldLocks, mapKey)
 	}
 	m.mu.Unlock()
-	if !ok {
+
+	if ok {
+		hl.cancel()
+		if err := m.etcdCli.ReleaseLock(ctx, lockType, lockNumber, m.nodeID); err != nil {
+			log.Printf("release lock error type=%d num=%d: %v",
+				lockType, lockNumber, err)
+		}
+		log.Printf("released lock type=%d num=%d mode=%s",
+			lockType, lockNumber, hl.mode)
 		return
 	}
-	hl.cancel()
+
+	// Untracked — still clean up etcd.
 	if err := m.etcdCli.ReleaseLock(ctx, lockType, lockNumber, m.nodeID); err != nil {
-		log.Printf("release lock error type=%d num=%d: %v",
+		log.Printf("release untracked lock error type=%d num=%d: %v",
 			lockType, lockNumber, err)
 	}
-	log.Printf("released lock type=%d num=%d mode=%s",
-		lockType, lockNumber, hl.mode)
 }
 
 func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
@@ -369,26 +351,31 @@ func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
 		delete(m.heldLocks, mapKey)
 	}
 	m.mu.Unlock()
-	if !ok {
-		return
-	}
-	hl.cancel()
 
-	// Handoff to the first waiter — atomically removes the lock key
-	// and writes a /next marker for the designated next holder.
-	target, err := m.etcdCli.HandoffRelease(ctx,
-		req.GlockType, req.GlockNumber, m.nodeID)
-	if err != nil {
-		log.Printf("handoff error type=%d num=%d: %v",
-			req.GlockType, req.GlockNumber, err)
+	if ok {
+		hl.cancel()
+		target, err := m.etcdCli.HandoffRelease(ctx,
+			req.GlockType, req.GlockNumber, m.nodeID)
+		if err != nil {
+			log.Printf("handoff error type=%d num=%d: %v",
+				req.GlockType, req.GlockNumber, err)
+			return
+		}
+		if target != "" {
+			log.Printf("handoff: type=%d num=%d → %s",
+				req.GlockType, req.GlockNumber, target)
+		}
+		log.Printf("released lock type=%d num=%d mode=%s",
+			req.GlockType, req.GlockNumber, hl.mode)
 		return
 	}
-	if target != "" {
-		log.Printf("handoff: type=%d num=%d → %s",
-			req.GlockType, req.GlockNumber, target)
+
+	// Lock not tracked locally (agent restarted, or untracked
+	// lock type).  Still release from etcd so the key is cleaned up.
+	if err := m.etcdCli.ReleaseLock(ctx, req.GlockType, req.GlockNumber, m.nodeID); err != nil {
+		log.Printf("release untracked lock error type=%d num=%d: %v",
+			req.GlockType, req.GlockNumber, err)
 	}
-	log.Printf("released lock type=%d num=%d mode=%s",
-		req.GlockType, req.GlockNumber, hl.mode)
 }
 
 func (m *Manager) HandleUnmount() {
