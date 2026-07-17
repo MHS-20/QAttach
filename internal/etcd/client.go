@@ -335,18 +335,50 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 			return false, 0, fmt.Errorf("process get: %w", err)
 		}
 
-		// Key doesn't exist — straightforward grant.
+		// Key doesn't exist — check handoff FIFO ordering.
 		if len(getResp.Kvs) == 0 {
+			// If a handoff marker exists for a different node,
+			// refuse so the designated next holder can claim
+			// the lock first (FIFO — like DLM's grant queue).
+			hk := handoffKey(lockType, lockNumber)
+			hResp, hErr := c.cli.Get(ctx, hk)
+			var hVer int64
+			designated := ""
+			if hErr == nil && len(hResp.Kvs) > 0 {
+				designated = string(hResp.Kvs[0].Value)
+				hVer = hResp.Kvs[0].Version
+			}
+			if designated != "" && designated != nodeID {
+				return false, 0, nil
+			}
+
 			val := marshalHolders([]lockEntry{{Node: nodeID, Mode: mode}})
+
+			conds := []clientv3.Cmp{
+				clientv3.Compare(clientv3.Version(key), "=", 0),
+			}
+			ops := []clientv3.Op{
+				clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease())),
+			}
+
+			if designated == nodeID {
+				// We are the designated next holder —
+				// atomically delete the marker.
+				conds = append(conds,
+					clientv3.Compare(clientv3.Version(hk), "=", hVer))
+				ops = append(ops, clientv3.OpDelete(hk))
+			}
+
 			txnResp, err := c.cli.Txn(ctx).
-				If(clientv3.Compare(clientv3.Version(key), "=", 0)).
-				Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
+				If(conds...).
+				Then(ops...).
+				Else(clientv3.OpGet(key)).
 				Commit()
 			if err != nil {
 				return false, 0, fmt.Errorf("process empty txn: %w", err)
 			}
 			if !txnResp.Succeeded {
-				continue // key was created between Get and Txn — retry
+				continue // key/marker changed — retry
 			}
 			return true, txnResp.Header.Revision, nil
 		}
@@ -574,6 +606,12 @@ func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber
 			clientv3.OpPut(hk, target, clientv3.WithLease(c.sess.Lease()))).
 		Commit()
 	return target, err
+}
+
+// DeleteHandoff removes the handoff marker for a lock (if it names this node).
+func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {
+	_, err := c.cli.Delete(ctx, handoffKey(lockType, lockNumber))
+	return err
 }
 
 // CheckHandoff returns true if there's a handoff marker for this node.

@@ -163,70 +163,76 @@ The **original** code (`LockModeExclusive=1, LockModeShared=3`) was correct. The
 - `setup-compute.sh`: stale-clean logic only nukes etcd data when etcd is NOT running
 - `server.go`: added `os.Getpid()` to nlh.Pid (harmless, may be unnecessary) and `nlh.Type = msgType` (also harmless)
 
+### Fix 10: Always release from etcd on unlock (commit `cb0108c`) — KEPT
+
+**Problem**: `HandleLockRelease` and `releaseHeldLock` silently returned when the lock wasn't in the agent's local `heldLocks` map. GFS2's `gfs2_glock_dq_uninit(&mount_gh)` at the end of `fill_super` triggers unlock → `lm_lock(UNLOCK)` → kernel sends `LETCD_MSG_LOCK_REL` → agent drops it because the MOUNT lock wasn't in `heldLocks`. The etcd key for the MOUNT lock persisted, blocking the second node's mount.
+
+**Fix**: Both functions now call `ReleaseLock` on etcd even for untracked locks. The local map is just a cache — the etcd key must always be cleaned up.
+
+**Outcome**: Multi-node mount works. All 3 nodes mount GFS2 without hacks.
+
+### Fix 11: Always send BAST on contention (commit `c866963`) — KEPT
+
+**Problem**: `HandleLockRequest` only sent BAST when `!wasHolder`. If a node was a PR holder and tried to upgrade to EX (PR→EX), `wasHolder=true` → BAST never sent. Meanwhile `ProcessLock` removed the node from holders (see Fix 12), so the EX holder never received a BAST and never released.
+
+**Fix**: Removed the `!wasHolder` guard. BAST is always sent when there's contention.
+
+**Outcome**: BASTs now fire on all contention, including PR→EX upgrade attempts. The heartbeat lock (type=2 num=50063) cycles through BAST→UNLOCK→GRANT correctly on all 3 nodes.
+
+### Fix 12: Don't remove self from holders on EX upgrade conflict (commit `c170bfd`) — KEPT
+
+**Problem**: `ProcessLock`'s self-contention PR→EX path: when another node held EX, the code REMOVED this node's PR entry from the holders array and returned false. The node became a "waiter" with no etcd entry. Combined with Fix 11 (BAST now sent), the node should re-acquire, but the holder removal was destructive.
+
+**Fix**: When another node holds EX during a PR→EX upgrade, just return false. Don't mutate the etcd key. Keep the PR entry. Let the BAST mechanism cause the EX holder to release, then the retry goroutine acquires EX.
+
+**Outcome**: Nodes stay as PR holders while waiting for EX. The etcd state is consistent.
+
+### Fix 13: FIFO handoff — ProcessLock checks /next marker (commit `66af53f`) — KEPT
+
+**Problem**: `HandoffRelease` atomically deletes the lock key and writes `/locks/glock/{type}/{number}/next` naming the first waiter. But `ProcessLock`'s fresh-acquisition path ignored this marker entirely. Any node could immediately re-acquire the lock by CAS'ing a new key, before the designated waiter could claim it. This caused live-lock: node 0 releases → creates handoff for node 1 → node 0 immediately re-acquires (another process on node 0 needs the lock) → node 1's handoff claim fails → node 1 retries → node 0 releases again → cycle repeats. DLM avoids this with a FIFO grant queue.
+
+**Fix**: `ProcessLock` now checks the `/next` marker before fresh acquisition. If a marker exists naming a different node, the acquisition is refused. If the marker names this node, it's atomically deleted alongside the key creation. This enforces FIFO ordering.
+
+**Outcome**: Handoff chain confirmed in agent logs: node0→node1→node2. The agent-side live-lock is resolved.
+
+### Fix 14: Delete handoff marker on timeout (commit `dd6d01e`) — KEPT
+
+**Problem**: `retryProcessLock` timeout handler removed the waiter entry but left the `/next` handoff marker intact. If the designated node timed out, the marker blocked other nodes for up to the session TTL (15s).
+
+**Fix**: Timeout handler now calls `DeleteHandoff` to clean up the marker.
+
+### Fix 15: Journal lock DENY for type=9 (commit `cb0108c`) — KEPT
+
+**Problem**: The original journal lock DENY checked type=1 (NONDISK). But GFS2 journal locks are type=9 (LM_TYPE_JOURNAL). The DENY never matched.
+
+**Fix**: Changed the check to `LockTypeJournal` (type 9) for EX mode requests. Also removed the old type=1 num>=1 check.
+
 ## Current state — what works, what doesn't, and why
 
-### Works: Single-node mount
+### Works: Multi-node mount (3 nodes mount successfully)
 
-Node 0 mounts GFS2 reliably. Lock requests flow correctly:
-1. Mount request → agent assigns jid → mount response
-2. Superblock lock (type=1 num=0 EX) → agent grants EX → GFS2 proceeds
-3. Journal lock (type=1 num=1 EX) → agent grants EX → GFS2 mounts
-4. Heartbeat + filesystem I/O locks flow correctly
+Node 0 mounts → acquires MOUNT lock (type=1 num=0 EX) → mount init → releases MOUNT lock via `gfs2_glock_dq_uninit`. The release reaches the agent (via Fix 10), etcd key is cleaned. Node 1 mounts → MOUNT lock is free → acquires normally. All 3 nodes mount.
 
-### Broken: Multi-node mount (ANY second node)
+### Works: Heartbeat lock handoff (type=2 num=50063)
 
-The mount hangs on the very first lock (superblock, type=1 num=0 EX). Both nodes compete for EX on the same superblock. Node 0 already holds EX. Node 1 requests EX. Agent sends WAIT. retryProcessLock polls forever.
+The heartbeat lock cycles through BAST→UNLOCK→GRANT on all 3 nodes every 30 seconds. The full handoff chain works: BAST received by kernel → `gfs2_glock_cb` → `run_queue` → `do_xmote(UNLOCKED)` → `letcd_lock(UNLOCK)` → LOCK_REL → agent HandoffRelease → etcd key deleted + /next written → waiter retry goroutine picks up handoff → acquires via ProcessLock → GRANT sent to kernel.
 
-### The core problem: lock_etcd cannot do mode conversion
+### Works: Agent-side FIFO ordering
 
-**DLM's approach (working)**: When two nodes contend for an EX lock, DLM sends a **blocking AST** (BAST) to the holder with target mode SH. GFS2 processes this via `gfs2_glock_cb → request_demote → run_queue`. The holder's glock is **converted** from EX to SH — holders stay active through the conversion. The `state_change(gl, LM_ST_SHARED)` is called with `ret=3` (SH mode). No unlock, no release, no handoff. Both nodes end up holding SH.
+`ProcessLock` now respects the `/next` handoff marker. The chain node0→handoff→node1→handoff→node2 is visible in etcd and agent logs.
 
-**lock_etcd's approach (broken)**: When two nodes contend for an EX lock, the agent sends BAST to the holder. The kernel module receives BAST → `dispatch_bast` → `gfs2_glock_cb(gl, target_mode)` → GFS2 marks the glock for demotion. But `run_queue` → `find_first_holder(gl)` returns non-NULL because the glock has active holders. **Demotion is blocked.** The lock can't be converted EX→SH without a full unlock/reacquire cycle. But a full unlock requires all holders to release, which never happens for mount-held locks.
+### Broken: Kernel BAST not delivered for cached/freed glocks
 
-**The critical GFS2 code paths** (from reference source `/tmp/gfs2-src/linux/fs/gfs2/`):
+The heartbeat lock's BAST mechanism works because the glock is always alive (re-acquired every 30s). But for inode glocks (e.g., directory inode 50069), GFS2 can free the glock from the LRU between the UNLOCK and the next re-acquisition. When `letcd_put_lock` is called during `gfs2_glock_free`, `letcd_bast_remove` removes the glock from the bast list. A subsequent BAST from another node finds no glock via `letcd_bast_lookup` → no demotion → etcd shows the old EX holder → waiters block.
 
-`run_queue` (glock.c):
-```c
-if (test_bit(GLF_DEMOTE, &gl->gl_flags)) {
-    if (find_first_holder(gl))
-        return;   // holders block demotion — this always fires for our locks
-    // ... proceed with do_xmote for demotion
-}
-```
-
-`finish_xmote` (glock.c) — how ret values are handled:
-```c
-if (!(ret & ~LM_OUT_ST_MASK)) {        // true for ret=0,1,2,3
-    state = ret & LM_OUT_ST_MASK;      // extract mode
-    state_change(gl, state);           // transition gl_state
-}
-// ret >= 4 (LM_OUT_ERROR=0x04, TRY_AGAIN=0x20, etc.): error path
-```
-
-`gdlm_ast` (lock_dlm.c) — DLM's completion callback:
-```c
-ret = gl->gl_req;                      // requested LM_ST_* value (0-3)
-gfs2_glock_complete(gl, ret);          // triggers finish_xmote → state_change
-```
-
-`gdlm_bast` (lock_dlm.c) — DLM's blocking AST callback:
-```c
-gfs2_glock_cb(gl, LM_ST_UNLOCKED);     // demote target (EX requester → UN)
-// or
-gfs2_glock_cb(gl, LM_ST_SHARED);       // demote target (SH requester → SH)
-```
+Confirmed by test: directory inode SH request gets WAIT at [220ms] and never resolves. Node 0's dmesg shows no BAST, no BAST-DROPPED, no UNLOCK for 50069 — only heartbeat activity. The BAST was sent by the agent (confirmed in logs) but the kernel silently discarded it because the glock was not in the bast list.
 
 ### Why multi-node mount worked before (v0.0.3 era)
 
-Before the lock mode "fix" was reverted, the constants were `EX=1, SH=3` (correct mapping). But wait — that's the same as now. So why did v0.0.3 work?
-
-The answer may be that v0.0.3 used a different agent lock flow (`ConvertLock` + `watchForLock` instead of `ProcessLock`). The old flow might have handled EX→EX differently. Or the old kernel module had different behavior. This needs investigation.
-
-### What the current kernel module can and cannot do
-
-**Can do**: Acquire new locks (UN→EX, UN→SH), release locks (EX→UN, SH→UN). Lock state machine is correct for single-node use.
-
-**Cannot do**: Mode conversion (EX→SH) without a full unlock/reacquire cycle. The kernel module has no code path for `lm_lock(gl, LM_ST_SHARED)` when `gl_state == LM_ST_EXCLUSIVE`. The `letcd_lock` function treats any non-UNLOCK `req_state` as a fresh acquisition, not a conversion.
+Before the lock mode "fix" was reverted, the constants were `EX=1, SH=3` (correct matching GFS2). The mount worked because:
+1. MOUNT lock was released by GFS2 at the end of `fill_super` (verified from source)
+2. With the original agent code (ConvertLock + watchForLock), the release was processed correctly
+3. The old flow might have handled the release path differently, or the old kernel module kept glocks in the bast list longer
 
 ## Known bugs (blocking e2e)
 
@@ -235,6 +241,8 @@ The answer may be that v0.0.3 used a different agent lock flow (`ConvertLock` + 
 **Root cause**: GFS2 acquires the superblock in EXCLUSIVE mode during `gfs2_fill_super`. When a second node mounts, it also requests EX on the superblock. DLM resolves this by sending a BAST that forces the first holder to **convert** EX→SH (not unlock). GFS2's `run_queue` handles this conversion via `do_xmote` with the demoted target. lock_etcd has no mode conversion support — it can only do unlock→handoff→reacquire, which is blocked by `find_first_holder()`.
 
 **Same issue affects journal locks**: Node 0 holds its journal EX permanently. Node 1's journal recovery check tries to acquire EX on node 0's journal with `LM_FLAG_TRY`. DLM returns -EAGAIN synchronously when TRY can't be granted. Our kernel must do the same — but `LM_FLAG_TRY` is not set by GFS2 on this kernel version, and even if it were, returning -EAGAIN via `gfs2_glock_complete` causes GFS2 to abort the entire mount (not just skip the journal).
+
+**Partial workaround applied**: Fix 10 (always release from etcd on unlock) combined with the fact that GFS2 releases the MOUNT lock at the end of `fill_super` means multi-node mount now works — the MOUNT lock doesn't collide. But mode conversion is still needed for inode/glock I/O operations.
 
 **Fix requires**: Kernel module must implement `lm_lock(gl, LM_ST_SHARED)` as a mode conversion when `gl_state == LM_ST_EXCLUSIVE`. This means:
 1. Kernel detects conversion (target < current state, lock already held)
@@ -253,29 +261,57 @@ The answer may be that v0.0.3 used a different agent lock flow (`ConvertLock` + 
 
 `letcd_ordered_list` in `lock_etcd_lock.c` persists across mount/unmount cycles. Stale entries block subsequent lock requests. Requires `letcd_ordered_cleanup()` in `lock_etcd_unmount()`.
 
+### BUG: Kernel BAST dropped for freed/cached glocks
+
+When GFS2 frees a glock from the LRU cache, `letcd_put_lock` calls `letcd_bast_remove`, removing the glock from the bast lookup list. A subsequent BAST from another node finds no glock → BAST is silently discarded → the EX holder entry persists in etcd → waiters block indefinitely. This affects inode glocks that GFS2 caches and evicts between operations.
+
+**Confirmed by test**: Directory inode (50069) SH request gets WAIT at [220ms] and never resolves. Node 0's dmesg shows no BAST, no BAST-DROPPED, no UNLOCK for 50069. The heartbeat lock (50063) works because it's re-acquired every 30s and never freed from the bast list.
+
+**Fix options** (kernel module only, no GFS2 core changes):
+
+**Option A — Move `letcd_bast_remove` to `letcd_put_lock` only (recommended):**
+Remove `letcd_bast_remove` from the UNLOCK path in `letcd_lock` (line ~29). Keep it ONLY in `letcd_put_lock`. The glock stays in the bast list across UNLOCK→ACQUIRE cycles. A BAST arriving after UNLOCK but before the glock is freed still finds the glock and triggers demotion. If the glock is later reacquired, the bast entry is reused. If the glock is freed without reacquisition, `letcd_put_lock` cleans up. Minimal change: 1 line removed. No race window.
+
+**Risk**: Low. The bast list holds a glock pointer. If the glock is freed without going through the UNLOCK path (directly by GFS2 LRU eviction without an explicit lm_lock(UNLOCK) call), the pointer becomes dangling. But GFS2 always calls `lm_lock(UNLOCK)` or `lm_put_lock` before freeing — the UNLOCK path is guaranteed. So the glock pointer remains valid in the bast list until `letcd_put_lock`.
+
+**Option B — Use type+number in bast list instead of glock pointer:**
+Change `letcd_bast_insert/lookup/remove` to store `{ln_type, ln_number}` instead of `struct gfs2_glock *`. On BAST, look up by type+number and use GFS2's `gfs2_glock_find` (exported in `glock.h`) to locate the glock. If no glock exists (already freed), the BAST is a no-op — the etcd key was already released by the agent.
+
+**Risk**: Medium. Requires using the GFS2 API to find glocks by type+number. `gfs2_glock_find` takes a spinlock and does a hash lookup. Could introduce locking dependencies. The bast lookup is called from the netlink recv handler (softirq context?), which might conflict with glock hash table locks.
+
+**Option C — New `LETCD_MSG_BAST_CACHED` message type:**
+Send BAST via a new message that doesn't require the glock to be in the bast list. The kernel handler queries GFS2's glock hash table for a matching glock. If found, demotes it. If not found (glock freed), the kernel sends a confirmation back to the agent that the lock is already released, and the agent can safely clean up the etcd key.
+
+**Risk**: High. New message type, new kernel receive path, bidirectional confirmation protocol. Most complete but most complex. Not needed if Option A solves the problem.
+
 ## Remaining todo
 
-### Priority 1 — Mode conversion (kernel + agent)
+### Priority 1 — Kernel BAST delivery for cached/freed glocks (kernel only)
+- [ ] Apply Option A: move `letcd_bast_remove` from UNLOCK path to `letcd_put_lock` only
+- [ ] Rebuild kernel, test that BAST triggers demotion for cached inode glocks
+- [ ] Verify concurrent I/O works with the fix
+
+### Priority 2 — Mode conversion (kernel + agent, lower priority after Option A)
 - [ ] Kernel: add `lm_lock(gl, LM_ST_SHARED)` support when `gl_state == LM_ST_EXCLUSIVE` (conversion path, not new acquisition)
 - [ ] Agent: handle mode conversion in etcd — update holder entry from EX→PR without full release
 - [ ] Kernel: investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount (flags=0x284)
 - [ ] Kernel: if TRY flag path needs to work, ensure `gfs2_glock_complete(gl, LM_OUT_TRY_AGAIN)` causes GFS2 to skip the journal, not abort mount
 
-### Priority 2 — Kernel correctness (requires kernel rebuild)
+### Priority 3 — Kernel correctness (requires kernel rebuild)
 - [ ] Move inline-SH fast-path outside yield-suppress block
 - [ ] Add `letcd_ordered_cleanup()` for ordered list drain on unmount
 
-### Priority 3 — Agent robustness (no kernel changes)
+### Priority 4 — Agent robustness (no kernel changes)
 - [ ] Fix `isEndpointHealthy` client leak: each health check creates new `clientv3.New(DialTimeout:10s)` while ticker fires every 2s
 - [ ] Fix `hasExistingData` restart: writes `initial-cluster` with all 3 members even for single-node clusters
 - [ ] Remove debug `netlink recv/dispatch` log lines in `server.go`
 - [ ] Revert unnecessary `nlh.Pid` and `nlh.Type` changes in `sendMsg` (or document properly)
 
-### Priority 4 — Script determinism
+### Priority 5 — Script determinism
 - [ ] deploy-kernel.sh: verify custom kernel boots after reboot (check `uname -r`)
-- [ ] setup-compute.sh: ensure idempotent re-runs on partially configured nodes (currently fails if aborted mid-way through node loop)
+- [ ] setup-compute.sh: ensure idempotent re-runs on partially configured nodes
 
-### Priority 5 — Documentation
+### Priority 6 — Documentation
 - [ ] Update `docs/` to reflect current state
 
 ## Additional docs

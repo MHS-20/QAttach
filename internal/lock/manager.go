@@ -234,26 +234,11 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 				req.GlockType, req.GlockNumber)
 			m.etcdCli.RemoveWaiter(context.Background(),
 				req.GlockType, req.GlockNumber, m.nodeID)
+			m.etcdCli.DeleteHandoff(context.Background(),
+				req.GlockType, req.GlockNumber)
 			m.sendDeny(req.RequestID, protocol.DenyReasonContended)
 			return
 		case <-ticker.C:
-			// Check handoff marker first — if the previous holder
-			// designated us, delete the marker and acquire immediately.
-			isHandoff, err := m.etcdCli.CheckHandoff(ctx,
-				req.GlockType, req.GlockNumber, m.nodeID)
-			if err == nil && isHandoff {
-				granted, rev, _, _, aerr := m.etcdCli.AcquireLock(ctx,
-					req.GlockType, req.GlockNumber, m.nodeID, mode)
-				if aerr == nil && granted {
-					log.Printf("retry handoff acquired: type=%d num=%d rev=%d",
-						req.GlockType, req.GlockNumber, rev)
-					m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-					m.sendGrant(req.RequestID, req.RequestedMode, rev)
-					m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
-					return
-				}
-			}
-
 			granted, rev, err := m.etcdCli.ProcessLock(ctx,
 				req.GlockType, req.GlockNumber, m.nodeID, mode)
 			if err != nil {
