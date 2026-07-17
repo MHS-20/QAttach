@@ -384,25 +384,12 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 						continue
 					}
 					if h.Mode == "EX" {
-						// Another node already has EX — remove
-						// our entry and become a waiter.
-						newH := make([]lockEntry, 0, len(holders)-1)
-						for j, h2 := range holders {
-							if j != ourIdx {
-								newH = append(newH, h2)
-							}
-						}
-						txnResp, err := c.cli.Txn(ctx).
-							If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-							Then(clientv3.OpPut(key, marshalHolders(newH),
-								clientv3.WithLease(c.sess.Lease()))).
-							Commit()
-						if err != nil {
-							return false, 0, fmt.Errorf("process remove-self txn: %w", err)
-						}
-						if !txnResp.Succeeded {
-							continue
-						}
+						// Another node holds EX — can't
+						// upgrade.  Keep our PR entry
+						// and return false.  The BAST
+						// mechanism will cause the EX
+						// holder to release; the retry
+						// goroutine will acquire EX then.
 						return false, 0, nil
 					}
 				}
