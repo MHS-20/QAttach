@@ -118,13 +118,35 @@ if [[ -z \"\$CUSTOM_INITRD\" ]]; then
 fi
 echo \"Custom initrd: \$CUSTOM_INITRD (\$(du -h \"\$CUSTOM_INITRD\" | cut -f1))\"
 
-# Set default kernel with grubby
-sudo grubby --info=\"\$CUSTOM_VMLINUZ\" >/dev/null 2>&1 || \
-    sudo grubby --add-kernel=\"\$CUSTOM_VMLINUZ\" --initrd=\"\$CUSTOM_INITRD\" --title='Custom lock_etcd kernel' --copy-default
-sudo grubby --set-default=\"\$CUSTOM_VMLINUZ\"
-echo 'Default kernel set'
+# Rebuild module dependencies for the custom kernel
+CUSTOM_KVER=\$(ls /lib/modules/ | grep -v amzn | head -1)
+echo \"Running depmod for \$CUSTOM_KVER...\"
+sudo depmod -a \"\$CUSTOM_KVER\" 2>/dev/null || true
 
-# Remove stale etcd config so old etcd does not auto-start after reboot.
+# Register kernel with grubby
+sudo grubby --info=\"\$CUSTOM_VMLINUZ\" >/dev/null 2>&1 || \
+    sudo grubby --add-kernel=\"\$CUSTOM_VMLINUZ\" --initrd=\"\$CUSTOM_INITRD\" \\
+        --title='Custom lock_etcd kernel' --copy-default
+
+# Set as default and regenerate GRUB config
+sudo grubby --set-default=\"\$CUSTOM_VMLINUZ\"
+sudo grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
+
+# Verify default
+DEFAULT=\$(sudo grubby --default-kernel 2>/dev/null)
+echo \"Default kernel: \$DEFAULT\"
+if [[ \"\$DEFAULT\" != \"\$CUSTOM_VMLINUZ\" ]]; then
+    echo 'WARNING: grubby --set-default did not take effect'
+    # Try grub2-set-default as fallback
+    KERNEL_INDEX=\$(sudo grubby --info=ALL 2>/dev/null | grep -n 'Custom lock_etcd' | head -1 | cut -d: -f1)
+    if [[ -n \"\$KERNEL_INDEX\" ]]; then
+        sudo grub2-set-default \$((KERNEL_INDEX - 1))
+        sudo grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
+        echo \"Fallback: set grub2 default to index \$((KERNEL_INDEX - 1))\"
+    fi
+fi
+
+# Remove stale etcd config
 sudo rm -rf /var/lib/etcd /etc/systemd/system/etcd.service.d /etc/etcd/etcd.args 2>/dev/null || true
 
 echo 'Rebooting...'
@@ -142,11 +164,11 @@ for ip in "${IPS[@]}"; do
     for i in $(seq 1 40); do
         if $SSH_CMD -o ConnectTimeout=5 "ec2-user@${ip}" "uname -r" 2>/dev/null | grep -q "6.18"; then
             KVER=$($SSH_CMD "ec2-user@${ip}" "uname -r")
-            log "  $ip is up: $KVER"
+            log \"  \$ip is up: \$KVER\"
             break
         fi
-        if [[ $i -eq 40 ]]; then
-            log "ERROR: $ip did not come back after reboot"
+        if [[ \$i -eq 40 ]]; then
+            log \"ERROR: \$ip did not come back after reboot\"
             exit 1
         fi
         sleep 5
