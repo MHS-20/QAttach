@@ -57,9 +57,6 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
-		wasHolder := m.etcdCli.AmIHolder(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID)
-
 		granted, rev, err := m.etcdCli.ProcessLock(ctx,
 			req.GlockType, req.GlockNumber, m.nodeID, mode)
 		if err != nil {
@@ -87,11 +84,9 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		}
 
 		// WAIT — conflicts exist.  Start the retry goroutine.
-		if !wasHolder {
-			m.etcdCli.AddWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-			m.etcdCli.RequestBast(ctx,
-				req.GlockType, req.GlockNumber, 0, m.nodeID)
-		}
+		m.etcdCli.AddWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
+		m.etcdCli.RequestBast(ctx,
+			req.GlockType, req.GlockNumber, 0, m.nodeID)
 		m.sendWait(req.RequestID)
 		go m.retryProcessLock(ctx, req, mode)
 	}()
