@@ -58,11 +58,15 @@ locks/
     Readers:  Holder's agent (WatchLockBast)
 
   glock/{type}/{number}/next
-    Purpose:  Atomic handoff reservation (experimental — currently unused)
+    Purpose:  FIFO handoff reservation (active — enforces lock ordering)
     Value:    waiter node_id
-    Lease:    Very short (5s)
+    Lease:    Releasing node's session lease (TTL=15s)
     Writers:  Holder (via HandoffRelease)
-    Readers:  Waiter (CheckHandoff)
+    Readers:  Waiter (CheckHandoff / ProcessLock)
+    Lifecycle: Created atomically with lock key deletion. ProcessLock
+               refuses acquisition if marker names a different node.
+               Deleted atomically when the designated node acquires.
+               Deleted by retryProcessLock on timeout.
 ```
 
 ## Lock Mode Semantics

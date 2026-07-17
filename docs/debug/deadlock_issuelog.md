@@ -195,4 +195,13 @@ See `docs/known-limitation-mount-glocks.md`.
 | 7 | Release all type-2/3 | Wrong diagnosis |
 | 8 | HasWaiter + yield | TOCTOU + self-yield + watch events |
 | 9 | Atomic handoff on yield | Untested |
-| 10 | Proactive BAST + persistent yield | Works for agent-mediated locks; hangs on mount-time glocks (quota) + sustained I/O livelock
+| 10 | Proactive BAST + persistent yield | Works for agent-mediated locks; hangs on mount-time glocks (quota) + sustained I/O livelock |
+| 11 | Always release from etcd on unlock | MOUNT lock not in heldLocks, release silently dropped — GFS2 releases MOUNT at end of fill_super but agent ignored it. Fixed: always call ReleaseLock even for untracked locks. Result: multi-node mount works. |
+| 12 | Always send BAST on contention | `!wasHolder` guard prevented BAST when node was PR holder trying to upgrade to EX. ProcessLock removed the node from holders but no BAST was sent. Fixed: removed the guard. |
+| 13 | Don't remove self from holders on EX conflict | ProcessLock removed the node's PR entry when another node held EX, making it a waiter with no etcd entry. Fixed: just return false, keep PR entry, let BAST release the EX holder. |
+| 14 | FIFO handoff via /next marker | ProcessLock's fresh-acquisition path ignored the handoff marker, allowing the releasing node to immediately reacquire. Fixed: check /next before granting; atomically delete marker when acquiring as designated node. |
+| 15 | Kernel BAST for freed/cached glocks (Option A) | `letcd_lock(UNLOCK)` removed glock from bast list via `bast_remove`. When glock was later freed and BAST arrived, `bast_lookup` returned NULL. Fixed: moved `bast_remove` from UNLOCK path to `letcd_put_lock` only. BAST→UNLOCK confirmed for directory inode. |
+
+## Current State (July 2026)
+
+Multi-node mount works. Light concurrent I/O works (1 op/5s per node, 3 shared files, 100% pass). High-frequency I/O (10 ops/s) still deadlocks due to etcd latency vs. GFS2 glock work scheduling. The kernel module's BAST delivery for cached glocks is fixed (Option A). Agent-side FIFO ordering is fixed (/next marker). See `AGENTS.md` for complete status and remaining todo.

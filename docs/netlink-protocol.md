@@ -91,13 +91,14 @@ Payload: struct letcd_lock_req {
     u64  glock_number
     u32  glock_type
     u32  requested_mode  // 0=UNLOCK, 1=EX, 2=DF, 3=SH
-    s64  node_epoch      // kernel's last-known cluster epoch
 }
+// Size: 24 bytes (kernel binary does not include node_epoch)
 ```
 
 Mode 0 (UNLOCK) means release the lock.  All other modes are acquire requests.
-`node_epoch` is validated by the agent against the current cluster epoch to
-detect fenced nodes.
+Note: `node_epoch` was removed from this struct due to kernel binary mismatch
+(kernel built without it).  Epoch validation only happens at mount time via
+MOUNT_RESP.
 
 ### LOCK_GRANT (2) — agent → kernel
 
@@ -189,34 +190,16 @@ Filesystem is unmounting — agent should release all resources.
 Payload: 4 zero bytes
 ```
 
-### LOCK_YIELD (12) — agent → kernel
+### LOCK_YIELD (12) — agent → kernel (DEPRECATED)
 
-Sets a yield flag for a specific lock. The kernel suppresses reacquire attempts
-(gl_state == LM_ST_UNLOCKED) until YIELD_CLEAR arrives. Conversions (EX→SH)
-pass through normally. Used during BAST handoff.
+The yield mechanism has been removed.  YIELD and YIELD_CLEAR messages are
+no longer sent by the agent.  The current handoff mechanism uses the `/next`
+marker in etcd with FIFO ordering enforced by `ProcessLock`.  See `AGENTS.md`
+Fixes 13-15 and `docs/debug/deadlock_issuelog.md` approaches 11-15.
 
-```
-Payload: struct letcd_lock_yield {
-    u32  glock_type
-    u64  glock_number
-}
-```
+### YIELD_CLEAR (13) — agent → kernel (DEPRECATED)
 
-The yield flag is tested in `letcd_lock()` before every lock request.
-If set and the glock is in UNLOCKED state, the request is suppressed with
-`gfs2_glock_complete(gl, 0)`. The flag is NOT auto-cleared.
-
-### YIELD_CLEAR (13) — agent → kernel
-
-Clears the yield flag for a lock. Sent when the waiter finishes I/O and
-releases the lock, allowing the previous holder to reacquire.
-
-```
-Payload: struct letcd_lock_yield {
-    u32  glock_type
-    u64  glock_number
-}
-```
+See above.
 
 ## C/Go Struct Alignment
 
