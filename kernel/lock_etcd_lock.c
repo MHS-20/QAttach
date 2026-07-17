@@ -26,7 +26,6 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 			gl->gl_name.ln_type, gl->gl_name.ln_number);
 		letcd_nl_send_msg(LETCD_MSG_LOCK_REL, &rel, sizeof(rel));
 		letcd_revision_clear(gl);
-		letcd_bast_remove(gl->gl_name.ln_type, gl->gl_name.ln_number);
 		gfs2_glock_complete(gl, req_state);
 		return 0;
 	}
