@@ -237,7 +237,8 @@ KERNEL_RELEASE=$($SSH_CMD "${SSH_USER}@${PUBLIC_IP}" \
 
 log "Kernel release: $KERNEL_RELEASE"
 
-run "dracut --force /boot/initramfs-${KERNEL_RELEASE}.img ${KERNEL_RELEASE}"
+run "dracut --force --no-hostonly /boot/initramfs-${KERNEL_RELEASE}.img ${KERNEL_RELEASE}"
+run "depmod -a ${KERNEL_RELEASE}"
 run "mv /boot/vmlinuz /boot/vmlinuz-${KERNEL_RELEASE}-custom"
 run "mv /boot/initramfs-${KERNEL_RELEASE}.img /boot/initramfs-${KERNEL_RELEASE}-custom.img"
 

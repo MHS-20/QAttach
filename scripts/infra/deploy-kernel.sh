@@ -137,8 +137,8 @@ DEFAULT=\$(sudo grubby --default-kernel 2>/dev/null)
 echo \"Default kernel: \$DEFAULT\"
 if [[ \"\$DEFAULT\" != \"\$CUSTOM_VMLINUZ\" ]]; then
     echo 'WARNING: grubby --set-default did not take effect'
-    # Try grub2-set-default as fallback
-    KERNEL_INDEX=\$(sudo grubby --info=ALL 2>/dev/null | grep -n 'Custom lock_etcd' | head -1 | cut -d: -f1)
+    # Try grub2-set-default as fallback — match either title
+    KERNEL_INDEX=\$(sudo grubby --info=ALL 2>/dev/null | grep -n -E '6\.18.*custom|Custom lock_etcd' | head -1 | cut -d: -f1)
     if [[ -n \"\$KERNEL_INDEX\" ]]; then
         sudo grub2-set-default \$((KERNEL_INDEX - 1))
         sudo grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
@@ -161,17 +161,36 @@ sleep 15
 
 for ip in "${IPS[@]}"; do
     log "Waiting for $ip..."
-    for i in $(seq 1 40); do
-        if $SSH_CMD -o ConnectTimeout=5 "ec2-user@${ip}" "uname -r" 2>/dev/null | grep -q "6.18"; then
-            KVER=$($SSH_CMD "ec2-user@${ip}" "uname -r")
-            log \"  \$ip is up: \$KVER\"
-            break
-        fi
-        if [[ \$i -eq 40 ]]; then
-            log \"ERROR: \$ip did not come back after reboot\"
+    ATTEMPT=0
+    while true; do
+        for i in $(seq 1 40); do
+            if $SSH_CMD -o ConnectTimeout=5 "ec2-user@${ip}" "uname -r" 2>/dev/null | grep -q "6.18"; then
+                KVER=$($SSH_CMD "ec2-user@${ip}" "uname -r")
+                log "  $ip is up: $KVER"
+                break 2
+            fi
+            sleep 5
+        done
+        ATTEMPT=$((ATTEMPT + 1))
+        if [[ $ATTEMPT -ge 2 ]]; then
+            log "ERROR: $ip booted wrong kernel twice — giving up"
             exit 1
         fi
-        sleep 5
+        log "WARNING: $ip did not boot custom kernel, fixing grub and rebooting..."
+        $SSH_CMD "ec2-user@${ip}" "
+            CUSTOM=\\\$(ls /boot/vmlinuz-*-custom 2>/dev/null | head -1)
+            CUSTOM_INITRD=\\\$(ls /boot/initramfs-*-custom.img 2>/dev/null | head -1)
+            if [[ -n \\\"\\\$CUSTOM\\\" ]]; then
+                sudo grubby --set-default=\\\"\\\$CUSTOM\\\" 2>/dev/null
+                IDX=\\\$(sudo grubby --info=ALL 2>/dev/null | grep -n -E '6\\.18.*custom|lock_etcd' | head -1 | cut -d: -f1)
+                if [[ -n \\\"\\\$IDX\\\" ]]; then
+                    sudo grub2-set-default \\\$((IDX - 1))
+                fi
+                sudo grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
+            fi
+            sudo reboot
+        " 2>/dev/null || true
+        sleep 15
     done
 done
 
