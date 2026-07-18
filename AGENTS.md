@@ -283,11 +283,11 @@ Safe deletions — the live code paths use `ProcessLock` + `retryProcessLock` ex
 
 ### Priority 2 — Agent robustness (no kernel changes)
 
-- [ ] **Fix `isEndpointHealthy` connection churn**: in `internal/membership/bootstrap.go:205-217`, `waitForHealth` creates a new `clientv3.Client` every 2s (ticker at line 382), calling `MemberList` then closing. This is wasteful TLS handshake churn (not a leak — each client is `defer`-closed). Replace with a single persistent health-check client or reuse the already-existent session client.
-- [ ] **Fix `hasExistingData` restart**: `bootstrap.go:80` writes `m.cfg.InitialCluster` (all 3 members) even for single-node restarts. Should detect how many peers are actually reachable or write only the local member on restart.
-- [ ] **Remove debug `netlink recv/dispatch` log lines** in `internal/netlink/server.go:82,116`.
-- [ ] **Clean up `sendMsg` double-write**: `sendMsg` writes msgType as both a `uint32` body prefix (line 183) AND `nlh.Type = uint16(msgType)` (line 198). Kernel reads only the body prefix via `*(u32 *)payload`; `nlmsg_type` is ignored. Remove the `nlh.Type` assignment.
-- [ ] **Remove `SendRegister` zero payload**: The register message appends a redundant 4-byte zero array after the msgType prefix. Kernel only checks the first 4 bytes.
+- [x] **Fix `isEndpointHealthy` connection churn**: `waitForHealth` now creates a single persistent `clientv3.Client` for the health-check loop, reused on every tick, closed on exit. Avoids wasteful TLS handshake churn.
+- [x] **Fix `hasExistingData` restart**: `Bootstrap` now checks peer reachability before writing the full `InitialCluster`. If no peers respond, only the local member is written (sole survivor restart). If at least one peer is healthy, the full cluster spec is used.
+- [x] **Remove debug `netlink recv/dispatch` log lines** in `server.go`.
+- [x] **Clean up `sendMsg` double-write**: removed `nlh.Type = uint16(msgType)`. Kernel reads only the body prefix for dispatch. Updated comment to reflect actual protocol.
+- [x] **Remove `SendRegister` zero payload**: register message now sends only the msgType prefix (4 bytes). Kernel only checks the first 4 bytes.
 
 ### Priority 3 — Kernel correctness (requires kernel rebuild)
 

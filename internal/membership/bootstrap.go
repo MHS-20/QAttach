@@ -77,7 +77,27 @@ func (m *Manager) Bootstrap(ctx context.Context) error {
 	// just start etcd (restart after crash/reboot).
 	if m.hasExistingData() {
 		log.Printf("membership: found existing etcd data, restarting")
-		if err := m.writeEtcdConfig("existing", m.cfg.InitialCluster); err != nil {
+
+		// Check if any peer is reachable.  If so, use the full
+		// initial-cluster (this node rejoins the existing cluster).
+		// If no peers respond, use only the local member (sole
+		// survivor of a full cluster restart).
+		cluster := m.singleMemberCluster()
+		for _, ep := range m.cfg.EtcdEndpoints {
+			if m.isSelfEndpoint(ep) {
+				continue
+			}
+			if m.isEndpointHealthy(ctx, ep) {
+				log.Printf("membership: peer %s is healthy — rejoining cluster", ep)
+				cluster = m.cfg.InitialCluster
+				break
+			}
+		}
+		if cluster == m.singleMemberCluster() {
+			log.Printf("membership: no peers reachable — starting as sole member")
+		}
+
+		if err := m.writeEtcdConfig("existing", cluster); err != nil {
 			return fmt.Errorf("write etcd config (restart): %w", err)
 		}
 		if err := m.StartEtcd(); err != nil {
@@ -200,6 +220,11 @@ func (m *Manager) selfEndpoint() string {
 	// Build from peer URL (swap port 2380 → 2379)
 	// Not needed if endpoints already include self.
 	return ""
+}
+
+// singleMemberCluster returns initial-cluster with only this node.
+func (m *Manager) singleMemberCluster() string {
+	return fmt.Sprintf("%s=%s", m.nodeName, m.peerURL)
 }
 
 func (m *Manager) isEndpointHealthy(ctx context.Context, endpoint string) bool {
@@ -378,6 +403,12 @@ func (m *Manager) joinExisting(ctx context.Context, seedEndpoint string) error {
 }
 
 func (m *Manager) waitForHealth(ctx context.Context) bool {
+	cli, err := m.connect(ctx, m.cfg.EtcdEndpoints)
+	if err != nil {
+		return false
+	}
+	defer cli.Close()
+
 	deadline := time.After(healthTimeout)
 	ticker := time.NewTicker(healthInterval)
 	defer ticker.Stop()
@@ -389,7 +420,10 @@ func (m *Manager) waitForHealth(ctx context.Context) bool {
 		case <-deadline:
 			return false
 		case <-ticker.C:
-			if m.isLocalHealthy(ctx) {
+			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_, err := cli.MemberList(cctx)
+			cancel()
+			if err == nil {
 				return true
 			}
 			log.Printf("membership: waiting for local etcd...")
