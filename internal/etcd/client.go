@@ -123,102 +123,7 @@ func marshalHolders(h []lockEntry) string {
 	return string(b)
 }
 
-// firstHolderInfo returns (mode, nodeID) of the first holder, or ("", "").
-func firstHolderInfo(raw []byte) (string, string) {
-	h := parseHolders(raw)
-	if len(h) == 0 {
-		return "", ""
-	}
-	return h[0].Mode, h[0].Node
-}
-
-// isHolder returns true if nodeID appears in the holders array.
-func isHolder(raw []byte, nodeID string) bool {
-	for _, h := range parseHolders(raw) {
-		if h.Node == nodeID {
-			return true
-		}
-	}
-	return false
-}
-
 // ---- lock operations ----
-
-// AcquireLock acquires a lock using a single-key holder-array model.
-//
-// Key:  /locks/glock/{type}/{number}
-// Value: [{"node":"A","mode":"EX"},{"node":"B","mode":"PR"}]
-//
-// EX mode: CAS that key does not exist, then Put with one EX holder.
-// SH mode: read holders, check no EX exists, append SH entry via optimistic lock.
-//
-// Returns (granted, revision, first_holder_mode, first_holder_node, error).
-func (c *Client) AcquireLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, mode string) (bool, int64, string, string, error) {
-	key := lockKey(lockType, lockNumber)
-
-	if mode == "EX" {
-		val := marshalHolders([]lockEntry{{Node: nodeID, Mode: mode}})
-		txnResp, err := c.cli.Txn(ctx).
-			If(clientv3.Compare(clientv3.Version(key), "=", 0)).
-			Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
-			Else(clientv3.OpGet(key)).
-			Commit()
-		if err != nil {
-			return false, 0, "", "", fmt.Errorf("acquire EX txn: %w", err)
-		}
-		if !txnResp.Succeeded {
-			hm, hn := "", ""
-			if len(txnResp.Responses) > 0 {
-				for _, ev := range txnResp.Responses[0].GetResponseRange().Kvs {
-					hm, hn = firstHolderInfo(ev.Value)
-					break
-				}
-			}
-			return false, 0, hm, hn, nil
-		}
-		return true, txnResp.Header.Revision, "", "", nil
-	}
-
-	// SH mode: append to holders array if no EX holder exists.
-	getResp, err := c.cli.Get(ctx, key)
-	if err != nil {
-		return false, 0, "", "", fmt.Errorf("get before SH: %w", err)
-	}
-
-	holders := []lockEntry{}
-	ver := int64(0)
-	if len(getResp.Kvs) > 0 {
-		ver = getResp.Kvs[0].Version
-		holders = parseHolders(getResp.Kvs[0].Value)
-		for _, h := range holders {
-			if h.Mode == "EX" {
-				return false, 0, h.Mode, h.Node, nil
-			}
-		}
-	}
-
-	holders = append(holders, lockEntry{Node: nodeID, Mode: mode})
-	val := marshalHolders(holders)
-	txnResp, err := c.cli.Txn(ctx).
-		If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-		Then(clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease()))).
-		Else(clientv3.OpGet(key)).
-		Commit()
-	if err != nil {
-		return false, 0, "", "", fmt.Errorf("acquire SH txn: %w", err)
-	}
-	if !txnResp.Succeeded {
-		hm, hn := "", ""
-		if len(txnResp.Responses) > 0 {
-			for _, ev := range txnResp.Responses[0].GetResponseRange().Kvs {
-				hm, hn = firstHolderInfo(ev.Value)
-				break
-			}
-		}
-		return false, 0, hm, hn, nil
-	}
-	return true, txnResp.Header.Revision, "", "", nil
-}
 
 // modesConflict returns true if two lock modes conflict.
 func modesConflict(a, b string) bool {
@@ -229,89 +134,6 @@ func modesConflict(a, b string) bool {
 		return true
 	}
 	return false
-}
-
-// ConvertLock converts an already-held lock to a new mode without releasing.
-// Updates our entry in the holders array. If no conflicting holders remain
-// after the update, returns granted=true. Otherwise returns granted=false
-// (caller must watch for other holders to release).
-// Returns an error if another node already holds EX (caller should release
-// and retry as a new request).
-func (c *Client) ConvertLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID, newMode string) (granted bool, rev int64, err error) {
-	key := lockKey(lockType, lockNumber)
-
-	for {
-		getResp, err := c.cli.Get(ctx, key)
-		if err != nil {
-			return false, 0, fmt.Errorf("convert get: %w", err)
-		}
-		if len(getResp.Kvs) == 0 {
-			return false, 0, fmt.Errorf("convert: lock not held")
-		}
-
-		ver := getResp.Kvs[0].Version
-		holders := parseHolders(getResp.Kvs[0].Value)
-
-		ourIdx := -1
-		for i, h := range holders {
-			if h.Node == nodeID {
-				ourIdx = i
-				break
-			}
-		}
-		if ourIdx < 0 {
-			return false, 0, fmt.Errorf("convert: self not in holders")
-		}
-
-		if holders[ourIdx].Mode == newMode {
-			for i, h := range holders {
-				if i == ourIdx {
-					continue
-				}
-				if modesConflict(newMode, h.Mode) {
-					return false, 0, nil
-				}
-			}
-			return true, getResp.Kvs[0].ModRevision, nil
-		}
-
-		if newMode == "EX" {
-			for i, h := range holders {
-				if i == ourIdx {
-					continue
-				}
-				if h.Mode == "EX" {
-					return false, 0, fmt.Errorf("convert: another node holds EX")
-				}
-			}
-		}
-
-		newHolders := make([]lockEntry, len(holders))
-		copy(newHolders, holders)
-		newHolders[ourIdx].Mode = newMode
-
-		txnResp, err := c.cli.Txn(ctx).
-			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-			Then(clientv3.OpPut(key, marshalHolders(newHolders),
-				clientv3.WithLease(c.sess.Lease()))).
-			Commit()
-		if err != nil {
-			return false, 0, fmt.Errorf("convert txn: %w", err)
-		}
-		if !txnResp.Succeeded {
-			continue
-		}
-
-		for i, h := range newHolders {
-			if i == ourIdx {
-				continue
-			}
-			if modesConflict(newMode, h.Mode) {
-				return false, 0, nil
-			}
-		}
-		return true, txnResp.Header.Revision, nil
-	}
 }
 
 // ProcessLock handles a lock request atomically in a single etcd Txn.
@@ -485,16 +307,6 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 	}
 }
 
-// AmIHolder checks if nodeID is among the current holders of this lock.
-func (c *Client) AmIHolder(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) bool {
-	key := lockKey(lockType, lockNumber)
-	getResp, err := c.cli.Get(ctx, key)
-	if err != nil || len(getResp.Kvs) == 0 {
-		return false
-	}
-	return isHolder(getResp.Kvs[0].Value, nodeID)
-}
-
 // ReleaseLock removes this node's entry from the holders array.
 // If the array becomes empty, the key is deleted.
 // Retries on CAS version mismatch (concurrent multi-holder release).
@@ -555,7 +367,6 @@ func (c *Client) WatchMemberDeletions(ctx context.Context) clientv3.WatchChan {
 	)
 }
 
-
 // ---- wait queue ----
 
 // AddWaiter registers this node as a waiter for a lock.
@@ -612,27 +423,6 @@ func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber
 func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {
 	_, err := c.cli.Delete(ctx, handoffKey(lockType, lockNumber))
 	return err
-}
-
-// CheckHandoff returns true if there's a handoff marker for this node.
-func (c *Client) CheckHandoff(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
-	resp, err := c.cli.Get(ctx, handoffKey(lockType, lockNumber))
-	if err != nil || len(resp.Kvs) == 0 {
-		return false, err
-	}
-	return string(resp.Kvs[0].Value) == nodeID, nil
-}
-
-// IsFirstWaiter returns true if this node is the oldest waiter.
-func (c *Client) IsFirstWaiter(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (bool, error) {
-	waiters, err := c.GetWaiters(ctx, lockType, lockNumber)
-	if err != nil {
-		return false, err
-	}
-	if len(waiters) == 0 {
-		return false, nil
-	}
-	return waiters[0] == nodeID, nil
 }
 
 // ---- bast / handoff ----
@@ -734,15 +524,11 @@ func (c *Client) InitEpoch(ctx context.Context) (int64, error) {
 	return txnResp.Header.Revision, nil
 }
 
-
-
-
 func (c *Client) MarkFencingComplete(ctx context.Context, failedNodeID, result string) error {
 	key := protocol.PrefixFencing + failedNodeID
 	_, err := c.cli.Put(ctx, key, result)
 	return err
 }
-
 
 func (c *Client) Close() error {
 	if c.sess != nil {

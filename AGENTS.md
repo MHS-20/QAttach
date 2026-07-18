@@ -242,7 +242,7 @@ Before the lock mode "fix" was reverted, the constants were `EX=1, SH=3` (correc
 
 **Same issue affects journal locks**: Node 0 holds its journal EX permanently. Node 1's journal recovery check tries to acquire EX on node 0's journal with `LM_FLAG_TRY`. DLM returns -EAGAIN synchronously when TRY can't be granted. Our kernel must do the same — but `LM_FLAG_TRY` is not set by GFS2 on this kernel version, and even if it were, returning -EAGAIN via `gfs2_glock_complete` causes GFS2 to abort the entire mount (not just skip the journal).
 
-**Partial workaround applied**: Fix 10 (always release from etcd on unlock) combined with the fact that GFS2 releases the MOUNT lock at the end of `fill_super` means multi-node mount now works — the MOUNT lock doesn't collide. But mode conversion is still needed for inode/glock I/O operations.
+**Partial workaround applied**: Fix 10 (always release from etcd on unlock) combined with the fact that GFS2 releases the MOUNT lock at the end of fill_super means multi-node mount now works. The heartbeat lock handoff (BAST→UNLOCK→GRANT, Fixes 11-15) handles shared-resource contention for running filesystems. Light concurrent I/O works (1op/5s per node, 3 shared files). Mode conversion is still needed for the general case (EX→SH without full unlock) but the immediate blockers are resolved.
 
 **Fix requires**: Kernel module must implement `lm_lock(gl, LM_ST_SHARED)` as a mode conversion when `gl_state == LM_ST_EXCLUSIVE`. This means:
 1. Kernel detects conversion (target < current state, lock already held)
@@ -261,58 +261,61 @@ Before the lock mode "fix" was reverted, the constants were `EX=1, SH=3` (correc
 
 `letcd_ordered_list` in `lock_etcd_lock.c` persists across mount/unmount cycles. Stale entries block subsequent lock requests. Requires `letcd_ordered_cleanup()` in `lock_etcd_unmount()`.
 
-### BUG: Kernel BAST dropped for freed/cached glocks
+**Note: no trace of `letcd_ordered_list` found in current kernel source. The binary may differ. Verify with `strings gfs2.ko | grep ordered` on a compute node.**
 
-When GFS2 frees a glock from the LRU cache, `letcd_put_lock` calls `letcd_bast_remove`, removing the glock from the bast lookup list. A subsequent BAST from another node finds no glock → BAST is silently discarded → the EX holder entry persists in etcd → waiters block indefinitely. This affects inode glocks that GFS2 caches and evicts between operations.
+### FIXED: Kernel BAST dropped for freed/cached glocks (Option A — commit `f786602`)
 
-**Confirmed by test**: Directory inode (50069) SH request gets WAIT at [220ms] and never resolves. Node 0's dmesg shows no BAST, no BAST-DROPPED, no UNLOCK for 50069. The heartbeat lock (50063) works because it's re-acquired every 30s and never freed from the bast list.
-
-**Fix options** (kernel module only, no GFS2 core changes):
-
-**Option A — Move `letcd_bast_remove` to `letcd_put_lock` only (recommended):**
-Remove `letcd_bast_remove` from the UNLOCK path in `letcd_lock` (line ~29). Keep it ONLY in `letcd_put_lock`. The glock stays in the bast list across UNLOCK→ACQUIRE cycles. A BAST arriving after UNLOCK but before the glock is freed still finds the glock and triggers demotion. If the glock is later reacquired, the bast entry is reused. If the glock is freed without reacquisition, `letcd_put_lock` cleans up. Minimal change: 1 line removed. No race window.
-
-**Risk**: Low. The bast list holds a glock pointer. If the glock is freed without going through the UNLOCK path (directly by GFS2 LRU eviction without an explicit lm_lock(UNLOCK) call), the pointer becomes dangling. But GFS2 always calls `lm_lock(UNLOCK)` or `lm_put_lock` before freeing — the UNLOCK path is guaranteed. So the glock pointer remains valid in the bast list until `letcd_put_lock`.
-
-**Option B — Use type+number in bast list instead of glock pointer:**
-Change `letcd_bast_insert/lookup/remove` to store `{ln_type, ln_number}` instead of `struct gfs2_glock *`. On BAST, look up by type+number and use GFS2's `gfs2_glock_find` (exported in `glock.h`) to locate the glock. If no glock exists (already freed), the BAST is a no-op — the etcd key was already released by the agent.
-
-**Risk**: Medium. Requires using the GFS2 API to find glocks by type+number. `gfs2_glock_find` takes a spinlock and does a hash lookup. Could introduce locking dependencies. The bast lookup is called from the netlink recv handler (softirq context?), which might conflict with glock hash table locks.
-
-**Option C — New `LETCD_MSG_BAST_CACHED` message type:**
-Send BAST via a new message that doesn't require the glock to be in the bast list. The kernel handler queries GFS2's glock hash table for a matching glock. If found, demotes it. If not found (glock freed), the kernel sends a confirmation back to the agent that the lock is already released, and the agent can safely clean up the etcd key.
-
-**Risk**: High. New message type, new kernel receive path, bidirectional confirmation protocol. Most complete but most complex. Not needed if Option A solves the problem.
+When GFS2 frees a glock from the LRU cache, `letcd_put_lock` calls `letcd_bast_remove`, removing the glock from the bast lookup list. A subsequent BAST from another node finds no glock → BAST is discarded → waiters block. Option A fixed it by removing `letcd_bast_remove` from the UNLOCK path in `letcd_lock`, keeping it only in `letcd_put_lock`. The glock stays in the bast list across UNLOCK→ACQUIRE cycles. Confirmed: BAST→UNLOCK now fires for directory inode (50069).
 
 ## Remaining todo
 
-### Priority 1 — Kernel BAST delivery for cached/freed glocks (kernel only)
-- [ ] Apply Option A: move `letcd_bast_remove` from UNLOCK path to `letcd_put_lock` only
-- [ ] Rebuild kernel, test that BAST triggers demotion for cached inode glocks
-- [ ] Verify concurrent I/O works with the fix
+### Priority 1 — Code quality cleanup (Go only, no kernel rebuild)
 
-### Priority 2 — Mode conversion (kernel + agent, lower priority after Option A)
-- [ ] Kernel: add `lm_lock(gl, LM_ST_SHARED)` support when `gl_state == LM_ST_EXCLUSIVE` (conversion path, not new acquisition)
-- [ ] Agent: handle mode conversion in etcd — update holder entry from EX→PR without full release
-- [ ] Kernel: investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount (flags=0x284)
-- [ ] Kernel: if TRY flag path needs to work, ensure `gfs2_glock_complete(gl, LM_OUT_TRY_AGAIN)` causes GFS2 to skip the journal, not abort mount
+Safe deletions — the live code paths use `ProcessLock` + `retryProcessLock` exclusively. All old yield-based helpers are superseded.
+
+- [x] **Delete dead functions in `internal/lock/manager.go`**: `watchForLock`, `watchForConversion`, `tryAcquireAsFirstWaiter`. Superseded by `retryProcessLock`.
+- [x] **Delete dead functions in `internal/etcd/client.go`**: `AcquireLock`, `ConvertLock`, `CheckHandoff`, `IsFirstWaiter`, `AmIHolder`, `firstHolderInfo`, `isHolder`. All were helpers for the old flow; handoff is now handled inline in `ProcessLock`.
+- [x] **Delete unused `LockValue` struct** from `pkg/protocol/etcd.go` — lock value format changed to JSON array of `lockEntry` objects.
+- [x] **Delete unused `wg sync.WaitGroup` field** from `internal/netlink/server.go` — declared but never called anywhere.
+- [x] **Delete unreachable UNLOCKED branch** in `internal/lock/manager.go` — kernel never sends LOCK_REQ with mode=0; it sends LOCK_REL instead.
+
+~310 lines removed. Build / test / vet all pass.
+
+### Priority 2 — Agent robustness (no kernel changes)
+
+- [ ] **Fix `isEndpointHealthy` connection churn**: in `internal/membership/bootstrap.go:205-217`, `waitForHealth` creates a new `clientv3.Client` every 2s (ticker at line 382), calling `MemberList` then closing. This is wasteful TLS handshake churn (not a leak — each client is `defer`-closed). Replace with a single persistent health-check client or reuse the already-existent session client.
+- [ ] **Fix `hasExistingData` restart**: `bootstrap.go:80` writes `m.cfg.InitialCluster` (all 3 members) even for single-node restarts. Should detect how many peers are actually reachable or write only the local member on restart.
+- [ ] **Remove debug `netlink recv/dispatch` log lines** in `internal/netlink/server.go:82,116`.
+- [ ] **Clean up `sendMsg` double-write**: `sendMsg` writes msgType as both a `uint32` body prefix (line 183) AND `nlh.Type = uint16(msgType)` (line 198). Kernel reads only the body prefix via `*(u32 *)payload`; `nlmsg_type` is ignored. Remove the `nlh.Type` assignment.
+- [ ] **Remove `SendRegister` zero payload**: The register message appends a redundant 4-byte zero array after the msgType prefix. Kernel only checks the first 4 bytes.
 
 ### Priority 3 — Kernel correctness (requires kernel rebuild)
-- [ ] Move inline-SH fast-path outside yield-suppress block
-- [ ] Add `letcd_ordered_cleanup()` for ordered list drain on unmount
 
-### Priority 4 — Agent robustness (no kernel changes)
-- [ ] Fix `isEndpointHealthy` client leak: each health check creates new `clientv3.New(DialTimeout:10s)` while ticker fires every 2s
-- [ ] Fix `hasExistingData` restart: writes `initial-cluster` with all 3 members even for single-node clusters
-- [ ] Remove debug `netlink recv/dispatch` log lines in `server.go`
-- [ ] Revert unnecessary `nlh.Pid` and `nlh.Type` changes in `sendMsg` (or document properly)
+- [ ] **Remove yield infrastructure from kernel**: `lock_etcd_netlink.c:138-149` (dispatch), `lock_etcd_glock.c:187-262` (yield_table + set/test/clear/cleanup), and the `letcd_lock_yield` struct. Agent hasn't sent YIELD/YIELD_CLEAR since Fix 11 — BAST replaced it. **This also fixes the inline-SH issue below** (the enclosing `if (letcd_yield_test(...))` block that gates inline-SH is removed).
+- [ ] **Sync `kernel/letcd_netlink.h` and `pkg/protocol/letcd_netlink.h`**: Go copy has yield messages (12, 13) and `struct letcd_lock_yield`; kernel copy doesn't. After yield removal, both should contain only messages 1-11. Verify both are identical.
+- [ ] **Move inline-SH fast-path outside yield-suppress block**: `lock_etcd_lock.c:64-78` is gated on `letcd_yield_test()` at line 59, which always returns false (yield is dead). Removing the yield block naturally fixes this. If yield removal is deferred, manually extract the inline-SH code.
+- [ ] **Verify `letcd_ordered_list` and add cleanup if needed**: No trace of `letcd_ordered_list` found in current kernel source. Verify with `strings gfs2.ko | grep ordered` on a compute node. If present in binary but missing from source, reconcile. If present, add `letcd_ordered_cleanup()` in `letcd_unmount()`.
+- [ ] **Investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount** (flags=0x284).
 
-### Priority 5 — Script determinism
-- [ ] deploy-kernel.sh: verify custom kernel boots after reboot (check `uname -r`)
+### Priority 4 — Script determinism
+
 - [ ] setup-compute.sh: ensure idempotent re-runs on partially configured nodes
+- [ ] deploy-kernel.sh: fix log line escaping (`$ip is up: $KVER` prints literally)
 
-### Priority 6 — Documentation
-- [ ] Update `docs/` to reflect current state
+### Priority 5 — Documentation
+
+- [ ] Update `docs/bast-mechanism.md` — entire doc describes removed yield mechanism
+- [ ] Update `docs/summary.md` — claims cross-node I/O is blocked
+- [ ] Update `docs/architecture.md` — BAST flow describes removed yield approach
+- [ ] Update `docs/proposal.md` — status section says handoff under investigation
+
+### Priority 6 — Performance optimizations (future)
+
+These are design-level optimizations that borrow from DLM's architecture to reduce etcd latency pressure. Not yet planned for implementation.
+
+- [ ] **Replace polling with etcd Watch in retryProcessLock.** Currently polls `ProcessLock` every 200ms (5 etcd round-trips/sec per waiting lock even when nothing changes). DLM uses event-driven callbacks. The retry goroutine should `Watch` the lock key instead and only call `ProcessLock` when the key changes (holder released). Cuts etcd traffic from O(ops/sec) to O(state changes).
+
+- [ ] **Lock locality / in-kernel fast-path for reacquired locks.** When a node reacquires a lock it already holds (heartbeat, directory inode for a second file in the same directory), grant immediately in the kernel without the netlink→etcd round-trip. The kernel knows which locks it holds via `letcd_bast_insert`. Only when a different node wants the lock (BAST arrives) would the lock touch etcd. This would make the common case of repeated local access as fast as DLM. Requires: new `lm_lock` fast-path for `gl_state` already at or above the requested mode, and a "local grant" that skips the agent entirely.
 
 ## Additional docs
 

@@ -19,12 +19,6 @@ type MemberInfo struct {
 	AZ         string `json:"az"`
 }
 
-// LockValue stored in /locks/glock/{type}/{number}.
-type LockValue struct {
-	OwnerNodeID string `json:"owner_node_id"`
-	Mode        string `json:"mode"` // EX, PR, CW
-}
-
 // Session config.
 const (
 	SessionTTL = 15 // seconds

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sync"
 	"syscall"
 	"unsafe"
 
@@ -25,7 +24,6 @@ type Handler interface {
 type Server struct {
 	fd      int
 	handler Handler
-	wg      sync.WaitGroup
 	done    chan struct{}
 }
 
