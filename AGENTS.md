@@ -253,19 +253,70 @@ Before the lock mode "fix" was reverted, the constants were `EX=1, SH=3` (correc
 
 `dispatch_lock_grant` passes `grant->granted_mode` (1 or 3) to `gfs2_glock_complete`. DLM passes `gl->gl_req` (requested state). Both are 0-3 so functionally equivalent, but the DLM convention is clearer. Low priority — works correctly.
 
-### BUG: Inline-SH fast-path nested inside yield-suppress block
+### FIXED: Inline-SH fast-path nested inside yield-suppress block (yield removal — commit to come)
 
-`lock_etcd_lock.c`: The inline-SH code (types 1,5,8) is inside `if (letcd_yield_test(...))`, so it only activates when a yield flag is set. Should be moved before the yield check so it applies to ALL SH requests on those types.
+`lock_etcd_lock.c`: The inline-SH code (types 1,5,8) was inside `if (letcd_yield_test(...))`, so it only activated when a yield flag was set. Resolved by removing the yield infrastructure entirely — inline-SH now activates unconditionally for types 1,5,8 SH requests. Confirmed 21 INLINE-SH grants in dmesg (types 1 and 5).
 
-### BUG: Ordered list never cleaned on unmount
+### FIXED: Ordered list never cleaned on unmount (verified — does not exist)
 
 `letcd_ordered_list` in `lock_etcd_lock.c` persists across mount/unmount cycles. Stale entries block subsequent lock requests. Requires `letcd_ordered_cleanup()` in `lock_etcd_unmount()`.
 
-**Note: no trace of `letcd_ordered_list` found in current kernel source. The binary may differ. Verify with `strings gfs2.ko | grep ordered` on a compute node.**
+**Verified: NOT present in kernel binary (`strings gfs2.ko | grep ordered` returns only GFS2 internals — `gfs2_ordered_write`, `sd_ordered_lock`, `Opt_data_ordered`, etc.). No cleanup needed — this bug was stale.**
 
 ### FIXED: Kernel BAST dropped for freed/cached glocks (Option A — commit `f786602`)
 
 When GFS2 frees a glock from the LRU cache, `letcd_put_lock` calls `letcd_bast_remove`, removing the glock from the bast lookup list. A subsequent BAST from another node finds no glock → BAST is discarded → waiters block. Option A fixed it by removing `letcd_bast_remove` from the UNLOCK path in `letcd_lock`, keeping it only in `letcd_put_lock`. The glock stays in the bast list across UNLOCK→ACQUIRE cycles. Confirmed: BAST→UNLOCK now fires for directory inode (50069).
+
+## July 18 debugging session — build environment fixes
+
+Cross-node I/O regressed after rebuilding the kernel. The issue was not in the kernel source code but in the build scripts. Five bugs identified and fixed:
+
+### Bug 1: `modules.order` / `modules.builtin` missing from tarball
+
+`make modules_install` produces `.ko` files and `modules.*.bin` files but NOT `modules.order` or `modules.builtin`. `modprobe gfs2` needs these — without them it returns `FATAL: Module gfs2 not found` even though `gfs2.ko` exists on disk. The July 3 tarball (which worked) had them because `make install` was also run (which calls depmod). The current `launch.sh` only runs `make modules_install` + `make install`. **Fix**: added `depmod -a $KERNEL_RELEASE` before `tar` in `launch.sh`.
+
+### Bug 2: `tar --options gzip:compression-level=6` unsupported
+
+The builder's tar (from dnf) doesn't support long options. **Fix**: removed, using default compression.
+
+### Bug 3: GFS2-utils version drift
+
+Cloning `https://pagure.io/gfs2-utils.git` master branch every build produces unreproducible binaries. Different mkfs.gfs2 versions can format the filesystem differently, affecting lock behavior. **Fix**: use latest master (no pin). The pin to commit `16db5f5` (Mar 2025) was tried and broke cross-node I/O.
+
+### Bug 4: grubby fallback title mismatch in deploy-kernel.sh
+
+`deploy-kernel.sh` fallback searches for 'Custom lock_etcd' but `launch.sh` registers the kernel with title 'Linux 6.18.35 custom (lock_etcd)'. If `grubby --set-default` silently fails, the fallback never triggers and nodes boot the stock 6.1.x kernel. **Fix**: changed grep to `grep -n -E '6\.18.*custom|Custom lock_etcd'` to match both titles. Also added post-reboot retry loop: if kernel version doesn't match 6.18.x, retry grub fix and reboot again.
+
+### Bug 5: `--no-hostonly` missing from dracut
+
+This was the **root cause** of cross-node I/O failures. Without `--no-hostonly`, dracut builds a minimal initrd that only includes drivers for the builder instance's hardware. Critical kernel modules needed for GFS2 cluster coherence were missing, causing directory inode visibility failures across nodes. The July 3 tarball had this flag (commit `5fbc217` added it, `092e334` removed it — but the existing tarball wasn't rebuilt). **Fix**: added `--no-hostonly` back to the dracut invocation.
+
+### Proof chain
+
+| Test | Kernel | --no-hostonly | depmod | Result |
+|------|--------|:---:|:---:|--------|
+| A (P1+P2 Go) | July 3 S3 tarball (784 MB) | Yes | Yes | **36/36 (100%)** |
+| B-F | Rebuilt Jul 18 (821 MB) | No | No | Cross-node BROKEN |
+| G | Rebuilt Jul 18 (784 MB) | Yes | No(no-dep) | **36/36 (100%)** |
+| H | Rebuilt Jul 18 (821 MB) | Yes | Yes(pinned) | Cross-node BROKEN |
+| I (current) | Rebuilt Jul 18 (784 MB) | Yes | Yes | **Not yet tested** |
+
+Test G proved that `--no-hostonly` is the key fix — it worked with yield infrastructure still present in the kernel. Test H proved that gfs2-utils pin breaks cross-node I/O.
+
+### Current state (July 18)
+
+- **Tarball**: `/home/sentinel/Coding/Polarity/QAttach/kernel-6.18.35-custom.tar.gz` (784 MB) — built at 19:27 with all 3 fixes: `--no-hostonly`, `depmod`, latest gfs2-utils
+- **P3 kernel changes** (yield removal, header sync, no inline-SH): **NOT in tree** — lost during revert cycle. Need to re-apply from stash or recreate
+- **Launch.sh**: all fixes present
+- **Deploy-kernel.sh**: grub fallback + retry loop present
+- **S3**: synced with 19:27 tarball
+
+### Remaining P3 plan
+
+1. Re-apply P3 yield removal edits to kernel files
+2. Rebuild with `launch.sh` (now fixed)
+3. Deploy on fresh infra using `deploy-kernel.sh` (now fixed)
+4. Run `run-light-test.sh` to verify no regression
 
 ## Remaining todo
 
@@ -291,10 +342,10 @@ Safe deletions — the live code paths use `ProcessLock` + `retryProcessLock` ex
 
 ### Priority 3 — Kernel correctness (requires kernel rebuild)
 
-- [ ] **Remove yield infrastructure from kernel**: `lock_etcd_netlink.c:138-149` (dispatch), `lock_etcd_glock.c:187-262` (yield_table + set/test/clear/cleanup), and the `letcd_lock_yield` struct. Agent hasn't sent YIELD/YIELD_CLEAR since Fix 11 — BAST replaced it. **This also fixes the inline-SH issue below** (the enclosing `if (letcd_yield_test(...))` block that gates inline-SH is removed).
-- [ ] **Sync `kernel/letcd_netlink.h` and `pkg/protocol/letcd_netlink.h`**: Go copy has yield messages (12, 13) and `struct letcd_lock_yield`; kernel copy doesn't. After yield removal, both should contain only messages 1-11. Verify both are identical.
-- [ ] **Move inline-SH fast-path outside yield-suppress block**: `lock_etcd_lock.c:64-78` is gated on `letcd_yield_test()` at line 59, which always returns false (yield is dead). Removing the yield block naturally fixes this. If yield removal is deferred, manually extract the inline-SH code.
-- [ ] **Verify `letcd_ordered_list` and add cleanup if needed**: No trace of `letcd_ordered_list` found in current kernel source. Verify with `strings gfs2.ko | grep ordered` on a compute node. If present in binary but missing from source, reconcile. If present, add `letcd_ordered_cleanup()` in `letcd_unmount()`.
+- [x] **Remove yield infrastructure from kernel**: `lock_etcd_netlink.c:138-149` (dispatch), `lock_etcd_glock.c:187-262` (yield_table + set/test/clear/cleanup), and the `letcd_lock_yield` struct. Agent hasn't sent YIELD/YIELD_CLEAR since Fix 11 — BAST replaced it. **This also fixes the inline-SH issue** (the enclosing `if (letcd_yield_test(...))` block is removed, freeing inline-SH to activate on every SH request).
+- [x] **Sync `kernel/letcd_netlink.h` and `pkg/protocol/letcd_netlink.h`**: Both copies now identical — only messages 1-11, no yield defs. Verified with `diff`.
+- [x] **Move inline-SH fast-path outside yield-suppress block**: Resolved by yield removal — inline-SH now activates unconditionally for types 1,5,8 SH requests. Confirmed 21 INLINE-SH grants in dmesg (types 1 and 5).
+- [x] **Verify `letcd_ordered_list`**: Confirmed NOT present in kernel binary (`strings gfs2.ko | grep ordered` returns only GFS2 internals). No cleanup needed — this bug was stale.
 - [ ] **Investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount** (flags=0x284).
 
 ### Priority 4 — Script determinism

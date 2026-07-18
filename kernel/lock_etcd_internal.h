@@ -42,12 +42,6 @@ int  letcd_netlink_init(void);
 void letcd_netlink_exit(void);
 int  letcd_nl_send_msg(int msg_type, const void *payload, size_t len);
 
-/* Yield infrastructure — prevents holder-reacquire race. */
-void letcd_yield_set(u32 glock_type, u64 glock_number);
-bool letcd_yield_test(u32 glock_type, u64 glock_number);
-void letcd_yield_clear(u32 glock_type, u64 glock_number);
-void letcd_yield_cleanup(void);
-
 struct letcd_mount_context {
 	struct completion mount_done;
 	int mount_jid;
