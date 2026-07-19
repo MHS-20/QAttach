@@ -3,6 +3,7 @@
 #define _LOCK_ETCD_INTERNAL_H
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/timer.h>
 #include <linux/hashtable.h>
 #include <linux/completion.h>
 #include <linux/atomic.h>
@@ -15,15 +16,18 @@
 #include "letcd_netlink.h"
 
 #define LETCD_PENDING_BITS  8
+#define LETCD_WAIT_TIMEOUT  (30 * HZ)
 
 struct letcd_pending_entry {
 	u64 request_id;
 	struct gfs2_glock *gl;
+	unsigned long wait_start;  /* jiffies when WAIT received, 0 = not waiting */
 	struct hlist_node node;
 };
 
 extern spinlock_t letcd_pending_lock;
 extern DECLARE_HASHTABLE(letcd_pending_table, LETCD_PENDING_BITS);
+extern struct timer_list letcd_wait_timeout_timer;
 extern atomic64_t letcd_req_counter;
 extern struct sock *letcd_nl_sk;
 extern struct letcd_mount_context letcd_mount_ctx;
@@ -32,6 +36,8 @@ extern const struct lm_lockops letcd_ops;
 void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
 			  u32 glock_type, u64 glock_number);
 struct gfs2_glock *letcd_pending_remove(u64 request_id);
+struct gfs2_glock *letcd_pending_find(u64 request_id);
+void letcd_pending_mark_wait(u64 request_id);
 void letcd_bast_insert(u32 glock_type, u64 glock_number, struct gfs2_glock *gl);
 void letcd_bast_remove(u32 glock_type, u64 glock_number);
 struct gfs2_glock *letcd_bast_lookup(u32 glock_type, u64 glock_number);

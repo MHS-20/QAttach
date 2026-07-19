@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/timer.h>
 #include "lock_etcd_internal.h"
 
 MODULE_LICENSE("GPL");
@@ -44,7 +45,7 @@ const struct lm_lockops letcd_ops = {
 };
 EXPORT_SYMBOL_GPL(letcd_ops);
 
-int __init lock_etcd_init_module(void)
+	int __init lock_etcd_init_module(void)
 {
 	spin_lock_init(&letcd_pending_lock);
 	hash_init(letcd_pending_table);
@@ -58,5 +59,6 @@ int __init lock_etcd_init_module(void)
 
 void __exit lock_etcd_exit_module(void)
 {
+	timer_delete(&letcd_wait_timeout_timer);
 	letcd_netlink_exit();
 }

@@ -11,6 +11,11 @@ EXPORT_SYMBOL(letcd_nl_sk);
 
 static u32 agent_pid;
 
+static void start_wait_timeout(void)
+{
+	mod_timer(&letcd_wait_timeout_timer, jiffies + HZ);
+}
+
 /* ---- dispatch helpers ---- */
 
 static void dispatch_mount_resp(struct letcd_mount_resp *resp)
@@ -61,14 +66,13 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 
 static void dispatch_lock_wait(struct letcd_lock_wait *wait)
 {
-	struct gfs2_glock *gl = letcd_pending_remove(wait->request_id);
+	struct gfs2_glock *gl = letcd_pending_find(wait->request_id);
 	if (!gl) {
 		pr_info("  WAIT-DROPPED reqid=%lld\n", wait->request_id);
 		return;
 	}
 	pr_info("  WAIT reqid=%lld\n", wait->request_id);
-	letcd_pending_insert(wait->request_id, gl,
-			     gl->gl_name.ln_type, gl->gl_name.ln_number);
+	letcd_pending_mark_wait(wait->request_id);
 }
 
 static void dispatch_bast(struct letcd_bast *bast)
@@ -104,6 +108,7 @@ static void letcd_nl_recv(struct sk_buff *skb)
 	if (plen >= 4 && *(u32 *)payload == LETCD_MSG_REGISTER) {
 		agent_pid = NETLINK_CB(skb).portid;
 		pr_info("agent registered pid=%u\n", agent_pid);
+		start_wait_timeout();
 		return;
 	}
 

@@ -2,6 +2,7 @@
 #define pr_fmt(fmt) "lock_etcd: " fmt
 #include <linux/slab.h>
 #include <linux/jhash.h>
+#include <linux/timer.h>
 #include "lock_etcd_internal.h"
 
 /* ---- pending requests ---- */
@@ -13,6 +14,9 @@ EXPORT_SYMBOL(letcd_pending_table);
 atomic64_t letcd_req_counter;
 EXPORT_SYMBOL(letcd_req_counter);
 
+static void letcd_pending_timeout_scan(struct timer_list *);
+DEFINE_TIMER(letcd_wait_timeout_timer, letcd_pending_timeout_scan);
+
 void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
 			  u32 glock_type, u64 glock_number)
 {
@@ -21,6 +25,7 @@ void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
 		return;
 	e->request_id = request_id;
 	e->gl = gl;
+	e->wait_start = 0;
 	spin_lock_bh(&letcd_pending_lock);
 	hash_add(letcd_pending_table, &e->node, request_id);
 	spin_unlock_bh(&letcd_pending_lock);
@@ -46,6 +51,71 @@ struct gfs2_glock *letcd_pending_remove(u64 request_id)
 	return gl;
 }
 EXPORT_SYMBOL(letcd_pending_remove);
+
+struct gfs2_glock *letcd_pending_find(u64 request_id)
+{
+	struct letcd_pending_entry *e;
+	struct gfs2_glock *gl = NULL;
+
+	spin_lock_bh(&letcd_pending_lock);
+	hash_for_each_possible(letcd_pending_table, e, node, request_id) {
+		if (e->request_id == request_id) {
+			gl = e->gl;
+			break;
+		}
+	}
+	spin_unlock_bh(&letcd_pending_lock);
+	return gl;
+}
+EXPORT_SYMBOL(letcd_pending_find);
+
+void letcd_pending_mark_wait(u64 request_id)
+{
+	struct letcd_pending_entry *e;
+
+	spin_lock_bh(&letcd_pending_lock);
+	hash_for_each_possible(letcd_pending_table, e, node, request_id) {
+		if (e->request_id == request_id) {
+			e->wait_start = jiffies;
+			break;
+		}
+	}
+	spin_unlock_bh(&letcd_pending_lock);
+}
+EXPORT_SYMBOL(letcd_pending_mark_wait);
+
+static void letcd_pending_timeout_scan(struct timer_list *timer)
+{
+	struct letcd_pending_entry *e;
+	struct hlist_node *tmp;
+	struct gfs2_glock *expired[16];
+	int count = 0;
+	unsigned long now = jiffies;
+	int bkt;
+
+	spin_lock_bh(&letcd_pending_lock);
+	hash_for_each_safe(letcd_pending_table, bkt, tmp, e, node) {
+		if (e->wait_start &&
+		    time_after(now, e->wait_start + LETCD_WAIT_TIMEOUT)) {
+			expired[count++] = e->gl;
+			hash_del(&e->node);
+			kfree(e);
+			if (count >= 16)
+				break;
+		}
+	}
+	spin_unlock_bh(&letcd_pending_lock);
+
+	while (count > 0) {
+		count--;
+		pr_info("  WAIT-TO t=%u n=%llu\n",
+			expired[count]->gl_name.ln_type,
+			expired[count]->gl_name.ln_number);
+		gfs2_glock_complete(expired[count], LM_OUT_TRY_AGAIN);
+	}
+
+	mod_timer(&letcd_wait_timeout_timer, jiffies + HZ);
+}
 
 /* ---- BAST lookup ---- */
 
