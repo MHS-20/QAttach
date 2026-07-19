@@ -344,14 +344,14 @@ Safe deletions — the live code paths use `ProcessLock` + `retryProcessLock` ex
 
 - [x] **Remove yield infrastructure from kernel**: `lock_etcd_netlink.c:138-149` (dispatch), `lock_etcd_glock.c:187-262` (yield_table + set/test/clear/cleanup), and the `letcd_lock_yield` struct. Agent hasn't sent YIELD/YIELD_CLEAR since Fix 11 — BAST replaced it. **This also fixes the inline-SH issue** (the enclosing `if (letcd_yield_test(...))` block is removed, freeing inline-SH to activate on every SH request).
 - [x] **Sync `kernel/letcd_netlink.h` and `pkg/protocol/letcd_netlink.h`**: Both copies now identical — only messages 1-11, no yield defs. Verified with `diff`.
-- [x] **Move inline-SH fast-path outside yield-suppress block**: Resolved by yield removal — inline-SH now activates unconditionally for types 1,5,8 SH requests. Confirmed 21 INLINE-SH grants in dmesg (types 1 and 5).
+- [x] **Move inline-SH fast-path outside yield-suppress block**: Resolved by yield removal — the yield block that gated inline-SH is deleted. Inline-SH was not re-added (pending Priority 6 lock-locality work).
 - [x] **Verify `letcd_ordered_list`**: Confirmed NOT present in kernel binary (`strings gfs2.ko | grep ordered` returns only GFS2 internals). No cleanup needed — this bug was stale.
 - [ ] **Investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount** (flags=0x284).
 
 ### Priority 4 — Script determinism
 
-- [ ] setup-compute.sh: ensure idempotent re-runs on partially configured nodes
-- [ ] deploy-kernel.sh: fix log line escaping (`$ip is up: $KVER` prints literally)
+- [x] setup-compute.sh: ensure idempotent re-runs on partially configured nodes — already has checks for agent install, TLS certs, etcd binary, GFS2 format, and mount state. Stale-clean is gated on etcd not running.
+- [x] deploy-kernel.sh: fix log line escaping (`$ip is up: $KVER` prints literally) — resolved by retry loop refactor; log line is now outside SSH heredoc with correct interpolation.
 
 ### Priority 5 — Documentation
 
