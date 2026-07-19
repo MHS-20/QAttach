@@ -473,10 +473,32 @@ func (c *Client) WatchLockBast(ctx context.Context, lockType uint32, lockNumber 
 	return c.cli.Watch(ctx, bastKey(lockType, lockNumber))
 }
 
+func (c *Client) WatchLockBastFrom(ctx context.Context, lockType uint32, lockNumber uint64, rev int64) clientv3.WatchChan {
+	return c.cli.Watch(ctx, bastKey(lockType, lockNumber), clientv3.WithRev(rev))
+}
+
 // WatchLock returns a watch channel for the lock key.
 // The watcher fires on any change (put, delete) to the key.
 func (c *Client) WatchLock(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
 	return c.cli.Watch(ctx, lockKey(lockType, lockNumber))
+}
+
+// WatchLockFrom returns a watch channel starting from rev, so events
+// between the initial Get and the watch start are not missed.
+func (c *Client) WatchLockFrom(ctx context.Context, lockType uint32, lockNumber uint64, rev int64) clientv3.WatchChan {
+	return c.cli.Watch(ctx, lockKey(lockType, lockNumber), clientv3.WithRev(rev))
+}
+
+// LockRev returns the current etcd revision for the lock key.
+func (c *Client) LockRev(ctx context.Context, lockType uint32, lockNumber uint64) (int64, error) {
+	resp, err := c.cli.Get(ctx, lockKey(lockType, lockNumber))
+	if err != nil {
+		return 0, err
+	}
+	if resp.Header == nil {
+		return 0, nil
+	}
+	return resp.Header.Revision, nil
 }
 
 // ---- fencing ----

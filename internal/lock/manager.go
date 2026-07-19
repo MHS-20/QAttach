@@ -116,7 +116,7 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 			default:
 			}
 			m.processBast(lockType, lockNumber)
-			return
+			continue
 		}
 
 		select {
@@ -125,7 +125,7 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 				return
 			}
 			m.processBast(lockType, lockNumber)
-			return
+			continue
 		case <-ctx.Done():
 			return
 		}
@@ -146,14 +146,16 @@ func (m *Manager) processBast(lockType uint32, lockNumber uint64) {
 	m.etcdCli.DeleteBastRequest(context.Background(), lockType, lockNumber)
 }
 
-// retryProcessLock watches the lock key in etcd and retries ProcessLock on
-// every change.  Replaces polling — only calls ProcessLock when the lock
-// state might have changed, eliminating wasted etcd round-trips.
+// retryProcessLock watches the lock key from the current etcd revision
+// and retries ProcessLock on every change.  Starting the watch from the
+// current revision ensures we don't miss events (key delete, /next write)
+// that happen between the initial ProcessLock failure and the watch setup.
 func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	watchCh := m.etcdCli.WatchLock(ctx, req.GlockType, req.GlockNumber)
+	rev, _ := m.etcdCli.LockRev(ctx, req.GlockType, req.GlockNumber)
+	watchCh := m.etcdCli.WatchLockFrom(ctx, req.GlockType, req.GlockNumber, rev+1)
 
 	for {
 		granted, rev, err := m.etcdCli.ProcessLock(ctx,
