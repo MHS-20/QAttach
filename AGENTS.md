@@ -355,10 +355,10 @@ Safe deletions — the live code paths use `ProcessLock` + `retryProcessLock` ex
 
 ### Priority 5 — Documentation
 
-- [ ] Update `docs/bast-mechanism.md` — entire doc describes removed yield mechanism
-- [ ] Update `docs/summary.md` — claims cross-node I/O is blocked
-- [ ] Update `docs/architecture.md` — BAST flow describes removed yield approach
-- [ ] Update `docs/proposal.md` — status section says handoff under investigation
+- [x] Update `docs/bast-mechanism.md` — rewritten to describe current BAST→Handoff→FIFO flow, removed yield mechanism details
+- [x] Update `docs/summary.md` — updated to reflect cross-node I/O working, current status, throughput ceiling
+- [x] Update `docs/architecture.md` — updated BAST flow, removed yield references, added FIFO handoff
+- [x] Update `docs/proposal.md` — updated lock flow diagram and status section
 
 ### Priority 6 — Performance optimizations (future)
 

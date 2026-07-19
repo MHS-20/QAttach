@@ -40,16 +40,17 @@ Kernel (GFS2)                    cluster-agent                     etcd
 ─────                            ──────────────                    ────
 gfs2_glock_nq(EX)
   → letcd_lock(EX)
-    → NL_SEND LOCK_REQ ──────►   AcquireLock(Txn: CAS put key)
+    → NL_SEND LOCK_REQ ──────►   ProcessLock(single Txn)
                                    → granted? GRANT ──► kernel
                                    → contended? WAIT + bast key
 BAST watcher sees bast key
   → NL_SEND BAST(UN) ────────►
     → gfs2_glock_cb(UN)
       → letcd_lock(UN)
-        → NL_SEND LOCK_REL ──►   ReleaseLock → delete key
-                                   waiter's watchAndRetry sees DELETE
-                                    → AcquireLock → GRANT ──► waiter kernel
+        → NL_SEND LOCK_REL ──►   HandoffRelease
+                                   atomically: delete key + write /next marker
+                                   waiter's retryProcessLock sees /next
+                                    → acquires → GRANT ──► waiter kernel
 ```
 
 ### Key Design Decisions
@@ -183,7 +184,9 @@ Agent receives SIGTERM / SIGINT
 
 ## Current Status
 
-The system can format, mount, and serve basic single-node I/O through GFS2.
-Cross-node lock contention (concurrent writes, metadata operations) exposes
-a glock handoff issue that is under active investigation. See
-`docs/debug/deadlock_issuelog.md` for the detailed technical history.
+Multi-node mount works on all 3 nodes. Cross-node sequential I/O confirmed
+(write on node0, read on node1+2). Concurrent I/O at low throughput (1 op/5s,
+3 shared files) passes at 94-100% success with the FIFO handoff mechanism.
+The old yield-based approach has been removed — BAST→HandoffRelease→FIFO
+is the active contention resolution path. Throughput is limited by etcd
+consensus latency; higher-frequency concurrent I/O can deadlock.
