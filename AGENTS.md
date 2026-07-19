@@ -320,53 +320,46 @@ Test G proved that `--no-hostonly` is the key fix — it worked with yield infra
 
 ## Remaining todo
 
-### Priority 1 — Code quality cleanup (Go only, no kernel rebuild)
+### Priority 1 — Throughput stress testing
 
-Safe deletions — the live code paths use `ProcessLock` + `retryProcessLock` exclusively. All old yield-based helpers are superseded.
+Determine the system's throughput ceiling and investigate deadlock causes.
 
-- [x] **Delete dead functions in `internal/lock/manager.go`**: `watchForLock`, `watchForConversion`, `tryAcquireAsFirstWaiter`. Superseded by `retryProcessLock`.
-- [x] **Delete dead functions in `internal/etcd/client.go`**: `AcquireLock`, `ConvertLock`, `CheckHandoff`, `IsFirstWaiter`, `AmIHolder`, `firstHolderInfo`, `isHolder`. All were helpers for the old flow; handoff is now handled inline in `ProcessLock`.
-- [x] **Delete unused `LockValue` struct** from `pkg/protocol/etcd.go` — lock value format changed to JSON array of `lockEntry` objects.
-- [x] **Delete unused `wg sync.WaitGroup` field** from `internal/netlink/server.go` — declared but never called anywhere.
-- [x] **Delete unreachable UNLOCKED branch** in `internal/lock/manager.go` — kernel never sends LOCK_REQ with mode=0; it sends LOCK_REL instead.
+- [ ] **Run randomized stress test at escalating rates**: start at 1 op/s, increase to 5, 10, 20 ops/s per node on a 3-node cluster. Measure success rate and D-state occurrence.
+- [ ] **Profile etcd latency during contention**: measure round-trip time for lock acquisition/release under load. Identify whether the bottleneck is etcd consensus, agent processing, or GFS2 glock scheduling.
+- [ ] **Diagnose D-state deadlocks**: when processes enter D-state (uninterruptible sleep), capture stack traces (`/proc/*/stack`) and GFS2 glock debug info (`/sys/kernel/debug/gfs2/*/glocks`) to identify which glocks are stuck and why.
+- [ ] **Fix any deadlock patterns found**: possible approaches — add backoff to retry goroutine, implement lock mode conversion (EX→SH demotion without full unlock), or improve BAST delivery timing.
 
-~310 lines removed. Build / test / vet all pass.
+### Priority 2 — Fencing + journal recovery
 
-### Priority 2 — Agent robustness (no kernel changes)
+Wire up production-grade node failure handling.
 
-- [x] **Fix `isEndpointHealthy` connection churn**: `waitForHealth` now creates a single persistent `clientv3.Client` for the health-check loop, reused on every tick, closed on exit. Avoids wasteful TLS handshake churn.
-- [x] **Fix `hasExistingData` restart**: `Bootstrap` now checks peer reachability before writing the full `InitialCluster`. If no peers respond, only the local member is written (sole survivor restart). If at least one peer is healthy, the full cluster spec is used.
-- [x] **Remove debug `netlink recv/dispatch` log lines** in `server.go`.
-- [x] **Clean up `sendMsg` double-write**: removed `nlh.Type = uint16(msgType)`. Kernel reads only the body prefix for dispatch. Updated comment to reflect actual protocol.
-- [x] **Remove `SendRegister` zero payload**: register message now sends only the msgType prefix (4 bytes). Kernel only checks the first 4 bytes.
+- [ ] **Attach IAM role to compute nodes**: create an IAM role with `ec2:StopInstances` and `ec2:DetachVolume` (never TerminateInstances). Attach it to the launch template in `create-infra.sh`.
+- [ ] **Test fencing end-to-end**: manually kill an agent process, verify the surviving nodes detect session expiry, win the CAS race, stop the instance via EC2 API, detach its EBS volume, and increment the cluster epoch.
+- [ ] **Implement journal recovery**: wire up `gfs2_recovery()` calls after successful fencing. The `lock_etcd_mount.c` recovery stubs (`lm_recovery_result`, etc.) need to trigger actual journal replay on surviving nodes.
+- [ ] **Test graceful node addition**: bootstrap a new etcd member onto a running 3-node cluster. Verify the new node mounts GFS2 and can read/write without disrupting existing I/O.
+- [ ] **Test graceful node removal**: deregister a node cleanly (stop agent, remove from etcd, unmount GFS2). Verify surviving nodes continue operating without errors or lock leaks.
 
-### Priority 3 — Kernel correctness (requires kernel rebuild)
+### Priority 3 — Crash and chaos testing
 
-- [x] **Remove yield infrastructure from kernel**: `lock_etcd_netlink.c:138-149` (dispatch), `lock_etcd_glock.c:187-262` (yield_table + set/test/clear/cleanup), and the `letcd_lock_yield` struct. Agent hasn't sent YIELD/YIELD_CLEAR since Fix 11 — BAST replaced it. **This also fixes the inline-SH issue** (the enclosing `if (letcd_yield_test(...))` block is removed, freeing inline-SH to activate on every SH request).
-- [x] **Sync `kernel/letcd_netlink.h` and `pkg/protocol/letcd_netlink.h`**: Both copies now identical — only messages 1-11, no yield defs. Verified with `diff`.
-- [x] **Move inline-SH fast-path outside yield-suppress block**: Resolved by yield removal — the yield block that gated inline-SH is deleted. Inline-SH was not re-added (pending Priority 6 lock-locality work).
-- [x] **Verify `letcd_ordered_list`**: Confirmed NOT present in kernel binary (`strings gfs2.ko | grep ordered` returns only GFS2 internals). No cleanup needed — this bug was stale.
+Validate resilience under failure conditions.
+
+- [ ] **Simulated agent crash**: kill the agent process with `SIGKILL`, verify that after session expiry (15s) the surviving nodes reopen all previously-held locks and continue I/O without data loss.
+- [ ] **Network partition**: use iptables to block etcd peer traffic to one node, verify the partitioned node correctly self-fences (releases locks, stops I/O) and the surviving nodes continue operating.
+- [ ] **Intermittent etcd failures**: randomly restart etcd on one node while I/O is running, verify the Raft cluster re-elects and the lock manager continues without corruption.
+- [ ] **Full chaos test**: combine random crashes, network flaps, and I/O load over a 30-minute period. Measure lock acquisition success rate and data integrity (checksum before/after).
+- [ ] **Anti-entropy verification**: after each test, unmount and run `fsck.gfs2` on a quiescent filesystem to confirm no on-disk corruption.
+
+### Priority 4 — 5-node cluster testing
+
+Scale validation: test everything on 5 compute nodes with colocated etcd.
+
+- [ ] **Update infra scripts for 5 nodes**: modify `create-infra.sh` and `setup-compute.sh` to support configurable node count (parameter-driven, not hardcoded to 3).
+- [ ] **Run full test suite on 5 nodes**: format, mount, cross-node I/O, light stress test, sequential node add/remove, crash/fencing.
+- [ ] **Measure etcd performance at 5 nodes**: Raft consensus latency increases with cluster size. Profile lock acquisition latency at 5 nodes vs 3 nodes to quantify the overhead.
+
+### Open question
+
 - [ ] **Investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount** (flags=0x284).
-
-### Priority 4 — Script determinism
-
-- [x] setup-compute.sh: ensure idempotent re-runs on partially configured nodes — already has checks for agent install, TLS certs, etcd binary, GFS2 format, and mount state. Stale-clean is gated on etcd not running.
-- [x] deploy-kernel.sh: fix log line escaping (`$ip is up: $KVER` prints literally) — resolved by retry loop refactor; log line is now outside SSH heredoc with correct interpolation.
-
-### Priority 5 — Documentation
-
-- [x] Update `docs/bast-mechanism.md` — rewritten to describe current BAST→Handoff→FIFO flow, removed yield mechanism details
-- [x] Update `docs/summary.md` — updated to reflect cross-node I/O working, current status, throughput ceiling
-- [x] Update `docs/architecture.md` — updated BAST flow, removed yield references, added FIFO handoff
-- [x] Update `docs/proposal.md` — updated lock flow diagram and status section
-
-### Priority 6 — Performance optimizations (future)
-
-These are design-level optimizations that borrow from DLM's architecture to reduce etcd latency pressure. Not yet planned for implementation.
-
-- [ ] **Replace polling with etcd Watch in retryProcessLock.** Currently polls `ProcessLock` every 200ms (5 etcd round-trips/sec per waiting lock even when nothing changes). DLM uses event-driven callbacks. The retry goroutine should `Watch` the lock key instead and only call `ProcessLock` when the key changes (holder released). Cuts etcd traffic from O(ops/sec) to O(state changes).
-
-- [ ] **Lock locality / in-kernel fast-path for reacquired locks.** When a node reacquires a lock it already holds (heartbeat, directory inode for a second file in the same directory), grant immediately in the kernel without the netlink→etcd round-trip. The kernel knows which locks it holds via `letcd_bast_insert`. Only when a different node wants the lock (BAST arrives) would the lock touch etcd. This would make the common case of repeated local access as fast as DLM. Requires: new `lm_lock` fast-path for `gl_state` already at or above the requested mode, and a "local grant" that skips the agent entirely.
 
 ## Additional docs
 
