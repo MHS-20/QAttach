@@ -473,6 +473,12 @@ func (c *Client) WatchLockBast(ctx context.Context, lockType uint32, lockNumber 
 	return c.cli.Watch(ctx, bastKey(lockType, lockNumber))
 }
 
+// WatchLock returns a watch channel for the lock key.
+// The watcher fires on any change (put, delete) to the key.
+func (c *Client) WatchLock(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
+	return c.cli.Watch(ctx, lockKey(lockType, lockNumber))
+}
+
 // ---- fencing ----
 
 func (c *Client) CASFencing(ctx context.Context, failedNodeID, localNodeID string) (bool, error) {

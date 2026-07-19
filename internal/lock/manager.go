@@ -146,17 +146,32 @@ func (m *Manager) processBast(lockType uint32, lockNumber uint64) {
 	m.etcdCli.DeleteBastRequest(context.Background(), lockType, lockNumber)
 }
 
-// retryProcessLock periodically retries ProcessLock until the lock is granted
-// or the retry times out (120s). On timeout, the waiter entry is cleaned up
-// and a DENY is sent to the kernel so GFS2 can move on.
+// retryProcessLock watches the lock key in etcd and retries ProcessLock on
+// every change.  Replaces polling — only calls ProcessLock when the lock
+// state might have changed, eliminating wasted etcd round-trips.
 func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	watchCh := m.etcdCli.WatchLock(ctx, req.GlockType, req.GlockNumber)
 
 	for {
+		granted, rev, err := m.etcdCli.ProcessLock(ctx,
+			req.GlockType, req.GlockNumber, m.nodeID, mode)
+		if err != nil {
+			log.Printf("retryProcessLock error type=%d num=%d: %v",
+				req.GlockType, req.GlockNumber, err)
+			return
+		}
+		if granted {
+			log.Printf("retryProcessLock acquired: type=%d num=%d rev=%d",
+				req.GlockType, req.GlockNumber, rev)
+			m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
+			m.sendGrant(req.RequestID, req.RequestedMode, rev)
+			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+			return
+		}
+
 		select {
 		case <-ctx.Done():
 			log.Printf("retryProcessLock timeout type=%d num=%d — denying",
@@ -167,20 +182,8 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 				req.GlockType, req.GlockNumber)
 			m.sendDeny(req.RequestID, protocol.DenyReasonContended)
 			return
-		case <-ticker.C:
-			granted, rev, err := m.etcdCli.ProcessLock(ctx,
-				req.GlockType, req.GlockNumber, m.nodeID, mode)
-			if err != nil {
-				log.Printf("retryProcessLock error type=%d num=%d: %v",
-					req.GlockType, req.GlockNumber, err)
-				return
-			}
-			if granted {
-				log.Printf("retryProcessLock acquired: type=%d num=%d rev=%d",
-					req.GlockType, req.GlockNumber, rev)
-				m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-				m.sendGrant(req.RequestID, req.RequestedMode, rev)
-				m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+		case _, ok := <-watchCh:
+			if !ok {
 				return
 			}
 		}
