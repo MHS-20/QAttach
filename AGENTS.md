@@ -330,42 +330,39 @@ Cross-node **deletion** of files or directories leaves the non-deleting node's c
 
 ## Remaining todo
 
-### Priority 1 — Throughput stress testing
+### Priority 1 — Clean node add/remove (autoscaling happy path)
 
-Determine the system's throughput ceiling and investigate deadlock causes.
+Simulate cloud autoscaling: add a node to a running cluster and remove it cleanly.
 
-- [ ] **Run randomized stress test at escalating rates**: start at 1 op/s, increase to 5, 10, 20 ops/s per node on a 3-node cluster. Measure success rate and D-state occurrence.
-- [ ] **Profile etcd latency during contention**: measure round-trip time for lock acquisition/release under load. Identify whether the bottleneck is etcd consensus, agent processing, or GFS2 glock scheduling.
-- [ ] **Diagnose D-state deadlocks**: when processes enter D-state (uninterruptible sleep), capture stack traces (`/proc/*/stack`) and GFS2 glock debug info (`/sys/kernel/debug/gfs2/*/glocks`) to identify which glocks are stuck and why.
-- [ ] **Fix any deadlock patterns found**: possible approaches — add backoff to retry goroutine, implement lock mode conversion (EX→SH demotion without full unlock), or improve BAST delivery timing.
+**Infrastructure prep:**
+- [ ] **Make node count configurable**: add `COMPUTE_NODES` env var and `--nodes N` flag to `create-infra.sh` and `setup-compute.sh`. Currently hardcoded to 3.
+- [ ] **Add node script**: write `add-compute-node.sh` that provisions a single EC2 instance, attaches the shared EBS volume, runs `deploy-kernel.sh` + `setup-compute.sh` for just one node, joins the existing etcd cluster, and mounts GFS2.
 
-### Priority 2 — Fencing + journal recovery
+**Test sequence:**
+- [ ] **Add 4th node**: run `add-compute-node.sh` on a running 3-node cluster. Verify the new node's etcd member appears in `etcdctl member list`, its agent registers, it mounts GFS2, and it can read/write existing files without disrupting I/O on the other 3 nodes.
+- [ ] **Cross-node I/O from new node**: write files from the new node, read from original nodes. Create in subdirectories, append, overwrite. Use `run-sequential-test.sh`.
+- [ ] **Remove node cleanly**: stop the agent on one node (`systemctl stop cluster-agent`), verify `HandleLockRelease` fires for all held locks, `DeregisterNode` runs, etcd member is removed. The remaining nodes continue I/O without errors. No lock leaks in etcd (`locks/glock/` prefix should not grow).
+- [ ] **Restart a stopped node**: re-start the agent, verify it rejoins etcd, re-mounts GFS2, can access existing files.
+- [ ] **Journal slot reuse**: after node removal, verify the freed journal slot is available for the next node addition (no "Too many users" or stale journal errors).
 
-Wire up production-grade node failure handling.
+### Priority 2 — Crash simulation + fencing (unclean shutdown)
 
-- [ ] **Attach IAM role to compute nodes**: create an IAM role with `ec2:StopInstances` and `ec2:DetachVolume` (never TerminateInstances). Attach it to the launch template in `create-infra.sh`.
-- [ ] **Test fencing end-to-end**: manually kill an agent process, verify the surviving nodes detect session expiry, win the CAS race, stop the instance via EC2 API, detach its EBS volume, and increment the cluster epoch.
-- [ ] **Implement journal recovery**: wire up `gfs2_recovery()` calls after successful fencing. The `lock_etcd_mount.c` recovery stubs (`lm_recovery_result`, etc.) need to trigger actual journal replay on surviving nodes.
-- [ ] **Test graceful node addition**: bootstrap a new etcd member onto a running 3-node cluster. Verify the new node mounts GFS2 and can read/write without disrupting existing I/O.
-- [ ] **Test graceful node removal**: deregister a node cleanly (stop agent, remove from etcd, unmount GFS2). Verify surviving nodes continue operating without errors or lock leaks.
+Force-kill an agent and verify the cluster recovers without data corruption.
 
-### Priority 3 — Crash and chaos testing
+**Infrastructure prep:**
+- [ ] **Attach IAM role**: create an IAM role with `ec2:StopInstances` + `ec2:DetachVolume` (not TerminateInstances). Update `create-infra.sh` launch template to attach it. This enables the fencer to actually call the EC2 API.
 
-Validate resilience under failure conditions.
+**Test sequence:**
+- [ ] **Basic crash recovery (without fencing)**: kill agent with `SIGKILL` (`systemctl kill -s SIGKILL cluster-agent`). Verify etcd session expiry after 15s auto-deletes all lock keys. Other nodes' waiters acquire the freed locks via retryProcessLock. Light I/O continues without interruption. Verify no D-state processes form.
+- [ ] **Fencing CAS race**: kill agent, verify the surviving nodes detect the dead member's key disappearing. Verify exactly one node wins the CAS on `/cluster/fencing/{id}`. Verify the winner calls EC2 `StopInstances` + `DetachVolume`. Verify the cluster epoch increments.
+- [ ] **Lock state after fencing**: verify all locks held by the fenced node are released in etcd. Other nodes can acquire them immediately. No stale `/next` markers or waiter entries remain.
+- [ ] **Recovery from crash**: reboot the fenced instance. Verify it cannot rejoin (epoch is stale — `DenyReasonStaleEpoch`). Format it as a new node and add it cleanly via `add-compute-node.sh`.
+- [ ] **Concurrent crash**: kill agents on 2 nodes simultaneously. Verify the single survivor maintains quorum (etcd needs 2/3 to commit). Verify the survivor can still read/write.
 
-- [ ] **Simulated agent crash**: kill the agent process with `SIGKILL`, verify that after session expiry (15s) the surviving nodes reopen all previously-held locks and continue I/O without data loss.
-- [ ] **Network partition**: use iptables to block etcd peer traffic to one node, verify the partitioned node correctly self-fences (releases locks, stops I/O) and the surviving nodes continue operating.
-- [ ] **Intermittent etcd failures**: randomly restart etcd on one node while I/O is running, verify the Raft cluster re-elects and the lock manager continues without corruption.
-- [ ] **Full chaos test**: combine random crashes, network flaps, and I/O load over a 30-minute period. Measure lock acquisition success rate and data integrity (checksum before/after).
-- [ ] **Anti-entropy verification**: after each test, unmount and run `fsck.gfs2` on a quiescent filesystem to confirm no on-disk corruption.
-
-### Priority 4 — 5-node cluster testing
-
-Scale validation: test everything on 5 compute nodes with colocated etcd.
-
-- [ ] **Update infra scripts for 5 nodes**: modify `create-infra.sh` and `setup-compute.sh` to support configurable node count (parameter-driven, not hardcoded to 3).
-- [ ] **Run full test suite on 5 nodes**: format, mount, cross-node I/O, light stress test, sequential node add/remove, crash/fencing.
-- [ ] **Measure etcd performance at 5 nodes**: Raft consensus latency increases with cluster size. Profile lock acquisition latency at 5 nodes vs 3 nodes to quantify the overhead.
+**Notes on fencing scope:**
+- `lock_etcd_mount.c` recovery stubs (`lm_recovery_result`, `first_done`) currently just log. Journal replay after fencing needs to call `gfs2_recovery()` — this requires deeper integration and is deferred.
+- The IAM role is the minimum required for the fencer to work. Without it, fencing silently fails (as observed).
+- `ec2:StopInstances` is used, never `ec2:TerminateInstances` (safety).
 
 ### Open question
 
