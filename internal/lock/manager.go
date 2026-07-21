@@ -150,8 +150,14 @@ func (m *Manager) processBast(lockType uint32, lockNumber uint64) {
 // and retries ProcessLock on every change.  Starting the watch from the
 // current revision ensures we don't miss events (key delete, /next write)
 // that happen between the initial ProcessLock failure and the watch setup.
+// For inode locks (type=2), uses a 5s timeout to prevent permanent D-state
+// from GFS2's find_first_holder directory glock deadlock.
 func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
-	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	timeout := 120 * time.Second
+	if req.GlockType == protocol.LockTypeInode {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	rev, _ := m.etcdCli.LockRev(ctx, req.GlockType, req.GlockNumber)

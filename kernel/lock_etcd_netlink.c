@@ -4,6 +4,7 @@
 #include <net/net_namespace.h>
 #include <net/netlink.h>
 #include <linux/skbuff.h>
+#include <linux/pagemap.h>
 #include "lock_etcd_internal.h"
 
 struct sock *letcd_nl_sk;
@@ -33,6 +34,8 @@ static void dispatch_mount_resp(struct letcd_mount_resp *resp)
 static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 {
 	struct gfs2_glock *gl = letcd_pending_remove(grant->request_id);
+	s64 old_rev;
+
 	if (!gl) {
 		pr_info("  GRANT-DROPPED reqid=%lld (no pending entry)\n",
 			grant->request_id);
@@ -41,7 +44,20 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 	pr_info("  GRANT reqid=%lld mode=%u rev=%lld\n",
 		grant->request_id, grant->granted_mode,
 		grant->etcd_revision);
+
+	old_rev = letcd_revision_get(gl);
 	letcd_revision_set(gl, grant->etcd_revision);
+
+	/* If etcd revision changed and this is an inode glock,
+	 * another node held the lock — invalidate the cached
+	 * pages so GFS2 re-reads from disk. */
+	if (old_rev && old_rev != grant->etcd_revision &&
+	    gl->gl_name.ln_type == LM_TYPE_INODE &&
+	    gl->gl_object) {
+		struct inode *inode = &((struct gfs2_inode *)gl->gl_object)->i_inode;
+		truncate_inode_pages(inode->i_mapping, 0);
+	}
+
 	gfs2_glock_complete(gl, grant->granted_mode);
 }
 

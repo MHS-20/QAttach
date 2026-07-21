@@ -318,6 +318,16 @@ Test G proved that `--no-hostonly` is the key fix — it worked with yield infra
 3. Deploy on fresh infra using `deploy-kernel.sh` (now fixed)
 4. Run `run-light-test.sh` to verify no regression
 
+## Known limitation: directory inode lock deadlock
+
+Cross-node **deletion** of files or directories leaves the non-deleting node's cache stale. When another node verifies the deletion (e.g., `test -f` on the deleted file), the process enters `gfs2_glock_wait` in D-state waiting for the directory inode glock. The directory EX holder (the node that did the delete) never releases because GFS2's `find_first_holder()` returns a non-NULL inode cache holder, blocking the GLF_DEMOTE path in `do_xmote`. The BAST from the waiter arrives but the holder kernel never processes it.
+
+**Why DLM avoids this**: DLM is a central arbiter that knows the full lock dependency graph. DLM's AST callback wakes the waiter, which finishes I/O naturally and clears the holder. `find_first_holder()` returns NULL on the next `do_xmote` cycle.
+
+**Why lock_etcd can't without patching GFS2**: The `lm_lockops` interface provides no mechanism to force-release a D-state holder. The centralized BAST dispatcher (single goroutine watching `/locks/bast/` prefix) was attempted but broke basic lock acquisition for unknown reasons. The approach that works: shorten the INODE lock retry timeout to 5s — the process gets an I/O error instead of permanent D-state. This converts deadlock into a transient error. The user retries and the next attempt succeeds because the directory EX was released in between.
+
+**What works (verified)**: Cross-node file creation, cross-node reads of existing files, cross-node overwrite/append, all without deadlock. The 5s retry timeout + 30s kernel WAIT-TO safety net ensures no process stays in D-state permanently.
+
 ## Remaining todo
 
 ### Priority 1 — Throughput stress testing

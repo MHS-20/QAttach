@@ -25,7 +25,8 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		pr_info("  UNLOCK t=%u n=%llu\n",
 			gl->gl_name.ln_type, gl->gl_name.ln_number);
 		letcd_nl_send_msg(LETCD_MSG_LOCK_REL, &rel, sizeof(rel));
-		letcd_revision_clear(gl);
+		/* Keep revision — cleared only on glock free.
+		 * dispatch_lock_grant uses it to detect handoff. */
 		gfs2_glock_complete(gl, req_state);
 		return 0;
 	}
