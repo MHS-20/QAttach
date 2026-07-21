@@ -166,7 +166,8 @@ func (s *Server) SendMountResponse(resp protocol.MountResponse) error {
 // SendRegister sends a REGISTER message to the kernel so it learns the
 // agent's PID for subsequent unicast replies.
 func (s *Server) SendRegister() error {
-	return s.sendMsg(protocol.MsgRegister, struct{}{})
+	var zero [4]byte
+	return s.sendMsg(protocol.MsgRegister, zero)
 }
 
 func (s *Server) sendMsg(msgType uint32, v interface{}) error {

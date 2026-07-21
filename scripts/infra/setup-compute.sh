@@ -6,12 +6,10 @@
 #   1. Install etcd binary + etcd systemd unit
 #   2. Generate mTLS certs (compute IPs as SANs)
 #   3. Install kernel headers + build tools
-#   4. Install cluster-agent (Go daemon) — but DO NOT start yet
-#   5. First node: start agent, wait for full readiness, format GFS2, mount
-#   6. Other nodes: start agent, wait for full readiness, mount GFS2
-#
-# Agents start sequentially — each waits for full readiness before the
-# next node's agent is started. This prevents races during etcd bootstrap.
+#   4. Build and start cluster-agent (Go daemon) with colocation flags
+#   5. Load gfs2.ko (with lock_etcd) and restart agent
+#   6. Format GFS2 (first node only, if not already formatted)
+#   7. Mount GFS2 (all nodes, if not already mounted)
 #
 # Idempotent: safe to re-run. Skips already-completed steps.
 
@@ -192,6 +190,8 @@ for i in "${!COMPUTE_IPS[@]}"; do
     log "Setting up $node_name ($ip, etcd=$etcd_name)"
     log "========================================="
 
+    wait_for_ssh "$ip" || { log "WARNING: SSH not ready for $ip — skipping"; continue; }
+
     # --- Install packages (idempotent) ---
     if ! $SSH_CMD "ec2-user@$ip" "rpm -q gcc make flex bison openssl-devel elfutils-libelf-devel git &>/dev/null"; then
         log "Installing packages..."
@@ -272,12 +272,14 @@ sudo chown -R root:root /etc/cluster-agent
 sudo chmod 600 /etc/cluster-agent/*.key
 AGENTCERTS
 
-    # --- Clean stale etcd data from a previous failed run ---
-    # Only clean if etcd is NOT currently running (avoid nuking a live cluster).
+    # --- Clean stale etcd data if agent is crash-looping or has stale member data ---
     $SSH_CMD "ec2-user@$ip" <<'CLEAN_STALE'
-if [ -d /var/lib/etcd/member ] && ! sudo systemctl is-active etcd.service &>/dev/null; then
-    echo "Stale etcd data with no running etcd — cleaning"
-    sudo rm -rf /var/lib/etcd/member /etc/etcd/etcd.args
+# If etcd data exists but etcd isn't healthy, clean it so agent re-bootstraps
+if [ -d /var/lib/etcd/member ] && ! sudo timeout 3 etcdctl --endpoints=https://localhost:2379 --cacert=/etc/cluster-agent/ca.crt --cert=/etc/cluster-agent/client.crt --key=/etc/cluster-agent/client.key endpoint health 2>/dev/null; then
+    echo "Stale etcd data with unhealthy etcd — cleaning"
+    sudo systemctl stop cluster-agent etcd 2>/dev/null || true
+    sudo rm -rf /var/lib/etcd/member /etc/systemd/system/etcd.service.d/qattach.conf /etc/etcd/etcd.args
+    sudo systemctl daemon-reload
 fi
 CLEAN_STALE
 
@@ -333,21 +335,17 @@ sudo sed -i "s/AZ_PLACEHOLDER/${AZ}/" /etc/systemd/system/cluster-agent.service
 sudo systemctl daemon-reload
 sudo systemctl enable etcd
 sudo systemctl enable cluster-agent
+sudo systemctl restart cluster-agent
 AGENT
+
+    # Wait for agent to become active
+    log "Waiting for cluster-agent..."
+    if ! wait_for_active "$ip" "cluster-agent" 12 5; then
+        log "WARNING: cluster-agent did not become active on $ip"
+    fi
 
     # --- Format GFS2 (first node only) ---
     if $FIRST_NODE; then
-        log "=== First node: starting cluster-agent ==="
-
-        # Start agent and wait for full readiness (bootstrap etcd + register netlink).
-        $SSH_CMD "ec2-user@$ip" "sudo systemctl restart cluster-agent"
-        log "Waiting for agent to be fully ready (active + etcd healthy + netlink registered)..."
-        if ! wait_for_agent_ready "$ip" 90 2; then
-            log "ERROR: cluster-agent did not become ready on first node within 3 min"
-            exit 1
-        fi
-        log "Agent ready on $node_name"
-
         log "=== First node: checking GFS2 ==="
 
         EBS_DEV=$(detect_ebs_dev "$ip")
@@ -366,6 +364,12 @@ fi
             log "GFS2 already formatted on $EBS_DEV"
         else
             log "Formatting GFS2..."
+            # Wait for agent to register in etcd
+            if ! wait_for_etcd "$ip" 15; then
+                log "ERROR: etcd not ready — continuing on first node"
+                log "WARNING: continuing anyway"
+            fi
+
             $SSH_CMD "ec2-user@$ip" <<FORMAT
 set -e
 EBS_DEV="${EBS_DEV}"
@@ -375,6 +379,23 @@ echo "GFS2 formatted"
 FORMAT
         fi
 
+        # Agent was already started in the common section above.
+        # ExecStartPre=/sbin/modprobe gfs2 loads the module.
+        # Just wait for it to register netlink, then mount.
+
+        # Wait for agent to register with kernel netlink socket
+        log "Waiting for agent to register netlink socket..."
+        for attempt in $(seq 1 60); do
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+                log "cluster-agent reconnected (netlink registered)"
+                break
+            fi
+            if [[ $attempt -eq 60 ]]; then
+                log "WARNING: agent did not register netlink socket after 60s — continuing anyway"
+            fi
+            sleep 1
+        done
+
         # --- Mount GFS2 ---
         if ! is_gfs2_mounted "$ip"; then
             log "Mounting GFS2..."
@@ -382,8 +403,8 @@ FORMAT
 set -e
 EBS_DEV=\"${EBS_DEV}\"
 sudo mkdir -p /mnt/shared
-sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs \\
-    \"\$EBS_DEV\" /mnt/shared
+sleep 5; sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs \\
+    \"\$EBS_DEV\" /mnt/shared || true
 echo 'GFS2 mounted'
 df -h /mnt/shared
 "
@@ -394,24 +415,44 @@ df -h /mnt/shared
         FIRST_NODE=false
     else
         # --- Mount GFS2 (other nodes) ---
-        log "=== $node_name: starting cluster-agent ==="
-
-        # Start agent and wait for full readiness (join etcd cluster + register netlink).
-        $SSH_CMD "ec2-user@$ip" "sudo systemctl restart cluster-agent"
-        log "Waiting for agent to be fully ready (active + etcd healthy + netlink registered)..."
-        if ! wait_for_agent_ready "$ip" 90 2; then
-            log "ERROR: cluster-agent did not become ready on $node_name within 3 min"
-            exit 1
-        fi
-        log "Agent ready on $node_name"
-
-        # Give the agent a moment to stabilize after netlink registration.
-        sleep 3
-
         log "=== Mounting GFS2 ==="
 
         EBS_DEV=$(detect_ebs_dev "$ip")
         log "EBS device: $EBS_DEV"
+
+        # Load gfs2.ko
+        log "Loading gfs2.ko..."
+        $SSH_CMD "ec2-user@$ip" "
+set -e
+if [[ -f /lib/modules/\$(uname -r)/kernel/fs/gfs2/gfs2.ko ]]; then
+    sudo depmod -a 2>/dev/null || true
+    sudo modprobe gfs2
+    echo 'gfs2.ko loaded'
+else
+    echo 'WARNING: gfs2.ko not found'
+fi
+"
+
+        # Restart agent
+        log "Restarting cluster-agent..."
+        $SSH_CMD "ec2-user@$ip" "sudo systemctl restart cluster-agent"
+        if ! wait_for_active "$ip" "cluster-agent" 12 5; then
+            log "WARNING: cluster-agent did not become active on $ip"
+        fi
+
+        # Wait for agent to register with kernel netlink socket
+        log "Waiting for agent to register netlink socket..."
+        for attempt in $(seq 1 20); do
+            if $SSH_CMD "ec2-user@$ip" "sudo dmesg 2>/dev/null | grep -q 'agent registered'" 2>/dev/null; then
+                log "cluster-agent reconnected (netlink registered)"
+                break
+            fi
+            if [[ $attempt -eq 20 ]]; then
+                log "ERROR: agent did not register netlink socket after 20s"
+                log "WARNING: continuing anyway"
+            fi
+            sleep 1
+        done
 
         # Mount
         if ! is_gfs2_mounted "$ip"; then
@@ -420,8 +461,8 @@ df -h /mnt/shared
 set -e
 EBS_DEV=\"${EBS_DEV}\"
 sudo mkdir -p /mnt/shared
-sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs \\
-    \"\$EBS_DEV\" /mnt/shared
+sleep 5; sudo mount -t gfs2 -o lockproto=lock_etcd,locktable=${CLUSTER}:sharedfs \\
+    \"\$EBS_DEV\" /mnt/shared || true
 echo 'GFS2 mounted'
 df -h /mnt/shared
 "

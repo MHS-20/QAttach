@@ -249,7 +249,7 @@ wait_for_agent_ready() {
 
         local reg
         reg=$(ssh $SSH_OPTS "ec2-user@${ip}" "sudo dmesg 2>/dev/null | grep -c 'agent registered' | tr -d '[:space:]'" 2>/dev/null || echo 0)
-        if [[ "$reg" != "0" ]]; then
+        if [[ "$reg" -eq 0 ]]; then
             i=$((i + 1))
             sleep "$delay"
             continue
