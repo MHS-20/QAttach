@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/polarity/qattach/internal/etcd"
-	"github.com/polarity/qattach/internal/netlink"
-	"github.com/polarity/qattach/pkg/protocol"
+	"github.com/MHS-20/QAttach/internal/etcd"
+	"github.com/MHS-20/QAttach/internal/netlink"
+	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
 type heldLock struct {

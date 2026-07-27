@@ -15,7 +15,7 @@ import (
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/polarity/qattach/internal/config"
+	"github.com/MHS-20/QAttach/internal/config"
 )
 
 const (

@@ -13,8 +13,8 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 
-	"github.com/polarity/qattach/internal/config"
-	"github.com/polarity/qattach/pkg/protocol"
+	"github.com/MHS-20/QAttach/internal/config"
+	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
 // Client wraps etcd client with session management.

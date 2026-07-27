@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/polarity/qattach/pkg/protocol"
+	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
 func TestDecodeLE(t *testing.T) {

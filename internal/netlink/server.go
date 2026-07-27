@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/polarity/qattach/pkg/protocol"
+	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
 // Handler receives messages from the kernel module.

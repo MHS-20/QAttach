@@ -1,4 +1,4 @@
-module github.com/polarity/qattach
+module github.com/MHS-20/QAttach
 
 go 1.26.4
 

@@ -3,7 +3,7 @@ package config
 import (
 	"time"
 
-	"github.com/polarity/qattach/pkg/protocol"
+	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
 // Config holds all cluster-agent configuration.

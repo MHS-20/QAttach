@@ -9,15 +9,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/polarity/qattach/internal/config"
-	"github.com/polarity/qattach/internal/etcd"
-	"github.com/polarity/qattach/internal/fencing"
-	"github.com/polarity/qattach/internal/identity"
-	"github.com/polarity/qattach/internal/lifecycle"
-	"github.com/polarity/qattach/internal/lock"
-	"github.com/polarity/qattach/internal/membership"
-	"github.com/polarity/qattach/internal/netlink"
-	"github.com/polarity/qattach/internal/signal"
+	"github.com/MHS-20/QAttach/internal/config"
+	"github.com/MHS-20/QAttach/internal/etcd"
+	"github.com/MHS-20/QAttach/internal/fencing"
+	"github.com/MHS-20/QAttach/internal/identity"
+	"github.com/MHS-20/QAttach/internal/lifecycle"
+	"github.com/MHS-20/QAttach/internal/lock"
+	"github.com/MHS-20/QAttach/internal/membership"
+	"github.com/MHS-20/QAttach/internal/netlink"
+	"github.com/MHS-20/QAttach/internal/signal"
 )
 
 func main() {
