@@ -61,7 +61,8 @@ VPC_ID=$(discover_vpc)
 log "VPC: $VPC_ID"
 
 SG_ID=$(state_get sg_id 2>/dev/null || echo "")
-if [[ -n "$SG_ID" && "$SG_ID" != "null" && "$SG_ID" != "" ]]; then
+[[ "$SG_ID" == "null" ]] && SG_ID=""
+if [[ -n "$SG_ID" ]]; then
     if aws ec2 describe-security-groups --group-ids "$SG_ID" &>/dev/null; then
         log "Security group already exists: $SG_ID"
     else
@@ -116,7 +117,8 @@ state_put ami_id "\"$AMI_ID\""
 # ---- Step 4: EBS Multi-Attach volume ----
 
 VOL_ID=$(state_get volume_id 2>/dev/null || echo "")
-if [[ -n "$VOL_ID" && "$VOL_ID" != "null" && "$VOL_ID" != "" ]]; then
+[[ "$VOL_ID" == "null" ]] && VOL_ID=""
+if [[ -n "$VOL_ID" ]]; then
     VOL_STATE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
         --query 'Volumes[0].State' --output text 2>/dev/null || echo "deleted")
     if [[ "$VOL_STATE" != "deleted" && "$VOL_STATE" != "None" && "$VOL_STATE" != "null" ]]; then
