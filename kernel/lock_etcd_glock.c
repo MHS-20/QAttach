@@ -132,16 +132,31 @@ struct bast_entry {
 static DEFINE_HASHTABLE(bast_table, LETCD_BAST_BITS);
 static DEFINE_SPINLOCK(bast_lock);
 
+/* Entries live from the first ACQUIRE until letcd_put_lock() frees the
+ * glock, so they survive UNLOCK→ACQUIRE cycles (a BAST may arrive for a
+ * cached glock).  Re-inserting must therefore update in place, or the
+ * table grows without bound under sustained I/O. */
 void letcd_bast_insert(u32 t, u64 n, struct gfs2_glock *gl)
 {
-	struct bast_entry *e = kmalloc(sizeof(*e), GFP_ATOMIC);
-	u32 key;
+	struct bast_entry *e;
+	u32 key = jhash_2words(t, (u32)n, 0);
+
+	spin_lock_bh(&bast_lock);
+	hash_for_each_possible(bast_table, e, node, key) {
+		if (e->type == t && e->number == n) {
+			e->gl = gl;
+			spin_unlock_bh(&bast_lock);
+			return;
+		}
+	}
+	spin_unlock_bh(&bast_lock);
+
+	e = kmalloc(sizeof(*e), GFP_ATOMIC);
 	if (!e)
 		return;
 	e->type = t;
 	e->number = n;
 	e->gl = gl;
-	key = jhash_2words(t, (u32)n, 0);
 	spin_lock_bh(&bast_lock);
 	hash_add(bast_table, &e->node, key);
 	spin_unlock_bh(&bast_lock);
