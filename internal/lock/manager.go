@@ -179,6 +179,11 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 		bg := context.Background()
 		m.etcdCli.RemoveWaiter(bg, req.GlockType, req.GlockNumber, m.nodeID)
 		m.etcdCli.DeleteHandoff(bg, req.GlockType, req.GlockNumber, m.nodeID)
+		// Drop our own outstanding demote request; left behind it would
+		// survive its lease and make the next holder demote for a waiter
+		// that no longer exists.
+		m.etcdCli.DeleteBastRequest(bg, req.GlockType, req.GlockNumber,
+			protocol.BastTargetMode(req.RequestedMode), m.nodeID)
 		m.sendDeny(req.RequestID, protocol.DenyReasonContended)
 	}()
 
