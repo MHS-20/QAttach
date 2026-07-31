@@ -1,5 +1,12 @@
 # QAttach Retrospective — Why GFS2 on etcd locking is not viable
 
+> **Correction (2026-07-31).** A review against the GFS2 and DLM sources
+> in `gfs2/` and `dlm/` does not support the conclusion below.  The
+> analysis that follows is kept for the record, but four of its five
+> "fundamental barriers" are wrong, and the observed failures trace to
+> defects in this repository rather than to GFS2's design.  See
+> "What the source actually says" at the end of this file.
+
 ## The premise
 
 QAttach replaces DLM (a kernel-level distributed lock manager) with etcd, a
@@ -220,3 +227,46 @@ infrastructure) could be adapted for:
    lock library, without the kernel module or GFS2 dependency
 
 None of these are QAttach. The original GFS2+etcd vision is not achievable.
+
+## What the source actually says
+
+**"`find_first_holder` deadlocks the demote forever" — no.**
+`run_queue` (`gfs2/glock.c:776`) defers a demote while a holder exists, but
+`__gfs2_glock_dq` (`gfs2/glock.c:1573-1585`) re-queues the glock work as
+soon as the last holder drops, precisely when a demote is pending.  A
+finished `ls` has already dequeued its `gfs2_holder`; cached pages are not
+holders, so `find_first_holder` returns NULL.  Deferred is not permanent.
+
+**"GFS2 needs microsecond lock resolution" — no.**
+`gfs2_glock_wait` (`gfs2/glock.c:1263`) is an untimed `wait_on_bit`.  There
+is no deadline anywhere in the glock state machine, and `gl_hold_time`
+self-tunes upward (`gfs2/glock.c:1232`) precisely to absorb a slow lock
+manager.  Latency costs throughput, never correctness.
+
+**"etcd has no per-lock master or grant queue" — no.**
+The Raft leader is a per-lock master and revision order is a global FIFO;
+etcd's own `concurrency.Mutex` is built on exactly that.  `GetWaiters`
+already sorts by `CreateRevision`.  The single-slot `/next` marker was a
+hand-rolled substitute for an ordering etcd provides directly.
+
+**"Cache invalidation needs `DLM_SBF_DEMOTED`" — no.**
+`gdlm_ast` asserts that flag is never set (`gfs2/lock_dlm.c:133`).
+Invalidation is done by GFS2 itself through `glops->go_inval` in
+`do_xmote` (`gfs2/glock.c:698`) plus `GLF_INSTANTIATE_NEEDED` on reacquire.
+
+**What was actually wrong.**  Defects in this repository, since fixed:
+errnos passed to `gfs2_glock_complete`, which takes an `LM_OUT_*` bitmask;
+`LM_OUT_TRY_AGAIN` returned for non-TRY requests, which reaches
+`GLOCK_BUG_ON` in `finish_xmote`; exit paths in `retryProcessLock` that
+completed no request at all, leaving `GLF_LOCK` set and wedging the glock
+and everything queued behind it; a release path that never removed the
+holder entry when no waiter was queued; a compatibility check that let DF
+and SH holders coexist; an unhandled session expiry that silently dropped
+every lock this node held while GFS2 kept writing.
+
+The remaining cost is genuine but is a throughput ceiling, not a wall:
+roughly 5ms per contended transition against DLM's ~10µs.  The failures
+reported above occurred at ~10 ops/s, about 5% of that ceiling, which is a
+per-operation defect rate rather than saturation.  Distinguishing the two
+takes one experiment nobody ran: the same *total operation count* at both
+rates.
