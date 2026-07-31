@@ -51,9 +51,17 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		log.Printf("lock request: id=%d type=%d num=%d mode=%d",
 			req.RequestID, req.GlockType, req.GlockNumber, req.RequestedMode)
 
-	mode := protocol.LockModeToEtcd(req.RequestedMode)
+		mode := protocol.LockModeToEtcd(req.RequestedMode)
+		if mode == "" {
+			// An unmapped mode would be stored as an empty holder
+			// entry and then conflict with every other mode.
+			log.Printf("lock request: unsupported mode %d type=%d num=%d",
+				req.RequestedMode, req.GlockType, req.GlockNumber)
+			m.sendDeny(req.RequestID, protocol.DenyReasonError)
+			return
+		}
 
-	granted, rev, err := m.etcdCli.ProcessLock(ctx,
+		granted, rev, err := m.etcdCli.ProcessLock(ctx,
 			req.GlockType, req.GlockNumber, m.nodeID, mode)
 		if err != nil {
 			log.Printf("process lock error type=%d num=%d: %v",
