@@ -49,6 +49,17 @@ func LockModeToEtcd(mode uint32) string {
 	}
 }
 
+// BastTargetMode returns the mode a holder must demote to so that a
+// waiter requesting mode can be granted.  Mirrors gdlm_bast in
+// fs/gfs2/lock_dlm.c: an EX waiter forces the holder to UN, while SH and
+// DF waiters only force the holder down to their own mode.
+func BastTargetMode(requested uint32) uint32 {
+	if requested == LockModeExclusive {
+		return LockModeUnlocked
+	}
+	return requested
+}
+
 // LockModeName returns a human-readable name for a lock mode.
 func LockModeName(mode uint32) string {
 	switch mode {

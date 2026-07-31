@@ -89,8 +89,8 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 
 		// WAIT — conflicts exist.  Start the retry goroutine.
 		m.etcdCli.AddWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-		m.etcdCli.RequestBast(ctx,
-			req.GlockType, req.GlockNumber, 0, m.nodeID)
+		m.etcdCli.RequestBast(ctx, req.GlockType, req.GlockNumber,
+			protocol.BastTargetMode(req.RequestedMode), m.nodeID)
 		m.sendWait(req.RequestID)
 		go m.retryProcessLock(ctx, req, mode)
 	}()
@@ -119,8 +119,8 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 	// fresh one per BAST cycle and never cancelled the old ones.
 	bastCh := m.etcdCli.WatchBastRequests(ctx, lockType, lockNumber)
 
-	if hasWaiter, _ := m.etcdCli.HasWaiter(ctx, lockType, lockNumber); hasWaiter {
-		m.processBast(lockType, lockNumber)
+	if hasWaiter, target, _ := m.etcdCli.HasWaiter(ctx, lockType, lockNumber); hasWaiter {
+		m.processBast(ctx, lockType, lockNumber, target)
 	}
 
 	for {
@@ -129,25 +129,29 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 			if !ok {
 				return
 			}
-			m.processBast(lockType, lockNumber)
+			hasWaiter, target, _ := m.etcdCli.HasWaiter(ctx, lockType, lockNumber)
+			if hasWaiter {
+				m.processBast(ctx, lockType, lockNumber, target)
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (m *Manager) processBast(lockType uint32, lockNumber uint64) {
-	log.Printf("bast received: type=%d num=%d — yielding", lockType, lockNumber)
+func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32) {
+	log.Printf("bast received: type=%d num=%d — demoting to %s",
+		lockType, lockNumber, protocol.LockModeName(targetMode))
 
 	if m.nlSrv != nil {
 		m.nlSrv.SendBast(protocol.BastNotification{
 			GlockType:   lockType,
 			GlockNumber: lockNumber,
-			TargetMode:  0,
+			TargetMode:  targetMode,
 		})
 	}
 
-	m.etcdCli.DeleteBastRequest(context.Background(), lockType, lockNumber)
+	m.etcdCli.DeleteBastRequest(ctx, lockType, lockNumber)
 }
 
 // retryProcessLock watches the lock key from the current etcd revision

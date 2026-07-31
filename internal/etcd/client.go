@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -396,18 +397,22 @@ func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber ui
 	return err
 }
 
-// HasWaiter returns true and the waiter's nodeID if a bast key exists.
-func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint64) (bool, string) {
+// HasWaiter reports whether a bast request exists, returning the mode the
+// holder must demote to and the waiter's nodeID.
+func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint64) (bool, uint32, string) {
 	resp, err := c.cli.Get(ctx, bastKey(lockType, lockNumber))
 	if err != nil || len(resp.Kvs) == 0 {
-		return false, ""
+		return false, 0, ""
 	}
-	val := string(resp.Kvs[0].Value)
-	parts := strings.SplitN(val, ",", 2)
-	if len(parts) == 2 && parts[1] != "" {
-		return true, parts[1]
+	parts := strings.SplitN(string(resp.Kvs[0].Value), ",", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return false, 0, ""
 	}
-	return false, ""
+	mode, err := strconv.ParseUint(parts[0], 10, 32)
+	if err != nil {
+		return false, 0, ""
+	}
+	return true, uint32(mode), parts[1]
 }
 
 func (c *Client) DeleteBastRequest(ctx context.Context, lockType uint32, lockNumber uint64) error {
