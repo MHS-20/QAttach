@@ -17,8 +17,7 @@ EXPORT_SYMBOL(letcd_req_counter);
 static void letcd_pending_timeout_scan(struct timer_list *);
 DEFINE_TIMER(letcd_wait_timeout_timer, letcd_pending_timeout_scan);
 
-void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
-			  u32 glock_type, u64 glock_number)
+void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl)
 {
 	struct letcd_pending_entry *e = kmalloc(sizeof(*e), GFP_ATOMIC);
 	if (!e)
@@ -42,9 +41,8 @@ struct gfs2_glock *letcd_pending_remove(u64 request_id)
 		if (e->request_id == request_id) {
 			gl = e->gl;
 			hash_del(&e->node);
-			spin_unlock_bh(&letcd_pending_lock);
 			kfree(e);
-			return gl;
+			break;
 		}
 	}
 	spin_unlock_bh(&letcd_pending_lock);

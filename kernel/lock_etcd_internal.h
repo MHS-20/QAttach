@@ -33,8 +33,7 @@ extern struct sock *letcd_nl_sk;
 extern struct letcd_mount_context letcd_mount_ctx;
 extern const struct lm_lockops letcd_ops;
 
-void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl,
-			  u32 glock_type, u64 glock_number);
+void letcd_pending_insert(u64 request_id, struct gfs2_glock *gl);
 struct gfs2_glock *letcd_pending_remove(u64 request_id);
 struct gfs2_glock *letcd_pending_find(u64 request_id);
 void letcd_pending_mark_wait(u64 request_id);

@@ -54,8 +54,7 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 		req.requested_mode, req.request_id);
 
 	letcd_bast_insert(req.glock_type, req.glock_number, gl);
-	letcd_pending_insert(req.request_id, gl,
-			     req.glock_type, req.glock_number);
+	letcd_pending_insert(req.request_id, gl);
 
 	pr_info("  INSERTED t=%u n=%llu reqid=%lld\n",
 		req.glock_type, req.glock_number, req.request_id);
