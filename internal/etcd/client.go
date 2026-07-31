@@ -63,6 +63,14 @@ func New(ctx context.Context, cfg *config.Config) (*Client, error) {
 	}, nil
 }
 
+// Done closes when the session lease expires.  Every member, journal and
+// lock key this node owns is attached to that lease, so etcd drops them
+// all at once while GFS2 still believes it holds the corresponding
+// glocks.  Callers must treat this as loss of cluster membership.
+func (c *Client) Done() <-chan struct{} {
+	return c.sess.Done()
+}
+
 // RegisterNode atomically writes /cluster/members/{node_id} with session lease.
 func (c *Client) RegisterNode(ctx context.Context, nodeID, instanceID, ip, az string) error {
 	val := fmt.Sprintf(`{"instance_id":"%s","ip":"%s","az":"%s"}`, instanceID, ip, az)

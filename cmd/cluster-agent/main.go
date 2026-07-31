@@ -91,6 +91,19 @@ func main() {
 	// Start fencer watch loop.
 	go f.Run(ctx)
 
+	// A lapsed session lease deletes every lock key this node owns while
+	// GFS2 still believes it holds those glocks — another node could then
+	// take EX on the same inode and both would write.  Die immediately:
+	// the kernel's netlink sends start failing with -ENODEV so GFS2
+	// degrades to I/O errors, and peers fence us on the member deletion.
+	go func() {
+		select {
+		case <-ec.Done():
+			log.Fatalf("etcd session lease expired — all locks lost, exiting to be fenced")
+		case <-ctx.Done():
+		}
+	}()
+
 	// Start ASG lifecycle hook poll if configured.
 	if cfg.ASGName != "" {
 		lh, err := lifecycle.NewHookHandler(id.InstanceID)
