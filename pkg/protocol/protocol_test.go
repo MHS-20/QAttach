@@ -1,8 +1,8 @@
 package protocol
 
 import (
-	"encoding/binary"
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -312,6 +312,21 @@ func TestGlockTypeValues(t *testing.T) {
 			if val != 9 {
 				t.Errorf("LM_TYPE_JOURNAL must be 9, got %d", val)
 			}
+		}
+	}
+}
+
+// Mirrors gdlm_bast in fs/gfs2/lock_dlm.c: only an EX waiter forces the
+// holder all the way to UN.  The agent used to hardcode UN for every
+// BAST, dropping readers that a demote to SH would have kept.
+func TestBastTargetMode(t *testing.T) {
+	for req, want := range map[uint32]uint32{
+		LockModeExclusive: LockModeUnlocked,
+		LockModeShared:    LockModeShared,
+		LockModeDeferred:  LockModeDeferred,
+	} {
+		if got := BastTargetMode(req); got != want {
+			t.Errorf("BastTargetMode(%d) = %d, want %d", req, got, want)
 		}
 	}
 }
