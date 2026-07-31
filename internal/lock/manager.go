@@ -180,7 +180,7 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 			req.GlockType, req.GlockNumber)
 		bg := context.Background()
 		m.etcdCli.RemoveWaiter(bg, req.GlockType, req.GlockNumber, m.nodeID)
-		m.etcdCli.DeleteHandoff(bg, req.GlockType, req.GlockNumber)
+		m.etcdCli.DeleteHandoff(bg, req.GlockType, req.GlockNumber, m.nodeID)
 		m.sendDeny(req.RequestID, protocol.DenyReasonContended)
 	}()
 

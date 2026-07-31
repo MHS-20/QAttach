@@ -374,9 +374,15 @@ func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber
 	return target, err
 }
 
-// DeleteHandoff removes the handoff marker for a lock (if it names this node).
-func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64) error {
-	_, err := c.cli.Delete(ctx, handoffKey(lockType, lockNumber))
+// DeleteHandoff clears the handoff reservation, but only when it names
+// nodeID.  Deleting another node's reservation would break the FIFO
+// ordering that stops a releasing holder from immediately reacquiring.
+func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) error {
+	hk := handoffKey(lockType, lockNumber)
+	_, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(hk), "=", nodeID)).
+		Then(clientv3.OpDelete(hk)).
+		Commit()
 	return err
 }
 
