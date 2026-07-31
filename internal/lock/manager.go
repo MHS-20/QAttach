@@ -216,33 +216,6 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 	}
 }
 
-func (m *Manager) releaseHeldLock(ctx context.Context, lockType uint32, lockNumber uint64) {
-	mapKey := lockMapKey(lockType, lockNumber)
-	m.mu.Lock()
-	hl, ok := m.heldLocks[mapKey]
-	if ok {
-		delete(m.heldLocks, mapKey)
-	}
-	m.mu.Unlock()
-
-	if ok {
-		hl.cancel()
-		if err := m.etcdCli.ReleaseLock(ctx, lockType, lockNumber, m.nodeID); err != nil {
-			log.Printf("release lock error type=%d num=%d: %v",
-				lockType, lockNumber, err)
-		}
-		log.Printf("released lock type=%d num=%d mode=%s",
-			lockType, lockNumber, hl.mode)
-		return
-	}
-
-	// Untracked — still clean up etcd.
-	if err := m.etcdCli.ReleaseLock(ctx, lockType, lockNumber, m.nodeID); err != nil {
-		log.Printf("release untracked lock error type=%d num=%d: %v",
-			lockType, lockNumber, err)
-	}
-}
-
 func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
 	ctx := context.Background()
 
