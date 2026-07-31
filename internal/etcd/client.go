@@ -125,15 +125,12 @@ func marshalHolders(h []lockEntry) string {
 
 // ---- lock operations ----
 
-// modesConflict returns true if two lock modes conflict.
+// modesConflict returns true if two lock modes held on the same object
+// conflict, per the DLM compatibility matrix GFS2 assumes (see may_grant
+// in fs/gfs2/glock.c): EX excludes everything, PR and CW are each
+// compatible only with themselves, and PR/CW exclude each other.
 func modesConflict(a, b string) bool {
-	if a == b {
-		return false
-	}
-	if a == "EX" || b == "EX" {
-		return true
-	}
-	return false
+	return a != b || a == protocol.EtcdModeEX
 }
 
 // ProcessLock handles a lock request atomically in a single etcd Txn.
@@ -216,89 +213,38 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 			}
 		}
 
-		if ourIdx >= 0 {
-			// ---- Self-contention: we're already a holder ----
-			if holders[ourIdx].Mode == mode {
-				// Already at target mode — just check conflicts.
-				for i, h := range holders {
-					if i == ourIdx {
-						continue
-					}
-					if modesConflict(mode, h.Mode) {
-						return false, 0, nil
-					}
-				}
-				return true, getResp.Kvs[0].ModRevision, nil
-			}
-
-			// Mode change.
-			if mode == "EX" {
-				for i, h := range holders {
-					if i == ourIdx {
-						continue
-					}
-					if h.Mode == "EX" {
-						// Another node holds EX — can't
-						// upgrade.  Keep our PR entry
-						// and return false.  The BAST
-						// mechanism will cause the EX
-						// holder to release; the retry
-						// goroutine will acquire EX then.
-						return false, 0, nil
-					}
-				}
-			}
-
-			// Update our mode.
-			newHolders := make([]lockEntry, len(holders))
-			copy(newHolders, holders)
-			newHolders[ourIdx].Mode = mode
-
-			txnResp, err := c.cli.Txn(ctx).
-				If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-				Then(clientv3.OpPut(key, marshalHolders(newHolders),
-					clientv3.WithLease(c.sess.Lease()))).
-				Commit()
-			if err != nil {
-				return false, 0, fmt.Errorf("process update txn: %w", err)
-			}
-			if !txnResp.Succeeded {
+		// A conflicting holder blocks this mode, whether we are
+		// converting or acquiring fresh.  Leave any entry we already
+		// have untouched and return false: BAST drives the holder
+		// out and the retry goroutine converts afterwards.
+		for i, h := range holders {
+			if i == ourIdx {
 				continue
 			}
-
-			for i, h := range newHolders {
-				if i == ourIdx {
-					continue
-				}
-				if modesConflict(mode, h.Mode) {
-					return false, 0, nil
-				}
-			}
-			return true, txnResp.Header.Revision, nil
-		}
-
-		// ---- Fresh acquisition: we're not a holder ----
-		if mode == "EX" {
-			// Key exists with holders — can't get EX.
-			return false, 0, nil
-		}
-
-		// PR mode — check for EX holder.
-		for _, h := range holders {
-			if h.Mode == "EX" {
+			if modesConflict(mode, h.Mode) {
 				return false, 0, nil
 			}
 		}
 
-		// Append our PR entry.
-		newHolders := append(holders, lockEntry{Node: nodeID, Mode: mode})
+		if ourIdx >= 0 && holders[ourIdx].Mode == mode {
+			return true, getResp.Kvs[0].ModRevision, nil
+		}
+
+		newHolders := make([]lockEntry, len(holders), len(holders)+1)
+		copy(newHolders, holders)
+		if ourIdx >= 0 {
+			newHolders[ourIdx].Mode = mode
+		} else {
+			newHolders = append(newHolders, lockEntry{Node: nodeID, Mode: mode})
+		}
+
 		txnResp, err := c.cli.Txn(ctx).
 			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
 			Then(clientv3.OpPut(key, marshalHolders(newHolders),
 				clientv3.WithLease(c.sess.Lease()))).
 			Commit()
 		if err != nil {
-			return false, 0, fmt.Errorf("process append txn: %w", err)
+			return false, 0, fmt.Errorf("process txn: %w", err)
 		}
 		if !txnResp.Succeeded {
 			continue
