@@ -262,52 +262,54 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 	}
 }
 
-// ReleaseLock removes this node's entry from the holders array.
-// If the array becomes empty, the key is deleted.
-// Retries on CAS version mismatch (concurrent multi-holder release).
-func (c *Client) ReleaseLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) error {
+// ReleaseLock removes this node's entry from the holders array, retrying
+// on CAS version mismatch (concurrent multi-holder release).
+//
+// When that leaves the key empty it is deleted, and if waiters are queued
+// the delete and a FIFO reservation for the first of them commit in the
+// same transaction — no other node, including this one, can reclaim the
+// lock in between.  Returns the reserved node, or "" if none.
+func (c *Client) ReleaseLock(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (string, error) {
 	key := lockKey(lockType, lockNumber)
 
 	for {
 		getResp, err := c.cli.Get(ctx, key)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if len(getResp.Kvs) == 0 {
-			return nil
+			return "", nil
 		}
 
 		ver := getResp.Kvs[0].Version
-		holders := parseHolders(getResp.Kvs[0].Value)
-		if len(holders) == 0 {
-			return nil
-		}
-
-		filtered := make([]lockEntry, 0, len(holders))
-		for _, h := range holders {
+		filtered := make([]lockEntry, 0, 1)
+		for _, h := range parseHolders(getResp.Kvs[0].Value) {
 			if h.Node != nodeID {
 				filtered = append(filtered, h)
 			}
 		}
 
-		var txnResp *clientv3.TxnResponse
-		if len(filtered) == 0 {
-			txnResp, err = c.cli.Txn(ctx).
-				If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-				Then(clientv3.OpDelete(key)).
-				Commit()
+		target := ""
+		var ops []clientv3.Op
+		if len(filtered) > 0 {
+			ops = []clientv3.Op{clientv3.OpPut(key, marshalHolders(filtered),
+				clientv3.WithLease(c.sess.Lease()))}
 		} else {
-			txnResp, err = c.cli.Txn(ctx).
-				If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-				Then(clientv3.OpPut(key, marshalHolders(filtered),
-					clientv3.WithLease(c.sess.Lease()))).
-				Commit()
+			ops = []clientv3.Op{clientv3.OpDelete(key)}
+			if target, err = c.reserveHandoff(ctx, lockType, lockNumber, &ops); err != nil {
+				return "", err
+			}
 		}
+
+		txnResp, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
+			Then(ops...).
+			Commit()
 		if err != nil {
-			return err
+			return "", err
 		}
 		if txnResp.Succeeded {
-			return nil
+			return target, nil
 		}
 	}
 }
@@ -356,16 +358,14 @@ func handoffKey(lockType uint32, lockNumber uint64) string {
 	return fmt.Sprintf("%s%d/%d/next", protocol.PrefixWait, lockType, lockNumber)
 }
 
-// HandoffRelease atomically deletes the lock key and writes a handoff
-// reservation for the next waiter.  Returns the handoff target nodeID.
-func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber uint64, nodeID string) (string, error) {
+// reserveHandoff appends a FIFO reservation for the longest-waiting node
+// to ops, so it commits together with the caller's lock-key delete.
+// Returns the reserved node, or "" when nobody is waiting.
+func (c *Client) reserveHandoff(ctx context.Context, lockType uint32, lockNumber uint64, ops *[]clientv3.Op) (string, error) {
 	waiters, err := c.GetWaiters(ctx, lockType, lockNumber)
 	if err != nil || len(waiters) == 0 {
 		return "", err
 	}
-	lk := lockKey(lockType, lockNumber)
-	hk := handoffKey(lockType, lockNumber)
-	target := waiters[0]
 
 	// The reservation gets its own short lease rather than this node's
 	// session lease: if the designated waiter dies before claiming, the
@@ -376,12 +376,9 @@ func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber
 		return "", fmt.Errorf("handoff lease grant: %w", err)
 	}
 
-	_, err = c.cli.Txn(ctx).
-		If(clientv3.Compare(clientv3.Version(lk), ">", 0)).
-		Then(clientv3.OpDelete(lk),
-			clientv3.OpPut(hk, target, clientv3.WithLease(lease.ID))).
-		Commit()
-	return target, err
+	*ops = append(*ops, clientv3.OpPut(handoffKey(lockType, lockNumber),
+		waiters[0], clientv3.WithLease(lease.ID)))
+	return waiters[0], nil
 }
 
 // DeleteHandoff clears the handoff reservation, but only when it names

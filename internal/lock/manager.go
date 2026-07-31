@@ -12,18 +12,14 @@ import (
 	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
-type heldLock struct {
-	cancel context.CancelFunc
-	mode   string
-}
-
 type Manager struct {
 	etcdCli *etcd.Client
 	nlSrv   *netlink.Server
 	nodeID  string
 
-	mu        sync.Mutex
-	heldLocks map[string]*heldLock
+	mu sync.Mutex
+	// heldLocks maps a lock to the cancel func of its BAST watcher.
+	heldLocks map[string]context.CancelFunc
 	epoch     int64
 }
 
@@ -31,7 +27,7 @@ func NewManager(ec *etcd.Client, nodeID string) *Manager {
 	return &Manager{
 		etcdCli:   ec,
 		nodeID:    nodeID,
-		heldLocks: make(map[string]*heldLock),
+		heldLocks: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -72,7 +68,7 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 
 		if granted {
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
-			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+			m.trackHeldLock(req.GlockType, req.GlockNumber)
 			return
 		}
 
@@ -96,14 +92,14 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 	}()
 }
 
-func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string) {
+func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	mapKey := lockMapKey(lockType, lockNumber)
 	m.mu.Lock()
 	if prev, ok := m.heldLocks[mapKey]; ok {
-		prev.cancel()
+		prev()
 	}
-	m.heldLocks[mapKey] = &heldLock{cancel: cancel, mode: mode}
+	m.heldLocks[mapKey] = cancel
 	m.mu.Unlock()
 
 	go m.watchBastAndYield(ctx, lockType, lockNumber)
@@ -201,7 +197,7 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 			acquired = true
 			m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
-			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
+			m.trackHeldLock(req.GlockType, req.GlockNumber)
 			return
 		}
 
@@ -221,36 +217,29 @@ func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
 
 	mapKey := lockMapKey(req.GlockType, req.GlockNumber)
 	m.mu.Lock()
-	hl, ok := m.heldLocks[mapKey]
+	cancel, ok := m.heldLocks[mapKey]
 	if ok {
 		delete(m.heldLocks, mapKey)
 	}
 	m.mu.Unlock()
 
+	// An untracked lock (agent restarted, or a type we never watched)
+	// still has to be cleared from etcd, so both paths release.
 	if ok {
-		hl.cancel()
-		target, err := m.etcdCli.HandoffRelease(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID)
-		if err != nil {
-			log.Printf("handoff error type=%d num=%d: %v",
-				req.GlockType, req.GlockNumber, err)
-			return
-		}
-		if target != "" {
-			log.Printf("handoff: type=%d num=%d → %s",
-				req.GlockType, req.GlockNumber, target)
-		}
-		log.Printf("released lock type=%d num=%d mode=%s",
-			req.GlockType, req.GlockNumber, hl.mode)
-		return
+		cancel()
 	}
 
-	// Lock not tracked locally (agent restarted, or untracked
-	// lock type).  Still release from etcd so the key is cleaned up.
-	if err := m.etcdCli.ReleaseLock(ctx, req.GlockType, req.GlockNumber, m.nodeID); err != nil {
-		log.Printf("release untracked lock error type=%d num=%d: %v",
+	target, err := m.etcdCli.ReleaseLock(ctx, req.GlockType, req.GlockNumber, m.nodeID)
+	if err != nil {
+		log.Printf("release error type=%d num=%d: %v",
 			req.GlockType, req.GlockNumber, err)
+		return
 	}
+	if target != "" {
+		log.Printf("handoff: type=%d num=%d -> %s",
+			req.GlockType, req.GlockNumber, target)
+	}
+	log.Printf("released lock type=%d num=%d", req.GlockType, req.GlockNumber)
 }
 
 func (m *Manager) HandleUnmount() {
