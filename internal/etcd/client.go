@@ -415,18 +415,30 @@ func (c *Client) DeleteBastRequest(ctx context.Context, lockType uint32, lockNum
 	return err
 }
 
-func (c *Client) WatchLockBast(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
-	return c.cli.Watch(ctx, bastKey(lockType, lockNumber))
-}
+// WatchBastRequests signals once per newly written bast request.  Deletes
+// are filtered out: the holder deletes the key itself in response, and
+// echoing that back would send the kernel a second, spurious BAST.
+func (c *Client) WatchBastRequests(ctx context.Context, lockType uint32, lockNumber uint64) <-chan struct{} {
+	wch := c.cli.Watch(ctx, bastKey(lockType, lockNumber))
+	out := make(chan struct{}, 1)
 
-func (c *Client) WatchLockBastFrom(ctx context.Context, lockType uint32, lockNumber uint64, rev int64) clientv3.WatchChan {
-	return c.cli.Watch(ctx, bastKey(lockType, lockNumber), clientv3.WithRev(rev))
-}
-
-// WatchLock returns a watch channel for the lock key.
-// The watcher fires on any change (put, delete) to the key.
-func (c *Client) WatchLock(ctx context.Context, lockType uint32, lockNumber uint64) clientv3.WatchChan {
-	return c.cli.Watch(ctx, lockKey(lockType, lockNumber))
+	go func() {
+		defer close(out)
+		for resp := range wch {
+			for _, ev := range resp.Events {
+				if ev.Type != clientv3.EventTypePut {
+					continue
+				}
+				select {
+				case out <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				break
+			}
+		}
+	}()
+	return out
 }
 
 // WatchLockFrom returns a watch channel starting from rev, so events

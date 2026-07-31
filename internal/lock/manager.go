@@ -113,27 +113,23 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64, mode string)
 // When a BAST appears: send BAST to kernel, release the etcd key,
 // and let waiters acquire via FIFO.  Does NOT reacquire.
 func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNumber uint64) {
+	// Start the watcher before the initial check so a bast request
+	// written in between is delivered rather than missed.  One watcher
+	// for the lifetime of the held lock — the previous loop created a
+	// fresh one per BAST cycle and never cancelled the old ones.
+	bastCh := m.etcdCli.WatchBastRequests(ctx, lockType, lockNumber)
+
+	if hasWaiter, _ := m.etcdCli.HasWaiter(ctx, lockType, lockNumber); hasWaiter {
+		m.processBast(lockType, lockNumber)
+	}
+
 	for {
-		bastCh := m.etcdCli.WatchLockBast(ctx, lockType, lockNumber)
-
-		hasWaiter, _ := m.etcdCli.HasWaiter(context.Background(), lockType, lockNumber)
-		if hasWaiter {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			m.processBast(lockType, lockNumber)
-			continue
-		}
-
 		select {
 		case _, ok := <-bastCh:
 			if !ok {
 				return
 			}
 			m.processBast(lockType, lockNumber)
-			continue
 		case <-ctx.Done():
 			return
 		}
