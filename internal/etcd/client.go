@@ -366,10 +366,20 @@ func (c *Client) HandoffRelease(ctx context.Context, lockType uint32, lockNumber
 	lk := lockKey(lockType, lockNumber)
 	hk := handoffKey(lockType, lockNumber)
 	target := waiters[0]
+
+	// The reservation gets its own short lease rather than this node's
+	// session lease: if the designated waiter dies before claiming, the
+	// marker must expire on its own, or it blocks the lock for as long
+	// as the releasing node stays alive.
+	lease, err := c.cli.Grant(ctx, protocol.HandoffLeaseTTL)
+	if err != nil {
+		return "", fmt.Errorf("handoff lease grant: %w", err)
+	}
+
 	_, err = c.cli.Txn(ctx).
 		If(clientv3.Compare(clientv3.Version(lk), ">", 0)).
 		Then(clientv3.OpDelete(lk),
-			clientv3.OpPut(hk, target, clientv3.WithLease(c.sess.Lease()))).
+			clientv3.OpPut(hk, target, clientv3.WithLease(lease.ID))).
 		Commit()
 	return target, err
 }

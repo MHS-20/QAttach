@@ -24,4 +24,5 @@ const (
 	SessionTTL = 15 // seconds
 	KeepaliveInterval = 5 // seconds, must be < TTL/3 per etcd best practice
 	FencingLeaseTTL = 60 // seconds, short TTL for fencing key
+	HandoffLeaseTTL = 5  // seconds, frees the reservation if the waiter dies
 )
