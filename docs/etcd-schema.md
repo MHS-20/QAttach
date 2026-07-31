@@ -41,32 +41,42 @@ locks/
     Readers:  All agents (WatchLockKey for contention/retry)
 
     Rules:
-      EX: CAS Version=0, Put with one EX holder.
-      SH: Get holders, check no EX exists, append SH entry via optimistic lock on Version.
-          Fails if an EX holder exists (must request BAST first).
-      DF: Like EX, single-holder only.
+      Acquire/convert: Get holders, reject if any *other* holder's mode
+               conflicts (DLM matrix: EX excludes everything; PR and CW are
+               compatible only with themselves, so PR and CW exclude each
+               other).  Otherwise add or update this node's entry via
+               optimistic lock on Version.  A rejected requester keeps any
+               entry it already had and waits for a BAST to clear the way.
       Release: Read-modify-write Txn to remove this node's entry.
-               If array becomes empty, delete the key.
-      Handoff: Txn replaces holder's entry with waiter's entry (mode change),
-               or removes holder entry if waiter wants EX.
+               If the array becomes empty, the key is deleted — and if
+               waiters are queued, the delete and the `/next` reservation
+               for the longest-waiting node commit in the same Txn, so no
+               node can reclaim the lock in between.
 
   bast/{type}/{number}
     Purpose:  BAST request signal from waiter to holder
     Value:    "targetMode,waiterID" (e.g. "0,i-0f620a6db190e05ce")
     Lease:    Short lease (15s)
-    Writers:  Agent that failed to CAS (waiter)
-    Readers:  Holder's agent (WatchLockBast)
+    Writers:  Agent that failed to acquire (waiter)
+    Readers:  Holder's agent (WatchBastRequests — PUT events only)
+    Note:     targetMode is the mode the holder must demote to, derived
+              from the waiter's request the way gdlm_bast does it: an EX
+              waiter forces UN, an SH or DF waiter forces only SH or DF.
 
   glock/{type}/{number}/next
     Purpose:  FIFO handoff reservation (active — enforces lock ordering)
     Value:    waiter node_id
-    Lease:    Releasing node's session lease (TTL=15s)
-    Writers:  Holder (via HandoffRelease)
-    Readers:  Waiter (CheckHandoff / ProcessLock)
+    Lease:    Its own short lease (TTL=5s), not the releasing node's
+              session lease — otherwise a designated waiter that dies
+              before claiming would block the lock for as long as the
+              releasing node stays alive.
+    Writers:  Releasing holder (inside ReleaseLock's Txn)
+    Readers:  Waiter (ProcessLock)
     Lifecycle: Created atomically with lock key deletion. ProcessLock
-               refuses acquisition if marker names a different node.
-               Deleted atomically when the designated node acquires.
-               Deleted by retryProcessLock on timeout.
+               refuses acquisition if the marker names a different node.
+               Deleted atomically when the designated node acquires, or
+               by that node's retry timeout — a Txn guarded on the value
+               so no node can clear another node's reservation.
 ```
 
 ## Lock Mode Semantics
@@ -104,6 +114,11 @@ locks/
   Prevents stale bast requests if the waiter crashes.
 - **Handoff token lease**: 5s TTL.  Short to quickly free the slot if the
   waiter crashes.
+
+Session expiry is fatal, not recoverable: every member, journal and lock
+key hangs off the session lease, so a lapsed lease drops them all at once
+while GFS2 still believes it holds the corresponding glocks.  The agent
+watches `Session.Done()` and exits immediately so peers fence it.
 
 ## Session Lifecycle
 
