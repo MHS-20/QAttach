@@ -105,10 +105,20 @@ func (m *Manager) trackHeldLock(lockType uint32, lockNumber uint64) {
 	go m.watchBastAndYield(ctx, lockType, lockNumber)
 }
 
+// minHoldTime is the shortest time a lock stays with us before we honour a
+// demote request, mirroring GFS2's own gl_hold_time (HZ/5 in
+// fs/gfs2/glock.c).  Without it a lock handed to us by the FIFO reservation
+// is demoted again before the operation that asked for it has run: the
+// waiter that triggered the handoff has usually already re-armed its bast
+// request, so the grant and the demote arrive together and the lock
+// ping-pongs between nodes without either making progress.
+const minHoldTime = 200 * time.Millisecond
+
 // watchBastAndYield watches the BAST key for a lock we hold.
 // When a BAST appears: send BAST to kernel, release the etcd key,
 // and let waiters acquire via FIFO.  Does NOT reacquire.
 func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNumber uint64) {
+	held := time.Now()
 	// Start the watcher before the initial check so a bast request
 	// written in between is delivered rather than missed.  One watcher
 	// for the lifetime of the held lock — the previous loop created a
@@ -116,7 +126,7 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 	bastCh := m.etcdCli.WatchBastRequests(ctx, lockType, lockNumber)
 
 	if hasWaiter, target, waiter := m.etcdCli.HasWaiter(ctx, lockType, lockNumber); hasWaiter {
-		m.processBast(ctx, lockType, lockNumber, target, waiter)
+		m.processBast(ctx, lockType, lockNumber, target, waiter, held)
 	}
 
 	for {
@@ -127,7 +137,7 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 			}
 			hasWaiter, target, waiter := m.etcdCli.HasWaiter(ctx, lockType, lockNumber)
 			if hasWaiter {
-				m.processBast(ctx, lockType, lockNumber, target, waiter)
+				m.processBast(ctx, lockType, lockNumber, target, waiter, held)
 			}
 		case <-ctx.Done():
 			return
@@ -136,7 +146,15 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 }
 
 func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber uint64,
-	targetMode uint32, waiterID string) {
+	targetMode uint32, waiterID string, held time.Time) {
+	if wait := minHoldTime - time.Since(held); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
+	}
+
 	log.Printf("bast received: type=%d num=%d — demoting to %s",
 		lockType, lockNumber, protocol.LockModeName(targetMode))
 

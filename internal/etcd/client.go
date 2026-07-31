@@ -429,7 +429,14 @@ func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint
 	if err != nil || len(resp.Kvs) == 0 {
 		return false, 0, ""
 	}
-	parts := strings.SplitN(string(resp.Kvs[0].Value), ",", 2)
+	return parseBastValue(string(resp.Kvs[0].Value))
+}
+
+// parseBastValue is the inverse of bastValue.  The pair has to round-trip
+// exactly: DeleteBastRequest guards its delete on the reconstructed string,
+// so any asymmetry would leave every processed request in place forever.
+func parseBastValue(v string) (bool, uint32, string) {
+	parts := strings.SplitN(v, ",", 2)
 	if len(parts) != 2 || parts[1] == "" {
 		return false, 0, ""
 	}
