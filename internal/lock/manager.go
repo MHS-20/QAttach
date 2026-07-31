@@ -150,18 +150,19 @@ func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber u
 	m.etcdCli.DeleteBastRequest(ctx, lockType, lockNumber)
 }
 
+// lockWaitTimeout bounds how long a contended request may wait before the
+// agent denies it.  It must stay below the kernel module's
+// LETCD_WAIT_TIMEOUT (30s): if the kernel gives up first it completes the
+// request itself, drops the pending entry, and a later GRANT from here is
+// discarded — leaving an etcd holder entry no node actually holds.
+const lockWaitTimeout = 20 * time.Second
+
 // retryProcessLock watches the lock key from the current etcd revision
 // and retries ProcessLock on every change.  Starting the watch from the
 // current revision ensures we don't miss events (key delete, /next write)
 // that happen between the initial ProcessLock failure and the watch setup.
-// For inode locks (type=2), uses a 5s timeout to prevent permanent D-state
-// from GFS2's find_first_holder directory glock deadlock.
 func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
-	timeout := 120 * time.Second
-	if req.GlockType == protocol.LockTypeInode {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, lockWaitTimeout)
 	defer cancel()
 
 	// lm_lock returned 0, so the kernel left GLF_LOCK set and is waiting
