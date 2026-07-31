@@ -111,7 +111,10 @@ static void letcd_pending_timeout_scan(struct timer_list *timer)
 		pr_info("  WAIT-TO t=%u n=%llu\n",
 			expired[count]->gl_name.ln_type,
 			expired[count]->gl_name.ln_number);
-		gfs2_glock_complete(expired[count], LM_OUT_TRY_AGAIN);
+		/* LM_OUT_TRY_AGAIN is only legal when the holder set
+		 * LM_FLAG_TRY/TRY_1CB.  For a plain request finish_xmote()
+		 * falls through to GLOCK_BUG_ON() when gl_state is EX. */
+		gfs2_glock_complete(expired[count], LM_OUT_ERROR);
 	}
 
 	mod_timer(&letcd_wait_timeout_timer, jiffies + HZ);

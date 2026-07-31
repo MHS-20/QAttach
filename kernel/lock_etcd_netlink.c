@@ -64,7 +64,6 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 {
 	struct gfs2_glock *gl = letcd_pending_remove(deny->request_id);
-	int ret = -EIO;
 
 	if (!gl) {
 		pr_info("  DENY-DROPPED reqid=%lld\n", deny->request_id);
@@ -72,12 +71,12 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 	}
 	pr_info("  DENY reqid=%lld reason=%u\n",
 		deny->request_id, deny->reason);
-	if (deny->reason == LETCD_DENY_STALE ||
-	    deny->reason == LETCD_DENY_STALE_EPOCH)
-		ret = -ESTALE;
-	else if (deny->reason == LETCD_DENY_CONTENDED)
-		ret = -EAGAIN;
-	gfs2_glock_complete(gl, ret);
+
+	/* gfs2_glock_complete() takes an LM_OUT_* bitmask, never an errno.
+	 * LM_OUT_ERROR is the only value that wakes a non-TRY holder
+	 * (do_error() sets gh_error = -EIO); an errno here would be
+	 * misparsed and can trip GLOCK_BUG_ON in finish_xmote(). */
+	gfs2_glock_complete(gl, LM_OUT_ERROR);
 }
 
 static void dispatch_lock_wait(struct letcd_lock_wait *wait)
