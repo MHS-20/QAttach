@@ -160,6 +160,22 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// lm_lock returned 0, so the kernel left GLF_LOCK set and is waiting
+	// for exactly one GRANT or DENY.  Any exit path that sends neither
+	// wedges that glock — and everything queued behind it — forever.
+	acquired := false
+	defer func() {
+		if acquired {
+			return
+		}
+		log.Printf("retryProcessLock giving up type=%d num=%d — denying",
+			req.GlockType, req.GlockNumber)
+		bg := context.Background()
+		m.etcdCli.RemoveWaiter(bg, req.GlockType, req.GlockNumber, m.nodeID)
+		m.etcdCli.DeleteHandoff(bg, req.GlockType, req.GlockNumber)
+		m.sendDeny(req.RequestID, protocol.DenyReasonContended)
+	}()
+
 	rev, _ := m.etcdCli.LockRev(ctx, req.GlockType, req.GlockNumber)
 	watchCh := m.etcdCli.WatchLockFrom(ctx, req.GlockType, req.GlockNumber, rev+1)
 
@@ -174,6 +190,7 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 		if granted {
 			log.Printf("retryProcessLock acquired: type=%d num=%d rev=%d",
 				req.GlockType, req.GlockNumber, rev)
+			acquired = true
 			m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
 			m.sendGrant(req.RequestID, req.RequestedMode, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber, mode)
@@ -182,13 +199,6 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 
 		select {
 		case <-ctx.Done():
-			log.Printf("retryProcessLock timeout type=%d num=%d — denying",
-				req.GlockType, req.GlockNumber)
-			m.etcdCli.RemoveWaiter(context.Background(),
-				req.GlockType, req.GlockNumber, m.nodeID)
-			m.etcdCli.DeleteHandoff(context.Background(),
-				req.GlockType, req.GlockNumber)
-			m.sendDeny(req.RequestID, protocol.DenyReasonContended)
 			return
 		case _, ok := <-watchCh:
 			if !ok {
