@@ -122,11 +122,15 @@ static void letcd_pending_timeout_scan(struct timer_list *timer)
 
 /* ---- BAST lookup ---- */
 
+/* One entry per live glock, created on the first ACQUIRE and freed by
+ * letcd_put_lock().  Holds both the BAST target and the last granted etcd
+ * revision — they share a key and a lifetime, so they share a table. */
 #define LETCD_BAST_BITS 8
 struct bast_entry {
 	u32 type;
 	u64 number;
 	struct gfs2_glock *gl;
+	s64 revision;
 	struct hlist_node node;
 };
 static DEFINE_HASHTABLE(bast_table, LETCD_BAST_BITS);
@@ -157,6 +161,7 @@ void letcd_bast_insert(u32 t, u64 n, struct gfs2_glock *gl)
 	e->type = t;
 	e->number = n;
 	e->gl = gl;
+	e->revision = 0;
 	spin_lock_bh(&bast_lock);
 	hash_add(bast_table, &e->node, key);
 	spin_unlock_bh(&bast_lock);
@@ -200,74 +205,26 @@ EXPORT_SYMBOL(letcd_bast_lookup);
 
 /* ---- revision tracking ---- */
 
-#define LETCD_REV_BITS 8
-struct rev_entry {
-	struct gfs2_glock *gl;
-	s64 revision;
-	struct hlist_node node;
-};
-static DEFINE_HASHTABLE(rev_table, LETCD_REV_BITS);
-static DEFINE_SPINLOCK(rev_lock);
-
-void letcd_revision_set(struct gfs2_glock *gl, s64 rev)
+/* Returns the previously recorded revision and stores the new one, so the
+ * caller can detect a handoff (revision changed => another node held the
+ * lock in between) in a single locked pass. */
+s64 letcd_revision_swap(struct gfs2_glock *gl, s64 rev)
 {
-	struct rev_entry *e;
-	unsigned long key = (unsigned long)gl;
-	bool found = false;
+	struct bast_entry *e;
+	u32 t = gl->gl_name.ln_type;
+	u64 n = gl->gl_name.ln_number;
+	u32 key = jhash_2words(t, (u32)n, 0);
+	s64 old = 0;
 
-	spin_lock_bh(&rev_lock);
-	hash_for_each_possible(rev_table, e, node, key) {
-		if (e->gl == gl) {
+	spin_lock_bh(&bast_lock);
+	hash_for_each_possible(bast_table, e, node, key) {
+		if (e->type == t && e->number == n) {
+			old = e->revision;
 			e->revision = rev;
-			found = true;
 			break;
 		}
 	}
-	if (!found) {
-		spin_unlock_bh(&rev_lock);
-		e = kmalloc(sizeof(*e), GFP_ATOMIC);
-		if (!e)
-			return;
-		e->gl = gl;
-		e->revision = rev;
-		spin_lock_bh(&rev_lock);
-		hash_add(rev_table, &e->node, key);
-	}
-	spin_unlock_bh(&rev_lock);
+	spin_unlock_bh(&bast_lock);
+	return old;
 }
-EXPORT_SYMBOL(letcd_revision_set);
-
-s64 letcd_revision_get(struct gfs2_glock *gl)
-{
-	struct rev_entry *e;
-	unsigned long key = (unsigned long)gl;
-	s64 rev = 0;
-
-	spin_lock_bh(&rev_lock);
-	hash_for_each_possible(rev_table, e, node, key) {
-		if (e->gl == gl) {
-			rev = e->revision;
-			break;
-		}
-	}
-	spin_unlock_bh(&rev_lock);
-	return rev;
-}
-EXPORT_SYMBOL(letcd_revision_get);
-
-void letcd_revision_clear(struct gfs2_glock *gl)
-{
-	struct rev_entry *e;
-	unsigned long key = (unsigned long)gl;
-
-	spin_lock_bh(&rev_lock);
-	hash_for_each_possible(rev_table, e, node, key) {
-		if (e->gl == gl) {
-			hash_del(&e->node);
-			kfree(e);
-			break;
-		}
-	}
-	spin_unlock_bh(&rev_lock);
-}
-EXPORT_SYMBOL(letcd_revision_clear);
+EXPORT_SYMBOL(letcd_revision_swap);

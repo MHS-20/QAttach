@@ -45,8 +45,7 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 		grant->request_id, grant->granted_mode,
 		grant->etcd_revision);
 
-	old_rev = letcd_revision_get(gl);
-	letcd_revision_set(gl, grant->etcd_revision);
+	old_rev = letcd_revision_swap(gl, grant->etcd_revision);
 
 	/* If etcd revision changed and this is an inode glock,
 	 * another node held the lock — invalidate the cached
