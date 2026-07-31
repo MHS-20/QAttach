@@ -60,8 +60,9 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	pr_info("  INSERTED t=%u n=%llu reqid=%lld\n",
 		req.glock_type, req.glock_number, req.request_id);
 
-	if (!(flags & (LM_FLAG_TRY | LM_FLAG_TRY_1CB)))
-		set_bit(GLF_BLOCKING, &gl->gl_flags);
+	/* TRY requests already returned above, so this is always a
+	 * blocking request. */
+	set_bit(GLF_BLOCKING, &gl->gl_flags);
 
 	ret = letcd_nl_send_msg(LETCD_MSG_LOCK_REQ, &req, sizeof(req));
 	pr_info("  NL-SENT t=%u n=%llu reqid=%lld ret=%d\n",
@@ -72,7 +73,10 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 			req.glock_type, req.glock_number, req.request_id, ret);
 		letcd_pending_remove(req.request_id);
 		letcd_bast_remove(req.glock_type, req.glock_number);
-		return ret;
+		/* do_xmote() only tolerates -ENODEV from lm_lock; any other
+		 * error hits GLOCK_BUG_ON(gl, !gfs2_withdrawn(sdp)) and
+		 * panics.  A dead agent must degrade to I/O errors instead. */
+		return -ENODEV;
 	}
 
 	return 0;
