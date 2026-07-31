@@ -62,6 +62,18 @@ locks/
     Note:     targetMode is the mode the holder must demote to, derived
               from the waiter's request the way gdlm_bast does it: an EX
               waiter forces UN, an SH or DF waiter forces only SH or DF.
+    Rules:    The holder deletes the key once it has passed the BAST to its
+              kernel, guarded on the exact value it read — a waiter may have
+              overwritten it in between, and erasing that newer request
+              would strand the waiter.  Because the key is consumed, a
+              waiter re-writes it on every retry: one request only ever
+              reaches one holder, and on a contended glock the lock changes
+              hands repeatedly while a waiter waits.  A waiter that gives up
+              deletes its own request, again guarded on the value.
+              A holder does not act on a BAST until it has held the lock for
+              minHoldTime (200ms, mirroring GFS2's gl_hold_time), otherwise
+              a lock arriving via a FIFO reservation is demoted before the
+              operation that asked for it has run.
 
   glock/{type}/{number}/next
     Purpose:  FIFO handoff reservation (active — enforces lock ordering)
