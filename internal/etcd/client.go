@@ -407,9 +407,13 @@ func waitPrefix(lockType uint32, lockNumber uint64) string {
 	return fmt.Sprintf("%s%d/%d/wait/", protocol.PrefixWait, lockType, lockNumber)
 }
 
+func bastValue(targetMode uint32, waiterID string) string {
+	return fmt.Sprintf("%d,%s", targetMode, waiterID)
+}
+
 func (c *Client) RequestBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32, waiterID string) error {
 	key := bastKey(lockType, lockNumber)
-	val := fmt.Sprintf("%d,%s", targetMode, waiterID)
+	val := bastValue(targetMode, waiterID)
 	lease, err := c.cli.Grant(ctx, int64(c.cfg.SessionTTL.Seconds()))
 	if err != nil {
 		return fmt.Errorf("bast lease grant: %w", err)
@@ -436,8 +440,18 @@ func (c *Client) HasWaiter(ctx context.Context, lockType uint32, lockNumber uint
 	return true, uint32(mode), parts[1]
 }
 
-func (c *Client) DeleteBastRequest(ctx context.Context, lockType uint32, lockNumber uint64) error {
-	_, err := c.cli.Delete(ctx, bastKey(lockType, lockNumber))
+// DeleteBastRequest clears a bast request the holder has acted on, but
+// only if the key still holds that exact request.  A waiter may overwrite
+// it between the read and the delete; erasing the newer request would drop
+// the only demote signal that waiter gets, and it would then spin on the
+// lock key until its wait timeout.
+func (c *Client) DeleteBastRequest(ctx context.Context, lockType uint32, lockNumber uint64,
+	targetMode uint32, waiterID string) error {
+	key := bastKey(lockType, lockNumber)
+	_, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(key), "=", bastValue(targetMode, waiterID))).
+		Then(clientv3.OpDelete(key)).
+		Commit()
 	return err
 }
 

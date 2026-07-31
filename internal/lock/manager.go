@@ -115,8 +115,8 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 	// fresh one per BAST cycle and never cancelled the old ones.
 	bastCh := m.etcdCli.WatchBastRequests(ctx, lockType, lockNumber)
 
-	if hasWaiter, target, _ := m.etcdCli.HasWaiter(ctx, lockType, lockNumber); hasWaiter {
-		m.processBast(ctx, lockType, lockNumber, target)
+	if hasWaiter, target, waiter := m.etcdCli.HasWaiter(ctx, lockType, lockNumber); hasWaiter {
+		m.processBast(ctx, lockType, lockNumber, target, waiter)
 	}
 
 	for {
@@ -125,9 +125,9 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 			if !ok {
 				return
 			}
-			hasWaiter, target, _ := m.etcdCli.HasWaiter(ctx, lockType, lockNumber)
+			hasWaiter, target, waiter := m.etcdCli.HasWaiter(ctx, lockType, lockNumber)
 			if hasWaiter {
-				m.processBast(ctx, lockType, lockNumber, target)
+				m.processBast(ctx, lockType, lockNumber, target, waiter)
 			}
 		case <-ctx.Done():
 			return
@@ -135,7 +135,8 @@ func (m *Manager) watchBastAndYield(ctx context.Context, lockType uint32, lockNu
 	}
 }
 
-func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber uint64, targetMode uint32) {
+func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber uint64,
+	targetMode uint32, waiterID string) {
 	log.Printf("bast received: type=%d num=%d — demoting to %s",
 		lockType, lockNumber, protocol.LockModeName(targetMode))
 
@@ -147,7 +148,7 @@ func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber u
 		})
 	}
 
-	m.etcdCli.DeleteBastRequest(ctx, lockType, lockNumber)
+	m.etcdCli.DeleteBastRequest(ctx, lockType, lockNumber, targetMode, waiterID)
 }
 
 // lockWaitTimeout bounds how long a contended request may wait before the
