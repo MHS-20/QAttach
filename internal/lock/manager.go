@@ -203,6 +203,17 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 			return
 		}
 
+		// Re-arm the demote signal against whoever holds the lock *now*.
+		// The holder deletes the bast key as soon as it has passed the
+		// BAST to its kernel, so the single request made when this wait
+		// started only ever reaches one holder.  On a hot glock — a
+		// shared directory under create/unlink churn — the lock changes
+		// hands repeatedly while we wait, and every holder after the
+		// first would never be told to demote: we would spin here until
+		// lockWaitTimeout and then deny an acquisition nobody refused.
+		m.etcdCli.RequestBast(ctx, req.GlockType, req.GlockNumber,
+			protocol.BastTargetMode(req.RequestedMode), m.nodeID)
+
 		select {
 		case <-ctx.Done():
 			return
