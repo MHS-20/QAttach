@@ -320,6 +320,15 @@ Test G proved that `--no-hostonly` is the key fix — it worked with yield infra
 
 ## Known limitation: directory inode lock deadlock
 
+> **Superseded (2026-07-31).** The root-cause analysis in this section is the
+> pre-correction reading. `docs/retrospective.md` carries a correction of the
+> same date (commit `295c9c7`): re-checked against the GFS2 and DLM sources,
+> `find_first_holder` defers a demotion rather than dropping it, and
+> `__gfs2_glock_dq` re-queues the glock work when the last holder leaves. The
+> deadlock traced to defects in this repository, several fixed after that date
+> (`6173f25`, `b714683`). Read the correction before citing the paragraphs
+> below.
+
 Cross-node **deletion** of files or directories leaves the non-deleting node's cache stale. When another node verifies the deletion (e.g., `test -f` on the deleted file), the process enters `gfs2_glock_wait` in D-state waiting for the directory inode glock. The directory EX holder (the node that did the delete) never releases because GFS2's `find_first_holder()` returns a non-NULL inode cache holder, blocking the GLF_DEMOTE path in `do_xmote`. The BAST from the waiter arrives but the holder kernel never processes it.
 
 **Why DLM avoids this**: DLM is a central arbiter that knows the full lock dependency graph. DLM's AST callback wakes the waiter, which finishes I/O naturally and clears the holder. `find_first_holder()` returns NULL on the next `do_xmote` cycle.
