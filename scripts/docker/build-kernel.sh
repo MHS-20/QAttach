@@ -17,6 +17,7 @@ config GFS2_FS_LOCKING_ETCD
 	bool "GFS2 etcd-backed locking (lock_etcd)"
 	depends on GFS2_FS
 KEOF
+  # shellcheck disable=SC2016 # a literal Makefile variable
   echo 'gfs2-$(CONFIG_GFS2_FS_LOCKING_ETCD) += lock_etcd_main.o lock_etcd_netlink.o lock_etcd_glock.o lock_etcd_mount.o lock_etcd_lock.o' >>"$GFS2/Makefile"
   # Only the registration patches: the glock/inode debug hooks in
   # patch-kernel.py log every holder and would flood the console.
