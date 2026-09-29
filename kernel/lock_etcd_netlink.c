@@ -57,6 +57,16 @@ static void dispatch_lock_grant(struct letcd_lock_grant *grant)
 		truncate_inode_pages(inode->i_mapping, 0);
 	}
 
+	/* Same contract as DLM_SBF_VALNOTVALID in gdlm_ast(): a value block we
+	 * were not handed is zeroed, never left as whatever this node last
+	 * cached — a stale rgrp LVB with a valid magic passes as current. */
+	if (gl->gl_lksb.sb_lvbptr) {
+		if (grant->lvb_valid)
+			memcpy(gl->gl_lksb.sb_lvbptr, grant->lvb, LETCD_LVB_SIZE);
+		else
+			memset(gl->gl_lksb.sb_lvbptr, 0, LETCD_LVB_SIZE);
+	}
+
 	gfs2_glock_complete(gl, grant->granted_mode);
 }
 
@@ -75,7 +85,22 @@ static void dispatch_lock_deny(struct letcd_lock_deny *deny)
 	 * LM_OUT_ERROR is the only value that wakes a non-TRY holder
 	 * (do_error() sets gh_error = -EIO); an errno here would be
 	 * misparsed and can trip GLOCK_BUG_ON in finish_xmote(). */
-	gfs2_glock_complete(gl, LM_OUT_ERROR);
+	/* A conversion deadlock is not an I/O error: LM_OUT_DEADLOCK leaves
+	 * gl_state unchanged, and finish_xmote() then unlocks and retries
+	 * from UN — the same recovery lock_dlm gets from -EDEADLK. */
+	switch (deny->reason) {
+	case LETCD_DENY_DEADLOCK:
+		gfs2_glock_complete(gl, LM_OUT_DEADLOCK);
+		break;
+	case LETCD_DENY_CANCELED:
+		gfs2_glock_complete(gl, LM_OUT_CANCELED);
+		break;
+	case LETCD_DENY_TRY_AGAIN:
+		gfs2_glock_complete(gl, LM_OUT_TRY_AGAIN);
+		break;
+	default:
+		gfs2_glock_complete(gl, LM_OUT_ERROR);
+	}
 }
 
 static void dispatch_lock_wait(struct letcd_lock_wait *wait)

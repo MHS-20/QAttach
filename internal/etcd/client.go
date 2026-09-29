@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -262,6 +263,34 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 	}
 }
 
+// ConversionDeadlock reports whether our blocked conversion to mode can
+// never be granted: we already hold the lock, and a holder that blocks us
+// is itself queued waiting to convert, so each waits for the other to
+// demote.  GFS2 cannot demote a glock whose own conversion is in flight,
+// so no BAST breaks the cycle.  DLM detects the same cycle and fails the
+// later converter with -EDEADLK; the caller must do the equivalent.
+func (c *Client) ConversionDeadlock(ctx context.Context, lockType uint32, lockNumber uint64,
+	nodeID, mode string) bool {
+	resp, err := c.cli.Get(ctx, lockKey(lockType, lockNumber))
+	if err != nil || len(resp.Kvs) == 0 {
+		return false
+	}
+	holders := parseHolders(resp.Kvs[0].Value)
+	if !slices.ContainsFunc(holders, func(h lockEntry) bool { return h.Node == nodeID }) {
+		return false
+	}
+	for _, h := range holders {
+		if h.Node == nodeID || !modesConflict(mode, h.Mode) {
+			continue
+		}
+		w, err := c.cli.Get(ctx, waitKey(lockType, lockNumber, h.Node), clientv3.WithCountOnly())
+		if err == nil && w.Count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ReleaseLock removes this node's entry from the holders array, retrying
 // on CAS version mismatch (concurrent multi-holder release).
 //
@@ -391,6 +420,37 @@ func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber 
 		Then(clientv3.OpDelete(hk)).
 		Commit()
 	return err
+}
+
+// ---- lock value blocks ----
+
+func lvbKey(lockType uint32, lockNumber uint64) string {
+	return fmt.Sprintf("%s%d/%d", protocol.PrefixLvb, lockType, lockNumber)
+}
+
+// PutLvb publishes the value block an EX holder hands on when it unlocks or
+// down-converts.  The caller must still hold EX, so no other node can be
+// granted — and read the old value — before this lands.  The key rides on
+// the writer's session lease: if the writer dies the value disappears and
+// the next holder sees it as invalid, as with DLM_SBF_VALNOTVALID.
+//
+// ponytail: an EX holder that dies before unlocking leaves the previous
+// writer's value in place; DLM would mark it invalid.  Needs the grant to
+// re-lease the key to the new EX holder, which matters only once journal
+// recovery exists.
+func (c *Client) PutLvb(ctx context.Context, lockType uint32, lockNumber uint64, lvb []byte) error {
+	_, err := c.cli.Put(ctx, lvbKey(lockType, lockNumber), string(lvb),
+		clientv3.WithLease(c.sess.Lease()))
+	return err
+}
+
+// GetLvb returns the current value block, or nil if none is valid.
+func (c *Client) GetLvb(ctx context.Context, lockType uint32, lockNumber uint64) ([]byte, error) {
+	resp, err := c.cli.Get(ctx, lvbKey(lockType, lockNumber))
+	if err != nil || len(resp.Kvs) == 0 {
+		return nil, err
+	}
+	return resp.Kvs[0].Value, nil
 }
 
 // ---- bast / handoff ----

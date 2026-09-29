@@ -9,6 +9,7 @@
 
 #define LETCD_NETLINK_FAMILY  31
 #define LETCD_MAX_PAYLOAD     256
+#define LETCD_LVB_SIZE        32  /* GDLM_LVB_SIZE */
 
 /* Message types */
 #define LETCD_MSG_LOCK_REQ    1   /* kernel → agent: request glock */
@@ -22,6 +23,7 @@
 #define LETCD_MSG_MOUNT_REQ   9   /* kernel → agent: mount request */
 #define LETCD_MSG_MOUNT_RESP  10  /* agent → kernel: mount response with jid */
 #define LETCD_MSG_REGISTER    11  /* agent → kernel: register PID for unicast */
+#define LETCD_MSG_CANCEL      12  /* kernel → agent: cancel a waiting request */
 
 /* Lock modes — must match GFS2 LM_ST_* exactly */
 #define LETCD_LM_ST_UNLOCKED  0
@@ -34,18 +36,34 @@
 #define LETCD_DENY_STALE       2
 #define LETCD_DENY_ERROR       3
 #define LETCD_DENY_STALE_EPOCH 4   /* node epoch < cluster epoch — node was fenced */
+#define LETCD_DENY_DEADLOCK    5   /* conversion deadlock — drop to UN and retry */
+#define LETCD_DENY_CANCELED    6   /* request canceled by lm_cancel */
+#define LETCD_DENY_TRY_AGAIN   7   /* TRY request not grantable now */
 
+/* Request flags — must match GFS2 LM_FLAG_* */
+#define LETCD_FLAG_TRY         0x0001
+#define LETCD_FLAG_TRY_1CB     0x0002
+
+/* lvb_valid on a request or release means the sender held EX and lvb is
+ * the value block to publish, as DLM does on an EX down-conversion or unlock.
+ * On a grant it means lvb is the current value; otherwise the receiver must
+ * treat its value block as invalid. */
 struct letcd_lock_req {
 	__u64 request_id;
 	__u64 glock_number;
 	__u32 glock_type;
 	__u32 requested_mode;
+	__u32 lvb_valid;
+	__u32 flags;            /* LM_FLAG_TRY / LM_FLAG_TRY_1CB */
+	__u8  lvb[LETCD_LVB_SIZE];
 };
 
 struct letcd_lock_grant {
 	__u64 request_id;
 	__u32 granted_mode;
+	__u32 lvb_valid;
 	__s64 etcd_revision;    /* fencing token */
+	__u8  lvb[LETCD_LVB_SIZE];
 };
 
 struct letcd_lock_deny {
@@ -66,6 +84,14 @@ struct letcd_bast {
 struct letcd_lock_rel {
 	__u64 glock_number;
 	__u32 glock_type;
+	__u32 lvb_valid;
+	__u8  lvb[LETCD_LVB_SIZE];
+};
+
+struct letcd_lock_cancel {
+	__u64 glock_number;
+	__u32 glock_type;
+	__u32 pad;
 };
 
 struct letcd_recovery_ok {

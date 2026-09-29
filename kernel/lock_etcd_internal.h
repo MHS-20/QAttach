@@ -41,6 +41,18 @@ void letcd_bast_insert(u32 glock_type, u64 glock_number, struct gfs2_glock *gl);
 void letcd_bast_remove(u32 glock_type, u64 glock_number);
 struct gfs2_glock *letcd_bast_lookup(u32 glock_type, u64 glock_number);
 s64  letcd_revision_swap(struct gfs2_glock *gl, s64 revision);
+int  letcd_mount(struct gfs2_sbd *sdp, const char *table);
+void letcd_first_done(struct gfs2_sbd *sdp);
+void letcd_recovery_result(struct gfs2_sbd *sdp,
+			   unsigned int jid, unsigned int result);
+void letcd_unmount(struct gfs2_sbd *sdp);
+void letcd_withdraw(struct gfs2_sbd *sdp);
+void letcd_put_lock(struct gfs2_glock *gl);
+int  letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
+		unsigned int flags);
+void letcd_cancel(struct gfs2_glock *gl);
+int  lock_etcd_init_module(void);
+void lock_etcd_exit_module(void);
 int  letcd_netlink_init(void);
 void letcd_netlink_exit(void);
 int  letcd_nl_send_msg(int msg_type, const void *payload, size_t len);

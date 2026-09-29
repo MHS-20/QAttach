@@ -16,17 +16,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("QAttach");
 MODULE_DESCRIPTION("GFS2 locking protocol backed by etcd");
 
-int  letcd_mount(struct gfs2_sbd *sdp, const char *table);
-void letcd_first_done(struct gfs2_sbd *sdp);
-void letcd_recovery_result(struct gfs2_sbd *sdp,
-			   unsigned int jid, unsigned int result);
-void letcd_unmount(struct gfs2_sbd *sdp);
-void letcd_withdraw(struct gfs2_sbd *sdp);
-void letcd_put_lock(struct gfs2_glock *gl);
-int  letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
-		unsigned int flags);
-void letcd_cancel(struct gfs2_glock *gl);
-
 const match_table_t letcd_tokens = {
 	{ Opt_err, NULL },
 };
@@ -45,7 +34,7 @@ const struct lm_lockops letcd_ops = {
 };
 EXPORT_SYMBOL_GPL(letcd_ops);
 
-	int __init lock_etcd_init_module(void)
+int __init lock_etcd_init_module(void)
 {
 	spin_lock_init(&letcd_pending_lock);
 	hash_init(letcd_pending_table);

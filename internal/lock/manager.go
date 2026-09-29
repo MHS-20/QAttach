@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strconv"
 	"sync"
@@ -20,14 +21,20 @@ type Manager struct {
 	mu sync.Mutex
 	// heldLocks maps a lock to the cancel func of its BAST watcher.
 	heldLocks map[string]context.CancelFunc
-	epoch     int64
+	// waiting maps a lock to the cancel func of its retryProcessLock, so
+	// an lm_cancel from the kernel can end the wait.
+	waiting map[string]context.CancelCauseFunc
+	epoch   int64
 }
+
+var errCanceled = errors.New("canceled by kernel")
 
 func NewManager(ec *etcd.Client, nodeID string) *Manager {
 	return &Manager{
 		etcdCli:   ec,
 		nodeID:    nodeID,
 		heldLocks: make(map[string]context.CancelFunc),
+		waiting:   make(map[string]context.CancelCauseFunc),
 	}
 }
 
@@ -57,6 +64,15 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 			return
 		}
 
+		if req.LvbValid != 0 {
+			if err := m.etcdCli.PutLvb(ctx, req.GlockType, req.GlockNumber, req.Lvb[:]); err != nil {
+				log.Printf("lvb publish error type=%d num=%d: %v",
+					req.GlockType, req.GlockNumber, err)
+				m.sendDeny(req.RequestID, protocol.DenyReasonError)
+				return
+			}
+		}
+
 		granted, rev, err := m.etcdCli.ProcessLock(ctx,
 			req.GlockType, req.GlockNumber, m.nodeID, mode)
 		if err != nil {
@@ -67,8 +83,19 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		}
 
 		if granted {
-			m.sendGrant(req.RequestID, req.RequestedMode, rev)
+			m.sendGrant(ctx, req, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber)
+			return
+		}
+
+		// TRY: never queue.  TRY_1CB also asks the holders to demote once,
+		// which is how GFS2 pokes a remote node into evicting an inode.
+		if req.Flags&(protocol.FlagTry|protocol.FlagTry1CB) != 0 {
+			if req.Flags&protocol.FlagTry1CB != 0 {
+				m.etcdCli.RequestBast(ctx, req.GlockType, req.GlockNumber,
+					protocol.BastTargetMode(req.RequestedMode), m.nodeID)
+			}
+			m.sendDeny(req.RequestID, protocol.DenyReasonTryAgain)
 			return
 		}
 
@@ -181,6 +208,17 @@ const lockWaitTimeout = 20 * time.Second
 // current revision ensures we don't miss events (key delete, /next write)
 // that happen between the initial ProcessLock failure and the watch setup.
 func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest, mode string) {
+	ctx, cancelWait := context.WithCancelCause(ctx)
+	mapKey := lockMapKey(req.GlockType, req.GlockNumber)
+	m.mu.Lock()
+	m.waiting[mapKey] = cancelWait
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.waiting, mapKey)
+		m.mu.Unlock()
+		cancelWait(nil)
+	}()
 	ctx, cancel := context.WithTimeout(ctx, lockWaitTimeout)
 	defer cancel()
 
@@ -188,12 +226,16 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 	// for exactly one GRANT or DENY.  Any exit path that sends neither
 	// wedges that glock — and everything queued behind it — forever.
 	acquired := false
+	reason := uint32(protocol.DenyReasonContended)
 	defer func() {
 		if acquired {
 			return
 		}
-		log.Printf("retryProcessLock giving up type=%d num=%d — denying",
-			req.GlockType, req.GlockNumber)
+		if context.Cause(ctx) == errCanceled {
+			reason = protocol.DenyReasonCanceled
+		}
+		log.Printf("retryProcessLock giving up type=%d num=%d reason=%d — denying",
+			req.GlockType, req.GlockNumber, reason)
 		bg := context.Background()
 		m.etcdCli.RemoveWaiter(bg, req.GlockType, req.GlockNumber, m.nodeID)
 		m.etcdCli.DeleteHandoff(bg, req.GlockType, req.GlockNumber, m.nodeID)
@@ -202,7 +244,7 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 		// that no longer exists.
 		m.etcdCli.DeleteBastRequest(bg, req.GlockType, req.GlockNumber,
 			protocol.BastTargetMode(req.RequestedMode), m.nodeID)
-		m.sendDeny(req.RequestID, protocol.DenyReasonContended)
+		m.sendDeny(req.RequestID, reason)
 	}()
 
 	rev, _ := m.etcdCli.LockRev(ctx, req.GlockType, req.GlockNumber)
@@ -221,8 +263,13 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 				req.GlockType, req.GlockNumber, rev)
 			acquired = true
 			m.etcdCli.RemoveWaiter(ctx, req.GlockType, req.GlockNumber, m.nodeID)
-			m.sendGrant(req.RequestID, req.RequestedMode, rev)
+			m.sendGrant(ctx, req, rev)
 			m.trackHeldLock(req.GlockType, req.GlockNumber)
+			return
+		}
+
+		if m.etcdCli.ConversionDeadlock(ctx, req.GlockType, req.GlockNumber, m.nodeID, mode) {
+			reason = protocol.DenyReasonDeadlock
 			return
 		}
 
@@ -265,6 +312,14 @@ func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
 		cancel()
 	}
 
+	// Publish while our holder entry still blocks every other grant.
+	if req.LvbValid != 0 {
+		if err := m.etcdCli.PutLvb(ctx, req.GlockType, req.GlockNumber, req.Lvb[:]); err != nil {
+			log.Printf("lvb publish error type=%d num=%d: %v",
+				req.GlockType, req.GlockNumber, err)
+		}
+	}
+
 	target, err := m.etcdCli.ReleaseLock(ctx, req.GlockType, req.GlockNumber, m.nodeID)
 	if err != nil {
 		log.Printf("release error type=%d num=%d: %v",
@@ -276,6 +331,19 @@ func (m *Manager) HandleLockRelease(req protocol.LockRelease) {
 			req.GlockType, req.GlockNumber, target)
 	}
 	log.Printf("released lock type=%d num=%d", req.GlockType, req.GlockNumber)
+}
+
+// HandleLockCancel ends a contended wait GFS2 no longer wants.  If the
+// grant already went out there is nothing to cancel: the kernel completes
+// the request with that grant, as with a DLM cancel that misses.
+func (m *Manager) HandleLockCancel(req protocol.LockCancel) {
+	m.mu.Lock()
+	cancel, ok := m.waiting[lockMapKey(req.GlockType, req.GlockNumber)]
+	m.mu.Unlock()
+	log.Printf("cancel request: type=%d num=%d waiting=%v", req.GlockType, req.GlockNumber, ok)
+	if ok {
+		cancel(errCanceled)
+	}
 }
 
 func (m *Manager) HandleUnmount() {
@@ -314,13 +382,25 @@ func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 
 // ---- netlink helpers ----
 
-func (m *Manager) sendGrant(requestID uint64, mode uint32, revision int64) {
+// sendGrant hands the kernel the lock together with its current value
+// block.  A value block we cannot read is reported invalid, never omitted:
+// the kernel zeroes it rather than trusting its own stale copy.
+func (m *Manager) sendGrant(ctx context.Context, req protocol.LockRequest, revision int64) {
 	if m.nlSrv == nil {
 		return
 	}
-	if err := m.nlSrv.SendLockGrant(protocol.LockGrant{
-		RequestID: requestID, GrantedMode: mode, EtcdRevision: revision,
-	}); err != nil {
+	grant := protocol.LockGrant{
+		RequestID: req.RequestID, GrantedMode: req.RequestedMode, EtcdRevision: revision,
+	}
+	lvb, err := m.etcdCli.GetLvb(ctx, req.GlockType, req.GlockNumber)
+	if err != nil {
+		log.Printf("lvb read error type=%d num=%d: %v", req.GlockType, req.GlockNumber, err)
+	}
+	if len(lvb) == len(grant.Lvb) {
+		grant.LvbValid = 1
+		copy(grant.Lvb[:], lvb)
+	}
+	if err := m.nlSrv.SendLockGrant(grant); err != nil {
 		log.Printf("send grant error: %v", err)
 	}
 }

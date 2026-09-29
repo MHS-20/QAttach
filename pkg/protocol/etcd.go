@@ -7,6 +7,7 @@ const (
 	KeyEpoch      = "cluster/epoch"      // /cluster/epoch
 	PrefixLocks   = "locks/glock/"       // /locks/glock/{type}/{number}
 	PrefixBast    = "locks/bast/"        // /locks/bast/{type}/{number}  — BAST request signal
+	PrefixLvb     = "locks/lvb/"         // /locks/lvb/{type}/{number}  — lock value block
 	PrefixJournal = "cluster/journals/"  // /cluster/journals/{jid} — journal slot assignment
 	PrefixWait    = "locks/glock/"       // /locks/glock/{type}/{number}/wait/{node_id} — FIFO wait queue
 	MaxJournals   = 16                   // max journals to try during mount

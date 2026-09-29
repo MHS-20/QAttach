@@ -16,6 +16,7 @@ import (
 type Handler interface {
 	HandleLockRequest(req protocol.LockRequest)
 	HandleLockRelease(req protocol.LockRelease)
+	HandleLockCancel(req protocol.LockCancel)
 	HandleUnmount()
 	HandleMountRequest(req protocol.MountRequest)
 }
@@ -120,6 +121,12 @@ func (s *Server) dispatch(msgType uint16, payload []byte) {
 		var req protocol.LockRelease
 		if decodeLE(payload, &req) {
 			s.handler.HandleLockRelease(req)
+		}
+
+	case protocol.MsgCancel:
+		var req protocol.LockCancel
+		if decodeLE(payload, &req) {
+			s.handler.HandleLockCancel(req)
 		}
 
 	case protocol.MsgUnmount:
