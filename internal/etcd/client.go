@@ -98,6 +98,18 @@ func (c *Client) AssignJournal(ctx context.Context, nodeID string, max int) (int
 	return -1, nil
 }
 
+// ReleaseJournal frees a journal slot on clean unmount, but only while it
+// still names nodeID.  Without it every remount claims a fresh slot until
+// the filesystem runs out of journals.
+func (c *Client) ReleaseJournal(ctx context.Context, jid int32, nodeID string) error {
+	key := fmt.Sprintf("%s%d", protocol.PrefixJournal, jid)
+	_, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(key), "=", nodeID)).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	return err
+}
+
 // DeregisterNode removes the member key and revokes the session lease.
 func (c *Client) DeregisterNode(ctx context.Context, nodeID string) error {
 	key := protocol.PrefixMembers + nodeID

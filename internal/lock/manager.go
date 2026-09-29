@@ -25,6 +25,7 @@ type Manager struct {
 	// an lm_cancel from the kernel can end the wait.
 	waiting map[string]context.CancelCauseFunc
 	epoch   int64
+	jid     int32 // journal slot of the current mount, -1 if none
 }
 
 var errCanceled = errors.New("canceled by kernel")
@@ -35,6 +36,7 @@ func NewManager(ec *etcd.Client, nodeID string) *Manager {
 		nodeID:    nodeID,
 		heldLocks: make(map[string]context.CancelFunc),
 		waiting:   make(map[string]context.CancelCauseFunc),
+		jid:       -1,
 	}
 }
 
@@ -347,7 +349,17 @@ func (m *Manager) HandleLockCancel(req protocol.LockCancel) {
 }
 
 func (m *Manager) HandleUnmount() {
-	log.Printf("filesystem unmounting — releasing all resources")
+	m.mu.Lock()
+	jid := m.jid
+	m.jid = -1
+	m.mu.Unlock()
+	log.Printf("filesystem unmounting — releasing journal %d", jid)
+	if jid < 0 {
+		return
+	}
+	if err := m.etcdCli.ReleaseJournal(context.Background(), jid, m.nodeID); err != nil {
+		log.Printf("journal release error: %v", err)
+	}
 }
 
 func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
@@ -372,6 +384,7 @@ func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 
 		m.mu.Lock()
 		m.epoch = epoch
+		m.jid = jid
 		m.mu.Unlock()
 
 		log.Printf("mount request: cluster=%s, assigned jid=%d, epoch=%d",
