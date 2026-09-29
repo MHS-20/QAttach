@@ -25,12 +25,13 @@ type Config struct {
 	ASGName     string
 	ClusterName string
 	VolumeID    string
+	FenceMode   string // fencing.ModeEC2 or fencing.ModeNone
 	AZ          string
 
-	SessionTTL         time.Duration
-	KeepaliveInterval  time.Duration
-	FencingLeaseTTL    time.Duration
-	FencingTimeout     time.Duration
+	SessionTTL        time.Duration
+	KeepaliveInterval time.Duration
+	FencingLeaseTTL   time.Duration
+	FencingTimeout    time.Duration
 }
 
 // Default returns a config with sensible defaults.

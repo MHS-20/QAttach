@@ -26,6 +26,8 @@ type Manager struct {
 	waiting map[string]context.CancelCauseFunc
 	epoch   int64
 	jid     int32 // journal slot of the current mount, -1 if none
+
+	recoveryDone chan protocol.RecoveryDone
 }
 
 var errCanceled = errors.New("canceled by kernel")
@@ -37,6 +39,8 @@ func NewManager(ec *etcd.Client, nodeID string) *Manager {
 		heldLocks: make(map[string]context.CancelFunc),
 		waiting:   make(map[string]context.CancelCauseFunc),
 		jid:       -1,
+		// Buffered so the netlink receive loop never blocks on it.
+		recoveryDone: make(chan protocol.RecoveryDone, 16),
 	}
 }
 
@@ -76,7 +80,7 @@ func (m *Manager) HandleLockRequest(req protocol.LockRequest) {
 		}
 
 		granted, rev, err := m.etcdCli.ProcessLock(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID, mode)
+			req.GlockType, req.GlockNumber, m.nodeID, mode, noexp(req))
 		if err != nil {
 			log.Printf("process lock error type=%d num=%d: %v",
 				req.GlockType, req.GlockNumber, err)
@@ -200,10 +204,14 @@ func (m *Manager) processBast(ctx context.Context, lockType uint32, lockNumber u
 
 // lockWaitTimeout bounds how long a contended request may wait before the
 // agent denies it.  It must stay below the kernel module's
-// LETCD_WAIT_TIMEOUT (30s): if the kernel gives up first it completes the
+// LETCD_WAIT_TIMEOUT (150s): if the kernel gives up first it completes the
 // request itself, drops the pending entry, and a later GRANT from here is
-// discarded — leaving an etcd holder entry no node actually holds.
-const lockWaitTimeout = 20 * time.Second
+// discarded — leaving an etcd holder entry no node actually holds.  It must
+// also outlast a peer failure — session TTL, fencing and journal replay —
+// during which requests conflicting with the dead node legitimately wait.
+const lockWaitTimeout = 120 * time.Second
+
+func noexp(req protocol.LockRequest) bool { return req.Flags&protocol.FlagNoexp != 0 }
 
 // retryProcessLock watches the lock key from the current etcd revision
 // and retries ProcessLock on every change.  Starting the watch from the
@@ -251,10 +259,12 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 
 	rev, _ := m.etcdCli.LockRev(ctx, req.GlockType, req.GlockNumber)
 	watchCh := m.etcdCli.WatchLockFrom(ctx, req.GlockType, req.GlockNumber, rev+1)
+	// A recovery barrier being lowered changes no lock key.
+	recoveryCh := m.etcdCli.WatchRecovery(ctx)
 
 	for {
 		granted, rev, err := m.etcdCli.ProcessLock(ctx,
-			req.GlockType, req.GlockNumber, m.nodeID, mode)
+			req.GlockType, req.GlockNumber, m.nodeID, mode, noexp(req))
 		if err != nil {
 			log.Printf("retryProcessLock error type=%d num=%d: %v",
 				req.GlockType, req.GlockNumber, err)
@@ -290,6 +300,10 @@ func (m *Manager) retryProcessLock(ctx context.Context, req protocol.LockRequest
 		case <-ctx.Done():
 			return
 		case _, ok := <-watchCh:
+			if !ok {
+				return
+			}
+		case _, ok := <-recoveryCh:
 			if !ok {
 				return
 			}
@@ -348,6 +362,57 @@ func (m *Manager) HandleLockCancel(req protocol.LockCancel) {
 	}
 }
 
+// adoptJournal takes back the slot an earlier run of this node died with.
+// Its lock entries are ours by name but no longer held by the kernel, so
+// they are purged — safe here, since lm_mount runs before this mount takes
+// any glock.  Until the mount has replayed the journal, a barrier holds
+// back every other node; this node's own requests pass it.
+func (m *Manager) adoptJournal(ctx context.Context, jid int32) error {
+	won, err := m.etcdCli.CASFencing(ctx, m.nodeID, m.nodeID)
+	if err != nil {
+		return err
+	}
+	if !won {
+		return errors.New("a peer is recovering it")
+	}
+	defer m.etcdCli.ReleaseFencing(context.Background(), m.nodeID, m.nodeID)
+	if err := m.etcdCli.BeginRecovery(ctx, jid, m.nodeID); err != nil {
+		return err
+	}
+	log.Printf("adopted journal %d from a previous run — replaying at mount", jid)
+	return m.etcdCli.PurgeHolder(ctx, m.nodeID)
+}
+
+// HandleRecoveryDone forwards a journal replay result to the recovery
+// coordinator.  Results for replays nobody asked for (a node recovering its
+// own journal at mount) are dropped by the coordinator.
+func (m *Manager) HandleRecoveryDone(done protocol.RecoveryDone) {
+	log.Printf("recovery done: jid=%d result=%d", done.JID, done.Result)
+	// Our own journal, replayed by this mount: lower any barrier we
+	// raised when adopting it.  Deleting an absent key is harmless.
+	if int32(done.JID) == m.MountedJID() && done.Result == protocol.RecoverySuccess {
+		if err := m.etcdCli.LowerBarrier(context.Background(), int32(done.JID)); err != nil {
+			log.Printf("lower barrier jid=%d: %v", done.JID, err)
+		}
+		return
+	}
+	select {
+	case m.recoveryDone <- done:
+	default:
+		log.Printf("recovery result dropped: jid=%d", done.JID)
+	}
+}
+
+// RecoveryResults delivers the kernel's journal replay results.
+func (m *Manager) RecoveryResults() <-chan protocol.RecoveryDone { return m.recoveryDone }
+
+// MountedJID returns the journal slot of the current mount, or -1.
+func (m *Manager) MountedJID() int32 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.jid
+}
+
 func (m *Manager) HandleUnmount() {
 	m.mu.Lock()
 	jid := m.jid
@@ -365,13 +430,19 @@ func (m *Manager) HandleUnmount() {
 func (m *Manager) HandleMountRequest(req protocol.MountRequest) {
 	go func() {
 		ctx := context.Background()
-		jid, err := m.etcdCli.AssignJournal(ctx, m.nodeID, protocol.MaxJournals)
+		jid, adopted, err := m.etcdCli.AssignJournal(ctx, m.nodeID, protocol.MaxJournals)
 		if err != nil {
 			log.Printf("journal assignment error: %v", err)
 			jid = -1
 		}
+		if jid >= 0 && adopted {
+			if err := m.adoptJournal(ctx, jid); err != nil {
+				log.Printf("adopting journal %d: %v", jid, err)
+				jid = -1
+			}
+		}
 		if jid < 0 {
-			log.Printf("mount request: no free journal slots")
+			log.Printf("mount request: no usable journal slot")
 			m.sendMountResponse(req.RequestID, -1, 0)
 			return
 		}

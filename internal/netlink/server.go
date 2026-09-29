@@ -17,6 +17,7 @@ type Handler interface {
 	HandleLockRequest(req protocol.LockRequest)
 	HandleLockRelease(req protocol.LockRelease)
 	HandleLockCancel(req protocol.LockCancel)
+	HandleRecoveryDone(done protocol.RecoveryDone)
 	HandleUnmount()
 	HandleMountRequest(req protocol.MountRequest)
 }
@@ -127,6 +128,12 @@ func (s *Server) dispatch(msgType uint16, payload []byte) {
 		var req protocol.LockCancel
 		if decodeLE(payload, &req) {
 			s.handler.HandleLockCancel(req)
+		}
+
+	case protocol.MsgRecoveryDone:
+		var done protocol.RecoveryDone
+		if decodeLE(payload, &done) {
+			s.handler.HandleRecoveryDone(done)
 		}
 
 	case protocol.MsgUnmount:

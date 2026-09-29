@@ -6,6 +6,8 @@
 #include <linux/skbuff.h>
 #include <linux/pagemap.h>
 #include "lock_etcd_internal.h"
+#include "recovery.h"
+#include "super.h"
 
 struct sock *letcd_nl_sk;
 EXPORT_SYMBOL(letcd_nl_sk);
@@ -130,9 +132,25 @@ static void dispatch_bast(struct letcd_bast *bast)
 	gfs2_glock_cb(gl, bast->target_mode);
 }
 
+/* The agent has fenced a dead node and set the cluster recovery barrier:
+ * replay its journal.  gfs2_recover_journal() only queues the work, which
+ * reports back through letcd_recovery_result(). */
 static void dispatch_recovery_ok(struct letcd_recovery_ok *rok)
 {
+	struct gfs2_sbd *sdp = letcd_mount_ctx.sdp;
+	struct letcd_recovery_done gaveup = {
+		.jid = rok->jid, .result = LM_RD_GAVEUP,
+	};
+	struct gfs2_jdesc *jd;
+
 	pr_info("recovery ok: jid=%u\n", rok->jid);
+	jd = sdp ? gfs2_jdesc_find(sdp, rok->jid) : NULL;
+	if (!jd) {
+		letcd_nl_send_msg(LETCD_MSG_RECOVERY_DONE, &gaveup, sizeof(gaveup));
+		return;
+	}
+	/* -EBUSY: already recovering; that run reports the result. */
+	gfs2_recover_journal(jd, false);
 }
 
 /* ---- netlink recv ---- */

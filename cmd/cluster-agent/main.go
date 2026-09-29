@@ -80,7 +80,7 @@ func main() {
 	}
 
 	// Create fencer.
-	f, err := fencing.NewFencer(ec, cfg.NodeID, cfg.VolumeID)
+	f, err := fencing.NewFencer(ec, cfg.NodeID, cfg.VolumeID, cfg.FenceMode)
 	if err != nil {
 		log.Fatalf("fencer init: %v", err)
 	}
@@ -88,8 +88,8 @@ func main() {
 		f.SetNetlink(nlSrv)
 	}
 
-	// Start fencer watch loop.
-	go f.Run(ctx)
+	// Start the fence-and-recover loop.
+	go f.Run(ctx, lm)
 
 	// A lapsed session lease deletes every lock key this node owns while
 	// GFS2 still believes it holds those glocks — another node could then
@@ -173,6 +173,8 @@ func parseFlags() *config.Config {
 	flag.StringVar(&cfg.ASGName, "asg-name", "", "Auto Scaling Group name for lifecycle hook handling")
 	flag.StringVar(&cfg.ClusterName, "cluster-name", "mycluster", "GFS2 cluster name")
 	flag.StringVar(&cfg.VolumeID, "volume-id", "", "EBS volume ID for fencing")
+	flag.StringVar(&cfg.FenceMode, "fence-mode", fencing.ModeEC2,
+		"how to fence a failed node: ec2, or none (test harnesses that kill nodes themselves)")
 	flag.StringVar(&cfg.AZ, "az", "us-east-1a", "availability zone")
 
 	// etcd colocation
@@ -186,7 +188,7 @@ func parseFlags() *config.Config {
 
 	cfg.EtcdEndpoints = strings.Split(*etcdEndpoints, ",")
 
-	if cfg.VolumeID == "" {
+	if cfg.VolumeID == "" && cfg.FenceMode == fencing.ModeEC2 {
 		fmt.Fprintf(os.Stderr, "warning: --volume-id not set, fencing will be incomplete\n")
 	}
 

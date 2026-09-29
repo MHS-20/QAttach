@@ -288,11 +288,12 @@ func TestNetlinkSizes(t *testing.T) {
 // silently drops a short payload, so a drift here loses every message.
 func TestNetlinkCLayout(t *testing.T) {
 	for name, c := range map[string]struct{ got, want int }{
-		"letcd_lock_req":    {binary.Size(LockRequest{}), 64},
-		"letcd_lock_grant":  {binary.Size(LockGrant{}), 56},
-		"letcd_lock_rel":    {binary.Size(LockRelease{}), 48},
-		"letcd_lock_deny":   {binary.Size(LockDeny{}), 16},
-		"letcd_lock_cancel": {binary.Size(LockCancel{}), 16},
+		"letcd_lock_req":      {binary.Size(LockRequest{}), 64},
+		"letcd_lock_grant":    {binary.Size(LockGrant{}), 56},
+		"letcd_lock_rel":      {binary.Size(LockRelease{}), 48},
+		"letcd_lock_deny":     {binary.Size(LockDeny{}), 16},
+		"letcd_lock_cancel":   {binary.Size(LockCancel{}), 16},
+		"letcd_recovery_done": {binary.Size(RecoveryDone{}), 8},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s: Go size %d, C size %d", name, c.got, c.want)

@@ -56,6 +56,7 @@ int letcd_mount(struct gfs2_sbd *sdp, const char *table)
 	ls->ls_jid = letcd_mount_ctx.mount_jid;
 	ls->ls_first = 0;
 	ls->ls_ops = &letcd_ops;
+	letcd_mount_ctx.sdp = sdp;
 
 	clear_bit(SDF_NOJOURNALID, &sdp->sd_flags);
 	smp_mb__after_atomic();
@@ -73,13 +74,17 @@ void letcd_first_done(struct gfs2_sbd *sdp)
 void letcd_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
 			    unsigned int result)
 {
+	struct letcd_recovery_done done = { .jid = jid, .result = result };
+
 	pr_info("recovery result: jid=%u result=%u\n", jid, result);
+	letcd_nl_send_msg(LETCD_MSG_RECOVERY_DONE, &done, sizeof(done));
 }
 
 void letcd_unmount(struct gfs2_sbd *sdp)
 {
 	char dummy[4] = {0};
 	pr_info("unmount\n");
+	letcd_mount_ctx.sdp = NULL;
 	letcd_nl_send_msg(LETCD_MSG_UNMOUNT, dummy, sizeof(dummy));
 }
 

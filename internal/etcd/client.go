@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 
@@ -80,22 +81,40 @@ func (c *Client) RegisterNode(ctx context.Context, nodeID, instanceID, ip, az st
 	return err
 }
 
-// AssignJournal atomically claims a journal slot via CAS.
-func (c *Client) AssignJournal(ctx context.Context, nodeID string, max int) (int32, error) {
+// AssignJournal claims a journal slot.  A slot this node already owns is
+// taken first and reported as adopted: it belonged to an earlier run that
+// died mounted, and this mount must replay it (GFS2 replays its own journal
+// at mount).  Otherwise the first free slot is claimed via CAS.  Slots are
+// not on the session lease: if this node dies its slot must stay claimed
+// until the journal is replayed.
+func (c *Client) AssignJournal(ctx context.Context, nodeID string, max int) (jid int32, adopted bool, err error) {
+	resp, err := c.cli.Get(ctx, protocol.PrefixJournal, clientv3.WithPrefix())
+	if err != nil {
+		return -1, false, err
+	}
+	for _, kv := range resp.Kvs {
+		if string(kv.Value) != nodeID {
+			continue
+		}
+		j, err := strconv.ParseInt(strings.TrimPrefix(string(kv.Key), protocol.PrefixJournal), 10, 32)
+		if err == nil {
+			return int32(j), true, nil
+		}
+	}
 	for jid := int32(0); jid < int32(max); jid++ {
 		key := fmt.Sprintf("%s%d", protocol.PrefixJournal, jid)
 		txnResp, err := c.cli.Txn(ctx).
 			If(clientv3.Compare(clientv3.Version(key), "=", 0)).
-			Then(clientv3.OpPut(key, nodeID, clientv3.WithLease(c.sess.Lease()))).
+			Then(clientv3.OpPut(key, nodeID)).
 			Commit()
 		if err != nil {
-			return -1, fmt.Errorf("journal %d CAS: %w", jid, err)
+			return -1, false, fmt.Errorf("journal %d CAS: %w", jid, err)
 		}
 		if txnResp.Succeeded {
-			return jid, nil
+			return jid, false, nil
 		}
 	}
-	return -1, nil
+	return -1, false, nil
 }
 
 // ReleaseJournal frees a journal slot on clean unmount, but only while it
@@ -166,11 +185,31 @@ func modesConflict(a, b string) bool {
 // The caller must:
 //   - On GRANTED: send GRANT to kernel, track the held lock
 //   - On WAIT:    send WAIT to kernel, start retry goroutine
+//
+// Lock keys are deliberately not on the session lease.  A lease expiry
+// would release a dead node's locks at once, before it is fenced and its
+// journal replayed, and a peer would read metadata that exists only in
+// that journal.  Its entries stay and keep blocking conflicting requests
+// until recovery purges them.  While a journal awaits replay, only noexp
+// (recovery's own) requests are granted, as with DLM's recovery — plus the
+// requests of a node replaying its own journal at mount.
 func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber uint64,
-	nodeID, mode string) (granted bool, rev int64, err error) {
+	nodeID, mode string, noexp bool) (granted bool, rev int64, err error) {
 	key := lockKey(lockType, lockNumber)
 
 	for {
+		var barrier []clientv3.Cmp
+		if !noexp {
+			blocked, rev, err := c.RecoveryBlocks(ctx, nodeID)
+			if err != nil {
+				return false, 0, err
+			}
+			if blocked {
+				return false, 0, nil
+			}
+			barrier = []clientv3.Cmp{noBarrierSince(rev)}
+		}
+
 		getResp, err := c.cli.Get(ctx, key)
 		if err != nil {
 			return false, 0, fmt.Errorf("process get: %w", err)
@@ -195,12 +234,10 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 
 			val := marshalHolders([]lockEntry{{Node: nodeID, Mode: mode}})
 
-			conds := []clientv3.Cmp{
+			conds := append([]clientv3.Cmp{
 				clientv3.Compare(clientv3.Version(key), "=", 0),
-			}
-			ops := []clientv3.Op{
-				clientv3.OpPut(key, val, clientv3.WithLease(c.sess.Lease())),
-			}
+			}, barrier...)
+			ops := []clientv3.Op{clientv3.OpPut(key, val)}
 
 			if designated == nodeID {
 				// We are the designated next holder —
@@ -261,9 +298,8 @@ func (c *Client) ProcessLock(ctx context.Context, lockType uint32, lockNumber ui
 		}
 
 		txnResp, err := c.cli.Txn(ctx).
-			If(clientv3.Compare(clientv3.Version(key), "=", ver)).
-			Then(clientv3.OpPut(key, marshalHolders(newHolders),
-				clientv3.WithLease(c.sess.Lease()))).
+			If(append([]clientv3.Cmp{clientv3.Compare(clientv3.Version(key), "=", ver)}, barrier...)...).
+			Then(clientv3.OpPut(key, marshalHolders(newHolders))).
 			Commit()
 		if err != nil {
 			return false, 0, fmt.Errorf("process txn: %w", err)
@@ -333,12 +369,18 @@ func (c *Client) ReleaseLock(ctx context.Context, lockType uint32, lockNumber ui
 		target := ""
 		var ops []clientv3.Op
 		if len(filtered) > 0 {
-			ops = []clientv3.Op{clientv3.OpPut(key, marshalHolders(filtered),
-				clientv3.WithLease(c.sess.Lease()))}
+			ops = []clientv3.Op{clientv3.OpPut(key, marshalHolders(filtered))}
 		} else {
 			ops = []clientv3.Op{clientv3.OpDelete(key)}
 			if target, err = c.reserveHandoff(ctx, lockType, lockNumber, &ops); err != nil {
 				return "", err
+			}
+			// Nobody left to hand the value block to: drop it, as DLM
+			// frees an unused resource.  Keeping every inode's block
+			// would grow etcd without bound; the next holder sees it
+			// invalid and GFS2 recomputes it from disk.
+			if target == "" {
+				ops = append(ops, clientv3.OpDelete(lvbKey(lockType, lockNumber)))
 			}
 		}
 
@@ -434,6 +476,169 @@ func (c *Client) DeleteHandoff(ctx context.Context, lockType uint32, lockNumber 
 	return err
 }
 
+// ---- journal recovery ----
+
+func recoveryKey(jid int32) string {
+	return fmt.Sprintf("%s%d", protocol.PrefixRecovery, jid)
+}
+
+// RecoveryBlocks reports whether a pending recovery holds back nodeID's
+// requests: every barrier does, except one nodeID raised for its own
+// journal while its mount replays it.  rev is the revision of the read,
+// for noBarrierSince.
+func (c *Client) RecoveryBlocks(ctx context.Context, nodeID string) (blocked bool, rev int64, err error) {
+	resp, err := c.cli.Get(ctx, protocol.PrefixRecovery, clientv3.WithPrefix())
+	if err != nil {
+		return false, 0, err
+	}
+	for _, kv := range resp.Kvs {
+		if string(kv.Value) != nodeID {
+			return true, 0, nil
+		}
+	}
+	return false, resp.Header.Revision, nil
+}
+
+// noBarrierSince holds for a Txn only if no barrier was raised after rev,
+// so a grant cannot slip in between RecoveryBlocks and the commit.  A range
+// compare over an empty range compares against a zero key, which passes.
+func noBarrierSince(rev int64) clientv3.Cmp {
+	return clientv3.Compare(clientv3.ModRevision(protocol.PrefixRecovery), "<", rev+1).
+		WithPrefix()
+}
+
+// WatchRecovery signals whenever the set of pending recoveries changes.
+func (c *Client) WatchRecovery(ctx context.Context) clientv3.WatchChan {
+	return c.cli.Watch(ctx, protocol.PrefixRecovery, clientv3.WithPrefix())
+}
+
+// OrphanJournals returns the journals peers must replay, keyed by jid with
+// the owning node: slots and unfinished recoveries whose owner is not a
+// live member — a node that died mounted, or, after a whole-cluster outage,
+// one that never came back.  A recovery whose recoverer died with it stays
+// listed until a peer finishes it.  ownJID is skipped: a mount replays its
+// own journal.
+func (c *Client) OrphanJournals(ctx context.Context, ownJID int32) (map[int32]string, error) {
+	journals, err := c.cli.Get(ctx, protocol.PrefixJournal, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	pending, err := c.cli.Get(ctx, protocol.PrefixRecovery, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	members, err := c.cli.Get(ctx, protocol.PrefixMembers, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[string]bool, len(members.Kvs))
+	for _, kv := range members.Kvs {
+		live[strings.TrimPrefix(string(kv.Key), protocol.PrefixMembers)] = true
+	}
+	orphans := make(map[int32]string)
+	for _, set := range []struct {
+		kvs    []*mvccpb.KeyValue
+		prefix string
+	}{{pending.Kvs, protocol.PrefixRecovery}, {journals.Kvs, protocol.PrefixJournal}} {
+		for _, kv := range set.kvs {
+			jid, err := strconv.ParseInt(strings.TrimPrefix(string(kv.Key), set.prefix), 10, 32)
+			owner := string(kv.Value)
+			if err == nil && int32(jid) != ownJID && !live[owner] {
+				orphans[int32(jid)] = owner
+			}
+		}
+	}
+	return orphans, nil
+}
+
+// BeginRecovery raises the barrier for jid.  It is persistent: if the
+// recovering node dies too, the barrier must outlive it until a peer
+// finishes the replay.
+func (c *Client) BeginRecovery(ctx context.Context, jid int32, owner string) error {
+	_, err := c.cli.Put(ctx, recoveryKey(jid), owner)
+	return err
+}
+
+// PurgeHolder removes every holder entry of a fenced node, so that
+// recovery (whose requests pass the barrier) can take its journal lock and
+// the locks it held.  Value blocks it held EX are dropped with them: the
+// node may have changed what they describe without publishing them.
+func (c *Client) PurgeHolder(ctx context.Context, nodeID string) error {
+	resp, err := c.cli.Get(ctx, protocol.PrefixLocks, clientv3.WithPrefix())
+	if err != nil {
+		return err
+	}
+	for _, kv := range resp.Kvs {
+		var lockType uint32
+		var lockNumber uint64
+		key := string(kv.Key)
+		// The prefix also holds wait queues and handoff markers.
+		if n, _ := fmt.Sscanf(key, protocol.PrefixLocks+"%d/%d", &lockType, &lockNumber); n != 2 ||
+			key != lockKey(lockType, lockNumber) {
+			continue
+		}
+		if err := c.purgeEntry(ctx, key, lockType, lockNumber, nodeID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) purgeEntry(ctx context.Context, key string, lockType uint32, lockNumber uint64, nodeID string) error {
+	for {
+		resp, err := c.cli.Get(ctx, key)
+		if err != nil || len(resp.Kvs) == 0 {
+			return err
+		}
+		var kept []lockEntry
+		wasEX, found := false, false
+		for _, h := range parseHolders(resp.Kvs[0].Value) {
+			if h.Node == nodeID {
+				found = true
+				wasEX = wasEX || h.Mode == protocol.EtcdModeEX
+				continue
+			}
+			kept = append(kept, h)
+		}
+		if !found {
+			return nil
+		}
+		ops := []clientv3.Op{clientv3.OpDelete(key)}
+		if len(kept) > 0 {
+			ops = []clientv3.Op{clientv3.OpPut(key, marshalHolders(kept))}
+		}
+		if wasEX {
+			ops = append(ops, clientv3.OpDelete(lvbKey(lockType, lockNumber)))
+		}
+		txn, err := c.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.Version(key), "=", resp.Kvs[0].Version)).
+			Then(ops...).
+			Commit()
+		if err != nil || txn.Succeeded {
+			return err
+		}
+	}
+}
+
+// LowerBarrier ends the recovery of a journal its owner replayed itself
+// at mount; the owner keeps the slot.
+func (c *Client) LowerBarrier(ctx context.Context, jid int32) error {
+	_, err := c.cli.Delete(ctx, recoveryKey(jid))
+	return err
+}
+
+// FinishRecovery lowers the barrier for jid and, if owner still holds it,
+// frees the journal slot — in one Txn, so neither can outlive the other.
+func (c *Client) FinishRecovery(ctx context.Context, jid int32, owner string) error {
+	slot := fmt.Sprintf("%s%d", protocol.PrefixJournal, jid)
+	_, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(slot), "=", owner)).
+		Then(clientv3.OpDelete(recoveryKey(jid)), clientv3.OpDelete(slot)).
+		Else(clientv3.OpDelete(recoveryKey(jid))).
+		Commit()
+	return err
+}
+
 // ---- lock value blocks ----
 
 func lvbKey(lockType uint32, lockNumber uint64) string {
@@ -445,11 +650,7 @@ func lvbKey(lockType uint32, lockNumber uint64) string {
 // granted — and read the old value — before this lands.  The key rides on
 // the writer's session lease: if the writer dies the value disappears and
 // the next holder sees it as invalid, as with DLM_SBF_VALNOTVALID.
-//
-// ponytail: an EX holder that dies before unlocking leaves the previous
-// writer's value in place; DLM would mark it invalid.  Needs the grant to
-// re-lease the key to the new EX holder, which matters only once journal
-// recovery exists.
+// A fenced EX holder's value is dropped by PurgeHolder.
 func (c *Client) PutLvb(ctx context.Context, lockType uint32, lockNumber uint64, lvb []byte) error {
 	_, err := c.cli.Put(ctx, lvbKey(lockType, lockNumber), string(lvb),
 		clientv3.WithLease(c.sess.Lease()))
@@ -580,6 +781,20 @@ func (c *Client) LockRev(ctx context.Context, lockType uint32, lockNumber uint64
 
 // ---- fencing ----
 
+// ReleaseFencing drops our claim on a failed node early, so the next
+// reconciliation pass can retry without waiting out the fencing lease.
+func (c *Client) ReleaseFencing(ctx context.Context, failedNodeID, localNodeID string) error {
+	key := protocol.PrefixFencing + failedNodeID
+	_, err := c.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(key), "=", localNodeID)).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	return err
+}
+
+// CASFencing claims the right to fence and recover a failed node.  The
+// claim lives on a short lease, so a claimant that dies mid-recovery is
+// replaced by the next reconciliation pass.
 func (c *Client) CASFencing(ctx context.Context, failedNodeID, localNodeID string) (bool, error) {
 	key := protocol.PrefixFencing + failedNodeID
 	lease, err := c.cli.Grant(ctx, int64(c.cfg.FencingLeaseTTL.Seconds()))
@@ -627,12 +842,6 @@ func (c *Client) InitEpoch(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return txnResp.Header.Revision, nil
-}
-
-func (c *Client) MarkFencingComplete(ctx context.Context, failedNodeID, result string) error {
-	key := protocol.PrefixFencing + failedNodeID
-	_, err := c.cli.Put(ctx, key, result)
-	return err
 }
 
 func (c *Client) Close() error {

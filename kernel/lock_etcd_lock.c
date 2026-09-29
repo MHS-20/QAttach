@@ -10,7 +10,8 @@ static u32 letcd_lvb_out(struct gfs2_glock *gl, u8 *lvb)
 {
 	BUILD_BUG_ON(LETCD_LVB_SIZE != GDLM_LVB_SIZE);
 	BUILD_BUG_ON(LETCD_FLAG_TRY != LM_FLAG_TRY ||
-		     LETCD_FLAG_TRY_1CB != LM_FLAG_TRY_1CB);
+		     LETCD_FLAG_TRY_1CB != LM_FLAG_TRY_1CB ||
+		     LETCD_FLAG_NOEXP != LM_FLAG_NOEXP);
 	if (!gl->gl_lksb.sb_lvbptr || gl->gl_state != LM_ST_EXCLUSIVE)
 		return 0;
 	memcpy(lvb, gl->gl_lksb.sb_lvbptr, LETCD_LVB_SIZE);
@@ -56,10 +57,13 @@ int letcd_lock(struct gfs2_glock *gl, unsigned int req_state,
 	req.glock_type     = gl->gl_name.ln_type;
 	req.requested_mode = req_state;
 	req.lvb_valid      = letcd_lvb_out(gl, req.lvb);
+	/* NOEXP marks the requests recovery itself makes; the agent grants
+	 * them while a recovery barrier holds every other request back. */
 	/* TRY is decided by the agent against etcd, as DLM_LKF_NOQUEUE is
 	 * by DLM: failing it locally breaks flock -n and every remote
 	 * delete poke (TRY_1CB), leaving unlinked inodes allocated. */
-	req.flags          = flags & (LM_FLAG_TRY | LM_FLAG_TRY_1CB);
+	req.flags          = flags & (LM_FLAG_TRY | LM_FLAG_TRY_1CB |
+				  LM_FLAG_NOEXP);
 
 	pr_info("  ACQUIRE t=%u n=%llu mode=%u reqid=%lld\n",
 		req.glock_type, req.glock_number,

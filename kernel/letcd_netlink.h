@@ -24,6 +24,7 @@
 #define LETCD_MSG_MOUNT_RESP  10  /* agent → kernel: mount response with jid */
 #define LETCD_MSG_REGISTER    11  /* agent → kernel: register PID for unicast */
 #define LETCD_MSG_CANCEL      12  /* kernel → agent: cancel a waiting request */
+#define LETCD_MSG_RECOVERY_DONE 13 /* kernel → agent: journal replay finished */
 
 /* Lock modes — must match GFS2 LM_ST_* exactly */
 #define LETCD_LM_ST_UNLOCKED  0
@@ -43,6 +44,7 @@
 /* Request flags — must match GFS2 LM_FLAG_* */
 #define LETCD_FLAG_TRY         0x0001
 #define LETCD_FLAG_TRY_1CB     0x0002
+#define LETCD_FLAG_NOEXP       0x0004  /* grantable during recovery */
 
 /* lvb_valid on a request or release means the sender held EX and lvb is
  * the value block to publish, as DLM does on an EX down-conversion or unlock.
@@ -54,7 +56,7 @@ struct letcd_lock_req {
 	__u32 glock_type;
 	__u32 requested_mode;
 	__u32 lvb_valid;
-	__u32 flags;            /* LM_FLAG_TRY / LM_FLAG_TRY_1CB */
+	__u32 flags;            /* LM_FLAG_TRY / LM_FLAG_TRY_1CB / LM_FLAG_NOEXP */
 	__u8  lvb[LETCD_LVB_SIZE];
 };
 
@@ -96,6 +98,12 @@ struct letcd_lock_cancel {
 
 struct letcd_recovery_ok {
 	__u32 jid;
+};
+
+/* result is GFS2's LM_RD_SUCCESS (309) or LM_RD_GAVEUP (308). */
+struct letcd_recovery_done {
+	__u32 jid;
+	__u32 result;
 };
 
 struct letcd_mount_req {

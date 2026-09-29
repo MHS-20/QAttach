@@ -2,10 +2,8 @@ package fencing
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,39 +11,55 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	"github.com/MHS-20/QAttach/internal/etcd"
+	"github.com/MHS-20/QAttach/internal/lock"
 	"github.com/MHS-20/QAttach/internal/netlink"
 	"github.com/MHS-20/QAttach/pkg/protocol"
 )
 
-// Fencer monitors etcd for member failures and executes EC2 fencing.
+// Fence modes.
+const (
+	// ModeEC2 force-stops the failed instance, falling back to a forced
+	// EBS detach.  The node ID must be the EC2 instance ID (the agent's
+	// default when --node-id is not given).
+	ModeEC2 = "ec2"
+	// ModeNone fences nothing: whoever runs the cluster guarantees a
+	// failed node is dead before its lease expires.  Only for test
+	// harnesses that kill the node themselves, such as scripts/docker.
+	ModeNone = "none"
+)
+
+const (
+	scanInterval    = 2 * time.Second
+	fenceTimeout    = 90 * time.Second
+	recoveryTimeout = 60 * time.Second
+)
+
+// Fencer fences failed nodes and drives the replay of their journals.
 type Fencer struct {
 	etcdCli  *etcd.Client
-	ec2Cli   *ec2.Client
+	ec2Cli   *ec2.Client // nil in ModeNone
 	nlSrv    *netlink.Server
 	nodeID   string
 	volumeID string
-
-	mu           sync.Mutex
-	journalMap   map[string]uint32 // nodeID → jid
 }
 
-// NewFencer creates a new fencer.
-func NewFencer(ec *etcd.Client, nodeID, volumeID string) (*Fencer, error) {
-	awsCfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("aws config: %w", err)
+// NewFencer creates a fencer for the given mode.
+func NewFencer(ec *etcd.Client, nodeID, volumeID, mode string) (*Fencer, error) {
+	f := &Fencer{etcdCli: ec, nodeID: nodeID, volumeID: volumeID}
+	switch mode {
+	case ModeEC2:
+		awsCfg, err := config.LoadDefaultConfig(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("aws config: %w", err)
+		}
+		f.ec2Cli = ec2.NewFromConfig(awsCfg)
+	case ModeNone:
+		log.Printf("fencing disabled (--fence-mode=none): failed nodes are assumed dead")
+	default:
+		return nil, fmt.Errorf("unknown fence mode %q", mode)
 	}
-
-	return &Fencer{
-		etcdCli:    ec,
-		ec2Cli:     ec2.NewFromConfig(awsCfg),
-		nodeID:     nodeID,
-		volumeID:   volumeID,
-		journalMap: make(map[string]uint32),
-	}, nil
+	return f, nil
 }
 
 // SetNetlink sets the netlink server reference.
@@ -53,152 +67,155 @@ func (f *Fencer) SetNetlink(srv *netlink.Server) {
 	f.nlSrv = srv
 }
 
-// RegisterJournal maps a node ID to its journal ID.
-func (f *Fencer) RegisterJournal(nodeID string, jid uint32) {
-	f.mu.Lock()
-	f.journalMap[nodeID] = jid
-	f.mu.Unlock()
-}
-
-// Run starts the member deletion watch loop. Blocks until context is cancelled.
-func (f *Fencer) Run(ctx context.Context) {
-	watchCh := f.etcdCli.WatchMemberDeletions(ctx)
-
-	for resp := range watchCh {
-		for _, ev := range resp.Events {
-			if ev.Type == clientv3.EventTypeDelete {
-				failedNodeID := keyToNodeID(string(ev.Kv.Key))
-				if failedNodeID == "" || failedNodeID == f.nodeID {
-					continue
-				}
-
-				var lastVal []byte
-				if ev.PrevKv != nil {
-					lastVal = ev.PrevKv.Value
-				}
-
-				go f.handlePeerFailure(ctx, failedNodeID, lastVal)
-			}
+// Run recovers the journals of failed nodes until ctx ends.  It is level
+// triggered: every pass recomputes what needs recovery from etcd, so a
+// whole-cluster restart, or a recoverer dying mid-recovery, is picked up
+// the same way as a fresh member deletion — which only makes it prompt.
+func (f *Fencer) Run(ctx context.Context, lm *lock.Manager) {
+	deletions := f.etcdCli.WatchMemberDeletions(ctx)
+	tick := time.NewTicker(scanInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deletions:
+		case <-tick.C:
 		}
+		f.reconcile(ctx, lm)
 	}
 }
 
-// handlePeerFailure races to become the fencing coordinator.
-func (f *Fencer) handlePeerFailure(ctx context.Context, failedNodeID string, lastVal []byte) {
-	log.Printf("detected peer failure: %s", failedNodeID)
-
-	// CAS race — only one winner
-	won, err := f.etcdCli.CASFencing(ctx, failedNodeID, f.nodeID)
+// reconcile recovers every orphaned journal.  Only a node with the
+// filesystem mounted can replay a journal, so an unmounted node does nothing.
+func (f *Fencer) reconcile(ctx context.Context, lm *lock.Manager) {
+	own := lm.MountedJID()
+	if own < 0 {
+		return
+	}
+	orphans, err := f.etcdCli.OrphanJournals(ctx, own)
 	if err != nil {
-		log.Printf("fencing CAS error for %s: %v", failedNodeID, err)
+		log.Printf("recovery scan: %v", err)
 		return
 	}
-	if !won {
-		log.Printf("lost fencing race for %s — another node is handling it", failedNodeID)
+	for jid, owner := range orphans {
+		f.recover(ctx, lm, jid, owner)
+	}
+}
+
+// recover fences owner and replays journal jid, the same sequence DLM and
+// lock_dlm run: block new grants, drop the dead node's locks, let only
+// recovery's NOEXP requests through, replay, then unblock.
+func (f *Fencer) recover(ctx context.Context, lm *lock.Manager, jid int32, owner string) {
+	won, err := f.etcdCli.CASFencing(ctx, owner, f.nodeID)
+	if err != nil || !won {
+		return
+	}
+	defer f.etcdCli.ReleaseFencing(context.Background(), owner, f.nodeID)
+	log.Printf("recovering jid=%d of %s", jid, owner)
+
+	if err := f.Fence(ctx, owner); err != nil {
+		// Without a successful fence the dead node's lock entries
+		// stay and keep blocking; that is the safe failure.
+		log.Printf("fencing %s failed, will retry: %v", owner, err)
 		return
 	}
 
-	log.Printf("won fencing race for %s — executing EC2 fencing", failedNodeID)
+	// Barrier before purge: the purge removes the only thing blocking
+	// requests that conflict with the dead node.
+	if err := f.etcdCli.BeginRecovery(ctx, jid, owner); err != nil {
+		log.Printf("recovery barrier jid=%d: %v", jid, err)
+		return
+	}
+	if err := f.etcdCli.PurgeHolder(ctx, owner); err != nil {
+		log.Printf("purge locks of %s: %v", owner, err)
+		return
+	}
 
-	var info protocol.MemberInfo
-	if lastVal != nil {
-		if err := json.Unmarshal(lastVal, &info); err != nil {
-			log.Printf("parse member info for %s: %v", failedNodeID, err)
+	if f.nlSrv == nil {
+		return
+	}
+	if err := f.nlSrv.SendRecoveryOk(protocol.RecoveryOk{JID: uint32(jid)}); err != nil {
+		log.Printf("send recovery request jid=%d: %v", jid, err)
+		return
+	}
+	timeout := time.After(recoveryTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout:
+			log.Printf("recovery jid=%d timed out, will retry", jid)
+			return
+		case done := <-lm.RecoveryResults():
+			if int32(done.JID) != jid {
+				continue
+			}
+			if done.Result != protocol.RecoverySuccess {
+				log.Printf("recovery jid=%d gave up (%d), will retry", jid, done.Result)
+				return
+			}
+			if err := f.etcdCli.FinishRecovery(ctx, jid, owner); err != nil {
+				log.Printf("finish recovery jid=%d: %v", jid, err)
+				return
+			}
+			// A fenced node that comes back must not reuse its old view.
+			if _, err := f.etcdCli.IncrementEpoch(ctx); err != nil {
+				log.Printf("increment epoch error: %v", err)
+			}
+			log.Printf("recovered jid=%d of %s", jid, owner)
 			return
 		}
 	}
-
-	f.executeFencing(ctx, info.InstanceID, failedNodeID)
 }
 
-// executeFencing stops the instance and detaches the volume if needed.
-func (f *Fencer) executeFencing(ctx context.Context, instanceID, failedNodeID string) {
-	fenceCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+// Fence makes sure the failed node can no longer write to the volume.
+func (f *Fencer) Fence(ctx context.Context, nodeID string) error {
+	if f.ec2Cli == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, fenceTimeout)
 	defer cancel()
 
-	// Step 1: Force-stop the instance.
-	log.Printf("fencing: stopping instance %s", instanceID)
-	_, err := f.ec2Cli.StopInstances(fenceCtx, &ec2.StopInstancesInput{
-		InstanceIds: []string{instanceID},
+	log.Printf("fencing: stopping instance %s", nodeID)
+	_, err := f.ec2Cli.StopInstances(ctx, &ec2.StopInstancesInput{
+		InstanceIds: []string{nodeID},
 		Force:       aws.Bool(true),
 	})
-	if err != nil {
-		log.Printf("stop instances error for %s: %v — falling back to detach", instanceID, err)
-		f.detachVolume(fenceCtx, instanceID)
-		return
+	if err == nil {
+		err = ec2.NewInstanceStoppedWaiter(f.ec2Cli).Wait(ctx,
+			&ec2.DescribeInstancesInput{InstanceIds: []string{nodeID}}, fenceTimeout)
+		if err == nil {
+			return nil
+		}
 	}
-
-	// Step 2: Poll until stopped.
-	waiter := ec2.NewInstanceStoppedWaiter(f.ec2Cli)
-	if err := waiter.Wait(fenceCtx,
-		&ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}},
-		60*time.Second,
-	); err != nil {
-		log.Printf("instance stop wait error for %s: %v — detaching volume", instanceID, err)
-		f.detachVolume(fenceCtx, instanceID)
-	}
-
-	// Step 3: Increment cluster epoch.
-	// With colocated etcd, the fenced node's etcd member is now dead.
-	// The epoch increment ensures the fenced node can never rejoin
-	// without a full reset. The remaining etcd cluster auto-removes
-	// the dead member via etcd's built-in failure detection.
-	//
-	// TODO: explicitly remove fenced node from etcd membership before
-	// epoch increment when the node is still reachable (e.g. graceful
-	// leave via ASG lifecycle hook).
-	if _, err := f.etcdCli.IncrementEpoch(ctx); err != nil {
-		log.Printf("increment epoch error: %v", err)
-	}
-
-	// Step 4: Signal kernel — journal recovery safe.
-	f.mu.Lock()
-	jid, ok := f.journalMap[failedNodeID]
-	f.mu.Unlock()
-	if ok {
-		f.signalRecoveryOk(jid)
-	}
-
-	// Step 5: Mark fencing complete so other nodes can observe it.
-	if err := f.etcdCli.MarkFencingComplete(ctx, failedNodeID, "done"); err != nil {
-		log.Printf("mark fencing complete error for %s: %v", failedNodeID, err)
-	}
-
-	log.Printf("fencing complete for node %s (instance %s)", failedNodeID, instanceID)
+	log.Printf("stop %s failed: %v — force-detaching volume", nodeID, err)
+	return f.detachVolume(ctx, nodeID)
 }
 
-// detachVolume force-detaches the EBS volume from the instance.
-func (f *Fencer) detachVolume(ctx context.Context, instanceID string) {
-	// Force-detach only if instance ID matches fenced instance.
-	log.Printf("fencing: force-detaching volume %s from instance %s", f.volumeID, instanceID)
-
+// detachVolume force-detaches the EBS volume from the instance and waits
+// until the detach is complete.
+func (f *Fencer) detachVolume(ctx context.Context, instanceID string) error {
 	_, err := f.ec2Cli.DetachVolume(ctx, &ec2.DetachVolumeInput{
 		VolumeId:   aws.String(f.volumeID),
 		InstanceId: aws.String(instanceID),
 		Force:      aws.Bool(true),
 	})
 	if err != nil {
-		log.Printf("detach volume error: %v", err)
-		return
+		return fmt.Errorf("detach volume: %w", err)
 	}
-
-	// Poll until detached.
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("detach poll timeout for volume %s", f.volumeID)
-			return
+			return fmt.Errorf("detach of %s not confirmed: %w", f.volumeID, ctx.Err())
 		case <-time.After(5 * time.Second):
 		}
-
 		resp, err := f.ec2Cli.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{
 			VolumeIds: []string{f.volumeID},
 		})
 		if err != nil {
-			log.Printf("describe volumes error: %v", err)
 			continue
 		}
-
 		detached := true
 		for _, vol := range resp.Volumes {
 			for _, att := range vol.Attachments {
@@ -208,29 +225,8 @@ func (f *Fencer) detachVolume(ctx context.Context, instanceID string) {
 				}
 			}
 		}
-
 		if detached {
-			log.Printf("volume %s detached from instance %s", f.volumeID, instanceID)
-			return
+			return nil
 		}
 	}
-}
-
-// signalRecoveryOk notifies the kernel module that journal recovery is safe.
-func (f *Fencer) signalRecoveryOk(jid uint32) {
-	if f.nlSrv == nil {
-		return
-	}
-	if err := f.nlSrv.SendRecoveryOk(protocol.RecoveryOk{JID: jid}); err != nil {
-		log.Printf("send recovery ok error: %v", err)
-	}
-}
-
-// keyToNodeID extracts the node ID from a member key path.
-func keyToNodeID(key string) string {
-	prefix := protocol.PrefixMembers
-	if len(key) > len(prefix) {
-		return key[len(prefix):]
-	}
-	return ""
 }

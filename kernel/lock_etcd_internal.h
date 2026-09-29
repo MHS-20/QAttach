@@ -16,7 +16,9 @@
 #include "letcd_netlink.h"
 
 #define LETCD_PENDING_BITS  8
-#define LETCD_WAIT_TIMEOUT  (30 * HZ)
+/* Above the agent's lockWaitTimeout (120s), which outlasts a peer's
+ * session TTL, fencing and journal replay. */
+#define LETCD_WAIT_TIMEOUT  (150 * HZ)
 
 struct letcd_pending_entry {
 	u64 request_id;
@@ -63,6 +65,7 @@ struct letcd_mount_context {
 	int mount_error;
 	u64 mount_request_id;
 	s64 mount_epoch;      /* cluster/epoch at mount time */
+	struct gfs2_sbd *sdp; /* mounted filesystem, NULL when none */
 	spinlock_t lock;
 };
 #endif

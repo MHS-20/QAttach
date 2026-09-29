@@ -9,18 +9,19 @@ const (
 
 // Message types — kernel↔agent.
 const (
-	MsgLockReq    = 1  // kernel → agent: request glock
-	MsgLockGrant  = 2  // agent → kernel: granted + fencing token
-	MsgLockDeny   = 3  // agent → kernel: denied (contended or stale)
-	MsgLockWait   = 4  // agent → kernel: queued, will notify on release
-	MsgBast       = 5  // agent → kernel: demote callback (blocking AST)
-	MsgLockRel    = 6  // kernel → agent: release glock
-	MsgRecoveryOk = 7  // agent → kernel: node fenced, journal replay safe
-	MsgUnmount    = 8  // kernel → agent: filesystem unmounting
-	MsgMountReq   = 9  // kernel → agent: mount request (needs jid)
-	MsgMountResp  = 10 // agent → kernel: mount response with jid
-	MsgRegister   = 11 // agent → kernel: register PID for unicast replies
-	MsgCancel     = 12 // kernel → agent: cancel a waiting request
+	MsgLockReq      = 1  // kernel → agent: request glock
+	MsgLockGrant    = 2  // agent → kernel: granted + fencing token
+	MsgLockDeny     = 3  // agent → kernel: denied (contended or stale)
+	MsgLockWait     = 4  // agent → kernel: queued, will notify on release
+	MsgBast         = 5  // agent → kernel: demote callback (blocking AST)
+	MsgLockRel      = 6  // kernel → agent: release glock
+	MsgRecoveryOk   = 7  // agent → kernel: node fenced, journal replay safe
+	MsgUnmount      = 8  // kernel → agent: filesystem unmounting
+	MsgMountReq     = 9  // kernel → agent: mount request (needs jid)
+	MsgMountResp    = 10 // agent → kernel: mount response with jid
+	MsgRegister     = 11 // agent → kernel: register PID for unicast replies
+	MsgCancel       = 12 // kernel → agent: cancel a waiting request
+	MsgRecoveryDone = 13 // kernel → agent: journal replay finished
 )
 
 // LockRequest sent from kernel to agent requesting a glock.
@@ -85,10 +86,22 @@ type RecoveryOk struct {
 	JID uint32 // journal ID of the recovered node
 }
 
+// RecoveryDone sent from kernel to agent when a journal replay ends.
+type RecoveryDone struct {
+	JID    uint32
+	Result uint32 // RecoverySuccess or RecoveryGaveUp
+}
+
+// GFS2 journal recovery results (LM_RD_*).
+const (
+	RecoveryGaveUp  = 308
+	RecoverySuccess = 309
+)
+
 // MountRequest sent from kernel to agent during lm_mount.
 type MountRequest struct {
-	RequestID    uint64
-	ClusterName  [32]byte
+	RequestID      uint64
+	ClusterName    [32]byte
 	FilesystemName [32]byte
 }
 
@@ -104,6 +117,7 @@ type MountResponse struct {
 const (
 	FlagTry    = 0x0001 // fail instead of queueing
 	FlagTry1CB = 0x0002 // as FlagTry, but first send the holders one BAST
+	FlagNoexp  = 0x0004 // recovery's own request, granted through the barrier
 )
 
 // Deny reasons.
