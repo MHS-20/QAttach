@@ -18,7 +18,7 @@ ip route add default via 10.0.2.2
 
 dmesg -w >/tmp/ctl/dmesg.log 2>&1 &
 /work/cluster-agent --no-bootstrap --node-id "node$node" \
-  --etcd-endpoints http://10.0.2.2:2379 >/tmp/ctl/agent.log 2>&1 &
+  --etcd-endpoints http://10.0.2.2:2379 --fence-mode none >/tmp/ctl/agent.log 2>&1 &
 until grep -q 'cluster-agent ready' /tmp/ctl/agent.log; do sleep 0.2; done
 echo ready >/tmp/ctl/state
 
