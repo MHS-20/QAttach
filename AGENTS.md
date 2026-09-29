@@ -2,6 +2,11 @@
 
 etcd-backed distributed lock manager (DLM) replacement for GFS2 on EBS Multi-Attach.
 
+Research prototype. It passes concurrent metadata stress and crash recovery on
+the local Docker/QEMU cluster (`scripts/docker/`); see "Current state
+(September 2026)" below and `README.md`. Most of this file after that section
+is the July 2026 debugging history and is kept for context.
+
 ## Architecture
 
 ```
@@ -17,11 +22,13 @@ lock_etcd (kernel module, lm_lockops impl) ←Netlink→ cluster-agent (Go daemo
 ## Key constraints
 
 - Fencing: EC2 API (`StopInstances`/`DetachVolume`), **not** STONITH/IPMI. Never grant `ec2:TerminateInstances`.
-- Session lease TTL=15s, keepalive every 5s. Idle nodes are never fenced.
-- Fencing token = etcd revision of the lock key, validated on every request.
+- Session lease TTL=15s, keepalive every 5s — membership only. Idle nodes are never fenced.
+- Lock keys and journal slots are **persistent**, never on the session lease: a dead node's locks must survive until it is fenced and its journal replayed. Recovery (`internal/fencing/fencer.go`) purges them.
+- While `cluster/recovery/{jid}` exists, only requests with `LM_FLAG_NOEXP` are granted (plus a node replaying its own journal at mount).
 - No node-to-node monitoring — etcd Watch + session expiry are the sole liveness signals.
 - Glock mode mapping: EX→EX, SH→PR, DF→CW, UN→delete key.
-- etcd keys: `/cluster/members/{id}`, `/cluster/fencing/{id}`, `/cluster/epoch`, `/cluster/journals/{jid}`, `/locks/glock/{type}/{number}`, `/locks/glock/{type}/{number}/next` (handoff reservation), `/locks/bast/{type}/{number}` (BAST request signal).
+- etcd keys: `/cluster/members/{id}`, `/cluster/fencing/{id}`, `/cluster/epoch`, `/cluster/journals/{jid}`, `/cluster/recovery/{jid}` (recovery barrier), `/locks/glock/{type}/{number}`, `/locks/glock/{type}/{number}/next` (handoff reservation), `/locks/bast/{type}/{number}` (BAST request signal), `/locks/lvb/{type}/{number}` (lock value block). See `docs/etcd-schema.md`.
+- `gfs2_glock_complete` takes an `LM_OUT_*` bitmask, never an errno. Agent deny reasons map to `LM_OUT_ERROR`, `LM_OUT_DEADLOCK`, `LM_OUT_CANCELED` or `LM_OUT_TRY_AGAIN` (`docs/netlink-protocol.md`).
 - `mkfs.gfs2` doesn't recognize `lock_etcd` — format with `-p lock_dlm`, mount with `-o lockproto=lock_etcd`.
 
 ## Build & test
@@ -35,6 +42,25 @@ make lint               # requires golangci-lint (not in go.mod)
 ```
 
 Single-package test: `go test ./internal/netlink/`
+
+### Local cluster (no AWS)
+
+`scripts/docker/` builds kernel 6.18.54 with lock_etcd built in and boots three
+QEMU/KVM guests inside one container, sharing a raw GFS2 image, against one
+etcd. Needs Docker and `/dev/kvm`. Artifacts and per-node logs (`agent.log`,
+`dmesg.log`, `console.log`) are in `~/.cache/qattach-docker`.
+
+```bash
+scripts/docker/run.sh build        # image + kernel + agent; rerun after kernel/ or Go changes
+scripts/docker/run.sh up && scripts/docker/mount-all.sh
+scripts/docker/stress.sh 500 20    # 3-node metadata churn; expect errors=0, timeouts=0
+scripts/docker/crash.sh 1          # kill node1 mid-write; survivors recover it, then fsck
+scripts/docker/node.sh 0 'cmd'     # run a command in guest 0
+scripts/docker/run.sh down
+```
+
+The harness passes `--fence-mode=none`: it kills guests itself. Never use
+that mode where a "dead" node could still be writing.
 
 ## Deployment workflow
 
@@ -82,6 +108,16 @@ The upstream GFS2 and DLM source used for analysis is at `/tmp/gfs2-src/linux/fs
 | `scripts/infra/` | AWS infra provisioning, etcd setup, compute setup, e2e tests |
 | `scripts/kernel/` | Kernel build pipeline (`launch.sh`, `patch-kernel.py`, `teardown.sh`) |
 | `docs/` | Architecture, epoch mechanism, known limitations |
+
+## Current state (September 2026)
+
+Tested on the local Docker/QEMU cluster only, not yet on AWS.
+
+- Works: mount/unmount/remount; concurrent cross-node create/unlink/append/readdir (1500 ops, 0 errors); `flock` across nodes; node crash with survivor recovery; whole-cluster crash with per-node journal adoption.
+- Fixed in this round: conversion deadlock (reason 5 → `LM_OUT_DEADLOCK`), LVB transport (rgrplvb is on by default for format 1802 — without it rgrp consistency errors withdraw the fs), `lm_cancel` (reason 6), TRY/TRY_1CB decided by the agent (reason 7), persistent lock keys + recovery, journal slot release on unmount.
+- Not supported: POSIX `fcntl` locks — `gfs2_lock` calls `dlm_posix_lock` on `ls->ls_dlm` directly, bypassing `lm_lockops`; returns `ENODEV`.
+- Needs `CONFIG_GFS2_FS_LOCKING_DLM=y` in the kernel config even though lock_dlm is unused: without it GFS2 compiles out cluster `flock` and silently uses local flocks.
+- Known gaps: a live node that has not remounted keeps its old journal slot and lock entries until it does; per-request epoch checks are designed but not implemented (`docs/epoch-mechanism.md`); throughput vs DLM unmeasured.
 
 ## Session history — what was attempted and why
 
@@ -207,7 +243,7 @@ The **original** code (`LockModeExclusive=1, LockModeShared=3`) was correct. The
 
 **Fix**: Changed the check to `LockTypeJournal` (type 9) for EX mode requests. Also removed the old type=1 num>=1 check.
 
-## Current state — what works, what doesn't, and why
+## July 2026 state — what worked, what didn't (superseded)
 
 ### Works: Multi-node mount (3 nodes mount successfully)
 
@@ -234,7 +270,7 @@ Before the lock mode "fix" was reverted, the constants were `EX=1, SH=3` (correc
 2. With the original agent code (ConvertLock + watchForLock), the release was processed correctly
 3. The old flow might have handled the release path differently, or the old kernel module kept glocks in the bast list longer
 
-## Known bugs (blocking e2e)
+## Known bugs, July 2026 (superseded — see Current state)
 
 ### CRITICAL: Multi-node mount blocked — lock_etcd cannot do EX→SH mode conversion
 
@@ -362,24 +398,26 @@ Force-kill an agent and verify the cluster recovers without data corruption.
 - [ ] **Attach IAM role**: create an IAM role with `ec2:StopInstances` + `ec2:DetachVolume` (not TerminateInstances). Update `create-infra.sh` launch template to attach it. This enables the fencer to actually call the EC2 API.
 
 **Test sequence:**
-- [ ] **Basic crash recovery (without fencing)**: kill agent with `SIGKILL` (`systemctl kill -s SIGKILL cluster-agent`). Verify etcd session expiry after 15s auto-deletes all lock keys. Other nodes' waiters acquire the freed locks via retryProcessLock. Light I/O continues without interruption. Verify no D-state processes form.
-- [ ] **Fencing CAS race**: kill agent, verify the surviving nodes detect the dead member's key disappearing. Verify exactly one node wins the CAS on `/cluster/fencing/{id}`. Verify the winner calls EC2 `StopInstances` + `DetachVolume`. Verify the cluster epoch increments.
-- [ ] **Lock state after fencing**: verify all locks held by the fenced node are released in etcd. Other nodes can acquire them immediately. No stale `/next` markers or waiter entries remain.
-- [ ] **Recovery from crash**: reboot the fenced instance. Verify it cannot rejoin (epoch is stale — `DenyReasonStaleEpoch`). Format it as a new node and add it cleanly via `add-compute-node.sh`.
-- [ ] **Concurrent crash**: kill agents on 2 nodes simultaneously. Verify the single survivor maintains quorum (etcd needs 2/3 to commit). Verify the survivor can still read/write.
+Crash recovery itself is implemented and verified locally (`scripts/docker/crash.sh`). What remains is the AWS side:
+
+- [ ] **EC2 fencing path**: kill an instance, verify exactly one node wins the CAS on `/cluster/fencing/{id}`, calls `StopInstances` (or force-detaches), then replays the journal and increments the epoch. Lock keys are not freed by lease expiry — they are purged by recovery after the fence succeeds.
+- [ ] **Rebooted node**: the rebooted instance adopts its own journal slot at mount and replays it; verify on EBS Multi-Attach.
+- [ ] **Concurrent crash**: kill 2 of 3 nodes. With colocated etcd this loses quorum, so no grant or recovery can commit until a member returns — verify the survivor blocks rather than proceeds.
 
 **Notes on fencing scope:**
-- `lock_etcd_mount.c` recovery stubs (`lm_recovery_result`, `first_done`) currently just log. Journal replay after fencing needs to call `gfs2_recovery()` — this requires deeper integration and is deferred.
-- The IAM role is the minimum required for the fencer to work. Without it, fencing silently fails (as observed).
+- A failed fence leaves the dead node's lock entries in place (conflicting requests keep waiting) and is retried on the next scan. That is the safe failure.
+- The IAM role is the minimum required for the fencer to work.
 - `ec2:StopInstances` is used, never `ec2:TerminateInstances` (safety).
 
 ### Open question
 
-- [ ] **Investigate why GFS2's Amazon Linux build doesn't set `LM_FLAG_TRY` on journal lock requests during mount** (flags=0x284).
+- [x] **Why GFS2 doesn't set `LM_FLAG_TRY` on journal lock requests during mount (flags=0x284).** 0x284 is `LM_FLAG_NOEXP | GL_EXACT | GL_NOPID`: the node's *own* journal inode glock, taken in `init_journal` (`ops_fstype.c`). GFS2 only uses TRY for other nodes' journals, in `gfs2_recover_func` (`recovery.c`).
 
 ## Additional docs
 
 - `docs/epoch-mechanism.md` — cluster epoch for fencing rejection
 - `docs/plan/etcd-compute-colocation.md` — etcd colocation design
-- `docs/bast-mechanism.md` — BAST flow, livelock, yield solution
+- `docs/netlink-protocol.md` — kernel↔agent messages
+- `docs/etcd-schema.md` — etcd keys, leases and recovery barrier
+- `docs/retrospective.md` — why the project was abandoned, and the corrections
 - `docs/glocks.md` — GFS2 glock state machine, lock types, modes

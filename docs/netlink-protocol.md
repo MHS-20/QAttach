@@ -83,22 +83,35 @@ The kernel waits up to 60 seconds for this response via a completion.
 
 ### LOCK_REQ (1) — kernel → agent
 
-Sent when GFS2 wants to acquire or release a glock.
+Sent when GFS2 wants to acquire a glock or convert one it holds.
 
 ```
 Payload: struct letcd_lock_req {
     u64  request_id
     u64  glock_number
     u32  glock_type
-    u32  requested_mode  // 0=UNLOCK, 1=EX, 2=DF, 3=SH
+    u32  requested_mode  // 1=EX, 2=DF, 3=SH
+    u32  lvb_valid       // 1: lvb is the value block to publish
+    u32  flags           // LM_FLAG_TRY (0x1), TRY_1CB (0x2), NOEXP (0x4)
+    u8   lvb[32]
 }
-// Size: 24 bytes (kernel binary does not include node_epoch)
+// 64 bytes
 ```
 
-Mode 0 (UNLOCK) means release the lock.  All other modes are acquire requests.
-Note: `node_epoch` was removed from this struct due to kernel binary mismatch
-(kernel built without it).  Epoch validation only happens at mount time via
-MOUNT_RESP.
+`lvb_valid` is set when the node holds the glock in EX and it has a value
+block, i.e. on an EX down-conversion. The agent stores the LVB in etcd before
+the conversion lets anyone else in.
+
+`flags` carries the GFS2 flags that change what the lock manager must do:
+
+- **TRY / TRY_1CB**: never queue. If the lock is not grantable at once the
+  agent replies `LOCK_DENY` with reason 7, which the kernel completes as
+  `LM_OUT_TRY_AGAIN`. TRY_1CB also sends the holders one BAST first. These
+  match DLM's `NOQUEUE` and `NOQUEUEBAST`.
+- **NOEXP**: the request is part of journal recovery and may be granted while
+  a recovery barrier holds every other request back.
+
+Unlock does not use LOCK_REQ; see LOCK_REL.
 
 ### LOCK_GRANT (2) — agent → kernel
 
@@ -108,30 +121,50 @@ Lock was successfully acquired in etcd.
 Payload: struct letcd_lock_grant {
     u64  request_id
     u32  granted_mode
-    u8   pad[4]          // C struct padding
-    s64  etcd_revision   // fencing token
+    u32  lvb_valid       // 1: lvb is the current value block
+    s64  etcd_revision
+    u8   lvb[32]
 }
+// 56 bytes
 ```
 
-The fencing token (etcd revision) is stored in the glock's private data.
-On subsequent LOCK_REQ for the same glock, the kernel validates the token
-to detect stale cache after a crash.
+If the glock has a value block, the kernel copies `lvb` into it, or zeroes it
+when `lvb_valid` is 0 — the equivalent of `DLM_SBF_VALNOTVALID`. A node must
+never keep its own copy: a stale resource-group LVB with a valid magic number
+passes as current and trips a consistency check.
+
+The kernel remembers `etcd_revision` per glock. If it changed since the last
+grant of an inode glock, another node held the lock in between, and the
+kernel truncates the inode's cached pages.
 
 ### LOCK_DENY (3) — agent → kernel
 
-Lock could not be acquired (error or stale token).
+The request completes without the lock.
 
 ```
 Payload: struct letcd_lock_deny {
     u64  request_id
-    u32  reason          // 1=contended, 2=stale, 3=error
-    u8   pad[4]          // C struct padding
+    u32  reason
+    u8   pad[4]
 }
+// 16 bytes
 ```
+
+| Reason | Meaning | Kernel completes with |
+|--------|---------|-----------------------|
+| 1 | Contended past the agent's wait timeout (120s) | `LM_OUT_ERROR` (EIO) |
+| 2 | Stale fencing token (defined, not currently sent) | `LM_OUT_ERROR` |
+| 3 | Internal error | `LM_OUT_ERROR` |
+| 4 | Stale epoch (defined, not currently sent) | `LM_OUT_ERROR` |
+| 5 | Conversion deadlock | `LM_OUT_DEADLOCK`: GFS2 unlocks and retries |
+| 6 | Canceled by `lm_cancel` | `LM_OUT_CANCELED` |
+| 7 | TRY request not grantable | `LM_OUT_TRY_AGAIN` |
+
+`gfs2_glock_complete` takes an `LM_OUT_*` bitmask, never an errno.
 
 ### LOCK_WAIT (4) — agent → kernel
 
-Lock is contended — kernel should wait for a BAST or retry notification.
+Lock is contended; the agent keeps trying and will send GRANT or DENY.
 
 ```
 Payload: struct letcd_lock_wait {
@@ -139,13 +172,14 @@ Payload: struct letcd_lock_wait {
 }
 ```
 
-The kernel keeps the glock in a pending state.  When the lock becomes available,
-the agent sends a LOCK_GRANT, or the kernel may retry based on its own logic.
+The kernel marks the pending request. If no reply arrives within
+`LETCD_WAIT_TIMEOUT` (150s, above the agent's 120s) it completes the request
+with `LM_OUT_ERROR` itself, so a dead agent cannot leave a process in D-state.
 
 ### BAST (5) — agent → kernel
 
-Blocking AST — tells the kernel that another node wants this lock.  GFS2
-should demote the lock to the target mode or release it.
+Blocking AST — another node wants this lock. GFS2 should demote to the
+target mode once its holders are done.
 
 ```
 Payload: struct letcd_bast {
@@ -155,51 +189,78 @@ Payload: struct letcd_bast {
 }
 ```
 
-The kernel calls `gfs2_glock_cb(gl, target_mode)` which triggers GFS2's
-blocking callback.  GFS2 may:
-- Comply: downgrade to target mode
-- Ignore: if it can't demote (e.g., journal lock)
-- Defer: finish current operation first
+The kernel calls `gfs2_glock_cb(gl, target_mode)`. An EX waiter forces
+UNLOCKED; an SH or DF waiter forces only SH or DF, as `gdlm_bast` does.
 
 ### LOCK_REL (6) — kernel → agent
 
-Explicit lock release (not the same as UNLOCK mode in LOCK_REQ).
+Unlock: sent from `lm_lock(UNLOCKED)` and from `lm_put_lock`.
 
 ```
 Payload: struct letcd_lock_rel {
     u64  glock_number
     u32  glock_type
+    u32  lvb_valid       // 1: lvb is the value block to publish
+    u8   lvb[32]
 }
+// 48 bytes
 ```
+
+The agent publishes the LVB, if any, before removing the node's holder entry.
 
 ### RECOVERY_OK (7) — agent → kernel
 
-Signals that fencing is complete and journal replay is safe.
+The node that owned `jid` has been fenced and its locks purged: replay its
+journal.
 
 ```
 Payload: struct letcd_recovery_ok {
-    u32  jid      // journal ID of the recovered node
+    u32  jid
 }
 ```
 
+The kernel calls `gfs2_recover_journal()` for that journal. If no filesystem
+is mounted, or the journal does not exist, it replies at once with
+RECOVERY_DONE and `LM_RD_GAVEUP`.
+
 ### UNMOUNT (8) — kernel → agent
 
-Filesystem is unmounting — agent should release all resources.
+Filesystem is unmounting. The agent frees the node's journal slot.
 
 ```
 Payload: 4 zero bytes
 ```
 
-### LOCK_YIELD (12) — agent → kernel (DEPRECATED)
+### CANCEL (12) — kernel → agent
 
-The yield mechanism has been removed.  YIELD and YIELD_CLEAR messages are
-no longer sent by the agent.  The current handoff mechanism uses the `/next`
-marker in etcd with FIFO ordering enforced by `ProcessLock`.  See `AGENTS.md`
-Fixes 13-15 and `docs/debug/deadlock_issuelog.md` approaches 11-15.
+GFS2 has stopped waiting for a request on this glock (`lm_cancel`). It sleeps
+until the request completes.
 
-### YIELD_CLEAR (13) — agent → kernel (DEPRECATED)
+```
+Payload: struct letcd_lock_cancel {
+    u64  glock_number
+    u32  glock_type
+    u32  pad
+}
+// 16 bytes
+```
 
-See above.
+If the agent is still waiting on the lock it ends the wait and replies
+`LOCK_DENY` with reason 6. If the grant already went out, the grant completes
+the request, as with a DLM cancel that arrives too late.
+
+### RECOVERY_DONE (13) — kernel → agent
+
+GFS2 finished replaying a journal (`lm_recovery_result`).
+
+```
+Payload: struct letcd_recovery_done {
+    u32  jid
+    u32  result          // 309 = LM_RD_SUCCESS, 308 = LM_RD_GAVEUP
+}
+```
+
+Sent for every replay, including the one each mount runs on its own journal.
 
 ## C/Go Struct Alignment
 

@@ -121,10 +121,13 @@ Each node needs a unique journal ID (jid) for its on-disk journal.  In DLM,
 the first mounter scans journals and assigns slots.  In QAttach, journal IDs
 are assigned via etcd CAS at mount time:
 
-1. Agent tries CAS on `/cluster/journals/0` (first fit)
-2. If CAS fails (slot taken), tries `/cluster/journals/1`, then `/cluster/journals/2`, ...
+1. If a slot already names this node, an earlier run died mounted: the agent
+   adopts it, and GFS2 replays that journal during this mount
+2. Otherwise the agent tries CAS on `/cluster/journals/0` (first fit), then
+   `/cluster/journals/1`, `/cluster/journals/2`, ...
 3. Once a slot is claimed, the agent responds with that jid
 4. If all slots are taken (up to `MaxJournals`), mount fails
 
-The journal key is attached to the agent's session lease — if the agent crashes,
-the slot is freed automatically when the lease expires.
+The journal key is not on the session lease. It is deleted on unmount; if the
+node crashes, it stays claimed until a peer has replayed the journal (see
+"Crash recovery" in `README.md`).

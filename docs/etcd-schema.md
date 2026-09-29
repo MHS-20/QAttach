@@ -2,6 +2,8 @@
 
 All keys are relative (no leading `/`).  Keys attached to the agent's session lease
 are automatically deleted if the agent crashes or the node becomes unreachable.
+Lock keys and journal slots are deliberately **not** on the lease: a dead node's
+locks must stay in place until it is fenced and its journal replayed.
 
 ## Key Layout
 
@@ -12,31 +14,52 @@ cluster/
     Value:    {"instance_id":"i-...","ip":"172.31.x.y","az":"eu-west-1b"}
     Lease:    Session lease (15s TTL)
     Writers:  Local agent at startup
-    Readers:  All agents (WatchMemberDeletions for fencing)
+    Readers:  All agents (member deletions trigger a recovery scan; a
+              journal slot whose owner has no member key needs recovery)
 
   fencing/{failed_node_id}
-    Purpose:  Fencing race — CAS winner gets to fence
-    Value:    fencer node_id
-    Lease:    Short lease (60s TTL)
-    Writers:  Any agent that detects a member deletion (CAS)
-    Readers:  All agents (check who won)
+    Purpose:  Claim to fence and recover a failed node — the CAS winner does it
+    Value:    claiming node_id
+    Lease:    Short lease (60s TTL): a claimant that dies is replaced by the
+              next scan.  Deleted by the claimant when it finishes or gives up.
+    Writers:  Any mounted agent whose scan finds an orphaned journal (CAS);
+              a remounting node claims its own ID before adopting its slot
+    Readers:  None (CAS failure is the answer)
 
   epoch
-    Purpose:  Cluster epoch counter (incremented on crash)
+    Purpose:  Cluster epoch counter (incremented after each recovery)
     Value:    (empty — revision is the counter)
 
   journals/{jid}
     Purpose:  Journal slot assignment
     Value:    node_id of the owner
-    Lease:    Session lease
-    Writers:  Agent at mount time (CAS, tries 0..MaxJournals-1)
-    Readers:  None (only written once, read only via CAS failure)
+    Lease:    None — persistent until unmount or recovery
+    Writers:  Agent at mount time.  A slot this node already owns is adopted
+              first (an earlier run died mounted and this mount replays it);
+              otherwise CAS on 0..MaxJournals-1.  Deleted on unmount, or by
+              FinishRecovery after a peer replayed it.
+    Readers:  Recovery scan (OrphanJournals)
+
+  recovery/{jid}
+    Purpose:  Recovery barrier — journal jid awaits replay
+    Value:    node_id that owned the journal
+    Lease:    None — must outlive the recovering node
+    Writers:  The fencing claimant, after fencing and before purging the
+              dead node's locks; a remounting node adopting its own slot
+    Readers:  ProcessLock.  While any barrier exists only NOEXP requests are
+              granted — except that a node passes a barrier naming itself,
+              so a mount can proceed while it replays its own journal.  The
+              grant Txn compares the barrier prefix's ModRevision, so a
+              barrier raised after the check aborts the grant.
+    Deleted:  With the journal slot in one Txn when replay succeeds (peer
+              recovery), or on the owner's own replay result (adoption)
 
 locks/
   glock/{type}/{number}
     Purpose:  Single key per lock with JSON holder array
     Value:    [{"node":"nodeID","mode":"EX"},{"node":"other","mode":"PR"}]
-    Lease:    Session lease
+    Lease:    None — a dead node's entries keep blocking conflicting requests
+              until recovery purges them (PurgeHolder)
     Writers:  Agents acquiring or releasing locks via etcd Txn
     Readers:  All agents (WatchLockKey for contention/retry)
 
@@ -51,7 +74,22 @@ locks/
                If the array becomes empty, the key is deleted — and if
                waiters are queued, the delete and the `/next` reservation
                for the longest-waiting node commit in the same Txn, so no
-               node can reclaim the lock in between.
+               node can reclaim the lock in between.  With no waiter, the
+               lock's value block is deleted in that Txn too.
+      Deadlock: A converter (already a holder) blocked by a holder that is
+               itself queued as a waiter is denied with reason 5; its
+               kernel unlocks and retries from UN, as with DLM -EDEADLK.
+
+  lvb/{type}/{number}
+    Purpose:  Lock value block (32 bytes, GDLM_LVB_SIZE)
+    Value:    raw bytes
+    Lease:    Session lease of the last writer — if the writer dies, the
+              value disappears and the next holder sees it as invalid
+    Writers:  An EX holder on unlock or down-conversion, before its holder
+              entry changes, so no one is granted in between
+    Readers:  Every grant (sent to the kernel; absent means invalid)
+    Deleted:  When the lock is fully released with no waiter, and by
+              PurgeHolder for locks a fenced node held EX
 
   bast/{type}/{number}
     Purpose:  BAST request signal from waiter to holder
@@ -119,7 +157,7 @@ locks/
 
 - **Session lease**: Created by `concurrency.NewSession` at agent startup.
   TTL = 15 seconds.  Keepalive every 5 seconds.  Used for member keys,
-  lock keys, and journal keys.
+  waiter keys and value blocks — not for lock keys or journal slots.
 - **Fencing lease**: Short TTL (60s).  Created during fencing CAS.  Prevents
   stale fencing keys from persisting.
 - **BAST request lease**: 15s TTL.  Created when writing a bast request.
@@ -127,10 +165,9 @@ locks/
 - **Handoff token lease**: 5s TTL.  Short to quickly free the slot if the
   waiter crashes.
 
-Session expiry is fatal, not recoverable: every member, journal and lock
-key hangs off the session lease, so a lapsed lease drops them all at once
-while GFS2 still believes it holds the corresponding glocks.  The agent
-watches `Session.Done()` and exits immediately so peers fence it.
+Session expiry is fatal, not recoverable: the member key disappears, so
+peers treat the node as failed, fence it and replay its journal.  The agent
+watches `Session.Done()` and exits immediately.
 
 ## Session Lifecycle
 
@@ -138,18 +175,23 @@ watches `Session.Done()` and exits immediately so peers fence it.
 Agent starts
   → concurrency.NewSession (TTL=15s, keepalive background goroutine)
   → RegisterNode (Put /cluster/members/{id} with lease)
-  → AcquireLock (Put /locks/glock/... with lease)
-  → AssignJournal (Put /cluster/journals/{jid} with lease)
+  → AssignJournal on mount (Put /cluster/journals/{jid}, persistent)
+  → ProcessLock (Put /locks/glock/..., persistent)
+
+Unmount
+  → GFS2 releases every glock (LOCK_REL) → lock entries removed
+  → UNMOUNT → journal slot deleted
 
 Agent stops (graceful)
   → DeregisterNode (Delete /cluster/members/{id}, Close session)
-  → All leased keys auto-deleted
+  → With the filesystem still mounted, peers treat this as a failure
 
-Agent crashes (ungraceful)
-  → Keepalive stops
-  → Session lease expires after 15s
-  → etcd deletes all keys attached to this lease
-  → Other agents detect member key deletion → fencing race
+Node crashes
+  → Session lease expires after 15s → member key deleted
+  → Its lock entries and journal slot remain
+  → A mounted peer claims fencing/{id}, fences it, writes recovery/{jid},
+    purges its lock entries, replays the journal, then deletes
+    recovery/{jid} and journals/{jid} and increments the epoch
 ```
 
 ## Consistency Guarantees
@@ -158,7 +200,12 @@ Agent crashes (ungraceful)
   Only one writer succeeds per etcd revision.
 - **Lock release**: Txn reads holder array, removes entry, Puts or Deletes.
   Atomic per etcd revision.
-- **Fencing**: CAS ensures exactly one survivor fences the failed node.
+- **Fencing**: CAS ensures one survivor at a time fences and recovers the
+  failed node.  Every recovery step is idempotent, so a repeat after a
+  claimant dies is safe.
+- **Recovery**: No non-NOEXP grant can commit once a barrier exists; the
+  dead node's persistent entries cover the window between lease expiry and
+  the barrier.
 - **Journal assignment**: CAS ensures unique jid per node.
 - **Membership**: Session lease guarantees liveness — if keepalive stops,
-  all keys vanish atomically.  No partial state.
+  the member key vanishes and recovery starts.

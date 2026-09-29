@@ -50,7 +50,7 @@ wakes the downconvert thread** when the LAST holder drops. This prevents the
 |---|------|-------|
 | Holder blocking demotion | Yes (`find_first_holder`) | Yes (`l_ex_holders` / `l_ro_holders`) |
 | Proactive wake on last holder drop | No | Yes (`ocfs2_downconvert_on_unlock`) |
-| D-state prevention | WAIT timeout (30s → LM_OUT_TRY_AGAIN) | Signal-interruptible waits |
+| D-state prevention | WAIT timeout (150s → LM_OUT_ERROR) | Signal-interruptible waits |
 
 ### 2. D-state vs signal-interruptible waits (OCFS2 is better)
 

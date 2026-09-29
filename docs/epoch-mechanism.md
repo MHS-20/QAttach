@@ -1,5 +1,15 @@
 # Epoch Mechanism
 
+
+> **Status.** Only part of this design is implemented. The agent keeps
+> `cluster/epoch`, returns it in MOUNT_RESP, and increments it after
+> recovering a failed node's journal (`internal/fencing/fencer.go`). The
+> per-request check described below is not: LOCK_REQ carries no
+> `node_epoch`, and the agent never sends `DenyReasonStaleEpoch`. A fenced
+> node that rejoins is kept safe by fencing and journal recovery instead: its
+> old locks are purged and its journal replayed before anyone else can use
+> what it held.
+
 ## Why epochs are necessary
 
 In a distributed lock manager backed by etcd, the fencing token (etcd revision
@@ -73,7 +83,8 @@ Lock Acquire (every request)
 
 Fence (crash of peer)
   surviving node's fencer executes EC2 StopInstances
-  on success → IncrementEpoch() → Put cluster/epoch
+  on success → purge the node's locks → replay its journal
+  → IncrementEpoch() → Put cluster/epoch
   → next lock request from fenced node (if it restarts) will have stale epoch
   → denied
 

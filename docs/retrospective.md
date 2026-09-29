@@ -6,6 +6,12 @@
 > "fundamental barriers" are wrong, and the observed failures trace to
 > defects in this repository rather than to GFS2's design.  See
 > "What the source actually says" at the end of this file.
+>
+> **Second correction (2026-09-29).** The source review was then tested on a
+> local three-node QEMU/KVM cluster (`scripts/docker/`). It held for the five
+> barriers below, but its claim that only a throughput cost remained did not.
+> Testing found six more defects, all now fixed, and two genuine
+> incompatibilities. See "What testing showed" at the end of this file.
 
 ## The premise
 
@@ -270,3 +276,68 @@ reported above occurred at ~10 ops/s, about 5% of that ceiling, which is a
 per-operation defect rate rather than saturation.  Distinguishing the two
 takes one experiment nobody ran: the same *total operation count* at both
 rates.
+
+## What testing showed
+
+The review above was checked on a local cluster: three QEMU/KVM guests
+running kernel 6.18.54 with lock_etcd built in, sharing one raw disk image,
+against a single etcd (`scripts/docker/`).
+
+**The five barriers.** None reproduced. With the fixes below, three nodes
+running 500 random append/unlink/read/readdir operations each against one
+shared directory finish in about 95 seconds with no I/O errors, no stuck
+processes and a clean `fsck.gfs2 -n`. Latency costs throughput, not
+correctness.
+
+**"The remaining cost is a throughput ceiling" — no.** The first stress run on
+the corrected code produced an I/O error roughly every 20 seconds and then a
+filesystem withdrawal. Each failure traced to a lock-manager obligation that
+`lm_lockops` implies and lock_etcd did not meet:
+
+- *Conversion deadlock.* Nodes holding a directory in SH all requested EX.
+  None could process the BAST, because GFS2 does not demote a glock while its
+  own conversion is in flight. DLM breaks this cycle by failing one converter
+  with `-EDEADLK`; GFS2's `finish_xmote` then unlocks and retries. The agent
+  now does the same, detecting the cycle from the holder and waiter keys in
+  etcd.
+- *Lock value blocks.* On-disk format 1802 enables `rgrplvb` by default.
+  lock_etcd never moved LVBs between nodes, so a node trusted its own stale
+  copy of a resource group's counts and hit
+  `fatal: filesystem consistency error` in `gfs2_rgrp_go_instantiate`. LVBs now
+  travel with unlock, down-conversion and grant.
+- *Cancel.* `gfs2_upgrade_iopen_glock` gives up on an EX iopen request after 5
+  seconds and calls `lm_cancel`, then sleeps until the request completes.
+  `letcd_cancel` did nothing, so the caller waited for the agent timeout and
+  got EIO.
+- *TRY requests.* lock_etcd refused every TRY request without asking etcd, so
+  remote-delete pokes (`LM_FLAG_TRY_1CB`) never reached the node holding an
+  unlinked inode, and deleted files stayed allocated.
+- *Lock keys on the session lease.* A crashed node's locks were released at
+  lease expiry, before fencing or journal replay. In a test, a survivor was
+  granted a lock the dead node had held 5 ms after the lease expired, read
+  metadata that existed only in the dead node's journal, and withdrew.
+- *Journal slots never released on unmount*, so remounts ran out of journals.
+
+All six are fixed, and crash recovery is implemented on the same model as DLM:
+fence, raise a barrier that only NOEXP requests pass, purge the dead node's
+locks, replay its journal, and lower the barrier. Killing a node mid-write
+leaves the survivors blocked for about 15 seconds, then working with the
+victim's synced data intact. Killing all three nodes and remounting replays
+every journal.
+
+**What is genuinely incompatible.**
+
+1. *POSIX locks.* `gfs2_lock` in `fs/gfs2/file.c` bypasses `lm_lockops` and
+   calls `dlm_posix_lock()` on `ls->ls_dlm`, the DLM lockspace only `lock_dlm`
+   creates. Under any other lock module `fcntl` locks fail with `ENODEV`
+   (confirmed in testing). Providing them requires patching GFS2 or running
+   DLM beside it.
+2. *Lease-scoped ownership.* The idiomatic etcd lock — a key on the owner's
+   lease — is unsafe for a shared-disk filesystem, because the lease releases
+   a dead node's locks before its journal is replayed. etcd can express the
+   correct model (persistent ownership, a recovery barrier checked inside
+   every grant transaction, fencing), and QAttach now does. But the model has
+   to be built on top of etcd; it does not come from etcd's own primitives.
+
+Not measured: throughput or latency against a DLM cluster, network partitions
+(as opposed to crashes), more than three nodes, and AWS/EBS Multi-Attach.
