@@ -17,7 +17,7 @@ if [[ ! -b "$DEVICE" ]]; then
     exit 1
 fi
 
-echo "Formatting $DEVICE with lock_etcd protocol"
+echo "Formatting $DEVICE (lock_dlm on disk; mount selects lock_etcd)"
 echo "  Lock table:   $LOCKTABLE"
 echo "  Journals:     $JOURNALS"
 
@@ -33,8 +33,10 @@ if ! pgrep -x cluster-agent > /dev/null; then
     exit 1
 fi
 
+# mkfs.gfs2 rejects lock protocols it does not know, so the superblock
+# records lock_dlm and mount-gfs2.sh overrides it with lockproto=lock_etcd.
 mkfs.gfs2 \
-    -p lock_etcd \
+    -p lock_dlm \
     -t "$LOCKTABLE" \
     -j "$JOURNALS" \
     "$DEVICE"
