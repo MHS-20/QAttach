@@ -161,9 +161,9 @@ disk image, against a single etcd. They have not been repeated on AWS.
 |------|--------|
 | 3-node mount, unmount, remount | Works |
 | Sequential cross-node create, read, append, delete | Works |
-| 3 nodes × 500 random append/unlink/read/readdir ops on one shared directory | 0 I/O errors, 0 timeouts, ~95s; `fsck.gfs2 -n` clean in most runs |
+| 3 nodes × 500 random append/unlink/read/readdir ops on one shared directory | No withdraw; 106–304s; in 2 of 3 runs some lock waits hit the agent's 120s bound, and 1 run had 2 `EIO`s |
 | `flock` across nodes, blocking and `-n` | Mutual exclusion and non-blocking semantics correct |
-| Crash of one node mid-write (VM killed) | Survivors resume after ~15s; the victim's journal is replayed; synced data survives; no withdraw |
+| Crash of one node mid-write (VM killed) | Survivors resume after 16–19s; the victim's journal is replayed; synced data survives; no withdraw |
 | Crash of all three nodes, then remount | Each node replays its own journal at mount; synced data survives; `fsck.gfs2 -n` clean |
 | POSIX `fcntl` locks | Fail with `ENODEV` — see below |
 
